@@ -1,0 +1,29 @@
+[project]
+name = "ops-data-workflow"
+version = "0.1.0"
+description = "Operations content advertising workflow and dashboard."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "openai>=2.36.0",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "plotly>=6.7.0",
+    "pytest>=8.4.2",
+    "python-dotenv>=1.2.1",
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+    "socksio>=1.0.0",
+    "streamlit>=1.50.0",
+    "watchdog>=6.0.0",
+    "xlrd>=2.0.2",
+    "xlsxwriter>=3.2.9",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ops_data_workflow*"]

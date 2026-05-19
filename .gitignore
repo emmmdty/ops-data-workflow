@@ -1,0 +1,15 @@
+.venv/
+.DS_Store
+.pytest_cache/
+.playwright-cli/
+.trae/
+archive/
+data/
+output/
+outputs/
+*.sqlite3
+*.db
+__pycache__/
+*.pyc
+.env
+*.egg-info/

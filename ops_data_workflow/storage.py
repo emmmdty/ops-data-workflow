@@ -1,0 +1,880 @@
+"""SQLite archive and batch persistence."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from contextlib import closing
+from pathlib import Path
+import hashlib
+import shutil
+import sqlite3
+from typing import Iterable, Optional
+
+import pandas as pd
+
+
+SUCCESS_BATCH_ORDER = "period_end desc, period_start desc, created_at desc"
+SUCCESS_BATCH_ORDER_ASC = "period_end asc, period_start asc, created_at asc"
+PERIOD_STATE_ACTIVE = "active"
+PERIOD_STATE_BACKED_UP = "backed_up"
+PERIOD_STATE_DELETED = "deleted"
+PERSISTED_RESULT_TABLES = [
+    "upload_batches",
+    "uploaded_files",
+    "ai_reports",
+    "category_mappings",
+    "period_file_states",
+    "file_backups",
+    "canonical_items",
+    "channel_summary_items",
+    "total_summary_items",
+    "platform_summary_items",
+    "platform_category_summary_items",
+    "category_summary_items",
+    "top_content_items",
+    "account_audit_items",
+    "cover_metric_items",
+    "data_quality_items",
+    "review_queue_items",
+    "preprocessing_report_items",
+    "duplicate_merge_items",
+    "conflict_retention_items",
+    "missing_value_items",
+    "channel_comparison_items",
+]
+
+
+@dataclass(frozen=True)
+class ArchivedFile:
+    source_file: str
+    archive_path: Path
+    sha256: str
+    size_bytes: int
+
+
+def init_db(db_path: Path) -> None:
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            create table if not exists upload_batches (
+                batch_id text primary key,
+                period_start text not null,
+                period_end text not null,
+                created_at text not null,
+                archive_dir text not null,
+                output_dir text not null,
+                status text not null,
+                comparison_batch_id text,
+                comparison_note text
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists uploaded_files (
+                batch_id text not null,
+                source_file text not null,
+                archive_path text not null,
+                sha256 text not null,
+                size_bytes integer not null
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists ai_reports (
+                batch_id text primary key,
+                provider text not null,
+                model text not null,
+                summary text not null,
+                created_at text not null
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists category_mappings (
+                mapping_key text primary key,
+                platform text not null,
+                platform_group text not null,
+                channel text not null default '',
+                content_id text not null,
+                material_id text not null,
+                title text not null,
+                category_l1 text not null,
+                category_l2 text not null,
+                category_l3 text not null,
+                updated_at text not null
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists period_file_states (
+                period_key text primary key,
+                period_start text not null,
+                period_end text not null,
+                status text not null,
+                batch_id text not null default '',
+                raw_dir text not null default '',
+                backup_dir text not null default '',
+                updated_at text not null
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists file_backups (
+                batch_id text primary key,
+                period_key text not null,
+                period_start text not null,
+                period_end text not null,
+                raw_dir text not null default '',
+                backup_dir text not null default '',
+                backed_up_at text not null
+            )
+            """
+        )
+        _ensure_table_columns(
+            conn,
+            "category_mappings",
+            pd.DataFrame(
+                columns=[
+                    "mapping_key",
+                    "platform",
+                    "platform_group",
+                    "channel",
+                    "content_id",
+                    "material_id",
+                    "title",
+                    "category_l1",
+                    "category_l2",
+                    "category_l3",
+                    "updated_at",
+                ]
+            ),
+        )
+        conn.commit()
+
+
+def archive_input_files(
+    input_dir: Path,
+    archive_dir: Path,
+    uploaded_zip_path: Optional[Path] = None,
+) -> list[ArchivedFile]:
+    input_dir = Path(input_dir)
+    archive_dir = Path(archive_dir)
+    raw_dir = archive_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    archived: list[ArchivedFile] = []
+
+    for path in sorted(input_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(input_dir)
+        target = raw_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        archived.append(_file_record(target, relative.as_posix()))
+
+    if uploaded_zip_path and Path(uploaded_zip_path).exists():
+        target = archive_dir / "uploaded.zip"
+        shutil.copy2(uploaded_zip_path, target)
+        archived.append(_file_record(target, "uploaded.zip"))
+    return archived
+
+
+def find_previous_batch(db_path: Path, period_start: str) -> Optional[str]:
+    return previous_successful_batch_id(db_path, period_start)
+
+
+def previous_successful_batch_id(db_path: Path, period_start: str) -> Optional[str]:
+    if not Path(db_path).exists():
+        return None
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            select batch_id
+            from upload_batches
+            where status = 'ok' and period_end < ?
+            order by period_end desc, period_start desc, created_at desc
+            limit 1
+            """,
+            (period_start,),
+        ).fetchone()
+    return str(row[0]) if row else None
+
+
+def latest_successful_batch_id(db_path: Path) -> Optional[str]:
+    if not Path(db_path).exists():
+        return None
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            f"""
+            select batch_id
+            from upload_batches
+            where status = 'ok'
+            order by {SUCCESS_BATCH_ORDER}
+            limit 1
+            """
+        ).fetchone()
+    return str(row[0]) if row else None
+
+
+def read_total_summary(db_path: Path, batch_id: str) -> pd.DataFrame:
+    if not batch_id or not Path(db_path).exists():
+        return pd.DataFrame()
+    with closing(sqlite3.connect(db_path)) as conn:
+        try:
+            return pd.read_sql_query(
+                "select * from total_summary_items where batch_id = ?",
+                conn,
+                params=(batch_id,),
+            ).drop(columns=["batch_id"], errors="ignore")
+        except Exception:
+            return pd.DataFrame()
+
+
+def list_recent_batches(db_path: Path, limit: int = 20) -> pd.DataFrame:
+    if not Path(db_path).exists():
+        return pd.DataFrame()
+    with closing(sqlite3.connect(db_path)) as conn:
+        return pd.read_sql_query(
+            """
+            select batch_id, period_start, period_end, created_at, status, archive_dir, output_dir, comparison_note
+            from upload_batches
+            order by period_end desc, period_start desc, created_at desc
+            limit ?
+            """,
+            conn,
+            params=(limit,),
+        )
+
+
+def read_batch_record(db_path: Path, batch_id: str) -> dict[str, str]:
+    if not batch_id or not Path(db_path).exists():
+        return {}
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            select batch_id, period_start, period_end, created_at, status, archive_dir, output_dir,
+                   comparison_batch_id, comparison_note
+            from upload_batches
+            where batch_id = ?
+            """,
+            (batch_id,),
+        ).fetchone()
+    if row is None:
+        return {}
+    columns = [
+        "batch_id",
+        "period_start",
+        "period_end",
+        "created_at",
+        "status",
+        "archive_dir",
+        "output_dir",
+        "comparison_batch_id",
+        "comparison_note",
+    ]
+    return {column: "" if value is None else str(value) for column, value in zip(columns, row)}
+
+
+def is_period_active(db_path: Path, period_start: str, period_end: str) -> bool:
+    """Return whether a period is allowed to appear in selectors and raw sync."""
+    db_path = Path(db_path)
+    if not period_start or not period_end:
+        return True
+    if not db_path.exists():
+        return True
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            select status
+            from period_file_states
+            where period_key = ?
+            """,
+            (_period_key(period_start, period_end),),
+        ).fetchone()
+    if row is None:
+        return True
+    return str(row[0] or PERIOD_STATE_ACTIVE) == PERIOD_STATE_ACTIVE
+
+
+def list_file_backups(db_path: Path) -> pd.DataFrame:
+    """List backed-up periods that can be restored from the app."""
+    columns = ["batch_id", "period_start", "period_end", "raw_dir", "backup_dir", "backed_up_at"]
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return pd.DataFrame(columns=columns)
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        try:
+            backups = pd.read_sql_query(
+                """
+                select batch_id, period_start, period_end, raw_dir, backup_dir, backed_up_at
+                from file_backups
+                order by backed_up_at desc, period_end desc, period_start desc
+                """,
+                conn,
+            )
+        except Exception:
+            return pd.DataFrame(columns=columns)
+    return backups[columns] if not backups.empty else pd.DataFrame(columns=columns)
+
+
+def move_batch_to_file_backup(
+    db_path: Path,
+    batch_id: str,
+    raw_root: Path,
+    file_backup_root: Path,
+) -> dict[str, str]:
+    """Hide a batch's raw period files and mark the period as backed up."""
+    record = read_batch_record(db_path, batch_id)
+    if not record:
+        raise ValueError(f"未找到批次：{batch_id}")
+
+    period_start = record["period_start"]
+    period_end = record["period_end"]
+    period_dir_name = _period_dir_name(period_start, period_end)
+    raw_dir = Path(raw_root) / period_dir_name
+    backup_dir = Path(file_backup_root) / f"{period_dir_name}_{batch_id}"
+    backup_raw_dir = backup_dir / "raw"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if raw_dir.exists() and not backup_raw_dir.exists():
+        shutil.move(str(raw_dir), str(backup_raw_dir))
+    elif raw_dir.exists() and backup_raw_dir.exists():
+        shutil.rmtree(backup_raw_dir)
+        shutil.move(str(raw_dir), str(backup_raw_dir))
+
+    now = datetime.now(timezone.utc).isoformat()
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        _upsert_period_state(
+            conn,
+            period_start,
+            period_end,
+            PERIOD_STATE_BACKED_UP,
+            batch_id,
+            raw_dir,
+            backup_dir,
+            now,
+        )
+        conn.execute(
+            """
+            insert into file_backups (
+                batch_id, period_key, period_start, period_end, raw_dir, backup_dir, backed_up_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?)
+            on conflict(batch_id) do update set
+                period_key = excluded.period_key,
+                period_start = excluded.period_start,
+                period_end = excluded.period_end,
+                raw_dir = excluded.raw_dir,
+                backup_dir = excluded.backup_dir,
+                backed_up_at = excluded.backed_up_at
+            """,
+            (
+                batch_id,
+                _period_key(period_start, period_end),
+                period_start,
+                period_end,
+                str(raw_dir),
+                str(backup_dir),
+                now,
+            ),
+        )
+        conn.commit()
+    return {
+        "batch_id": batch_id,
+        "period_start": period_start,
+        "period_end": period_end,
+        "raw_dir": str(raw_dir),
+        "backup_dir": str(backup_dir),
+    }
+
+
+def restore_file_backup(
+    db_path: Path,
+    batch_id: str,
+    raw_root: Path,
+    file_backup_root: Path,
+) -> dict[str, str]:
+    """Restore a backed-up raw period so the period appears in selectors again."""
+    db_path = Path(db_path)
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            select batch_id, period_start, period_end, raw_dir, backup_dir
+            from file_backups
+            where batch_id = ?
+            """,
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"未找到备份：{batch_id}")
+        _, period_start, period_end, stored_raw_dir, stored_backup_dir = row
+
+    period_dir_name = _period_dir_name(str(period_start), str(period_end))
+    raw_dir = Path(stored_raw_dir or "") if stored_raw_dir else Path(raw_root) / period_dir_name
+    backup_dir = Path(stored_backup_dir or "") if stored_backup_dir else Path(file_backup_root) / f"{period_dir_name}_{batch_id}"
+    backup_raw_dir = backup_dir / "raw"
+    if raw_dir.exists() and backup_raw_dir.exists():
+        raise FileExistsError(f"raw 周期目录已存在，无法恢复：{raw_dir}")
+    if backup_raw_dir.exists():
+        raw_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(backup_raw_dir), str(raw_dir))
+    if backup_dir.exists() and not any(backup_dir.iterdir()):
+        backup_dir.rmdir()
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("delete from file_backups where batch_id = ?", (batch_id,))
+        conn.execute("delete from period_file_states where period_key = ?", (_period_key(str(period_start), str(period_end)),))
+        conn.commit()
+    return {
+        "batch_id": batch_id,
+        "period_start": str(period_start),
+        "period_end": str(period_end),
+        "raw_dir": str(raw_dir),
+        "backup_dir": str(backup_dir),
+    }
+
+
+def delete_batch_permanently(
+    db_path: Path,
+    batch_id: str,
+    raw_root: Path,
+    file_backup_root: Path,
+) -> dict[str, str]:
+    """Delete one batch's persisted rows and artifacts while preserving reusable mappings."""
+    record = read_batch_record(db_path, batch_id)
+    if not record:
+        raise ValueError(f"未找到批次：{batch_id}")
+    period_start = record["period_start"]
+    period_end = record["period_end"]
+    period_dir_name = _period_dir_name(period_start, period_end)
+    raw_dir = Path(raw_root) / period_dir_name
+    output_dir = Path(record.get("output_dir", ""))
+    archive_dir = Path(record.get("archive_dir", ""))
+
+    for path in [raw_dir, output_dir, archive_dir]:
+        _remove_path_if_exists(path)
+
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(db_path)) as conn:
+        backup_row = conn.execute(
+            "select backup_dir from file_backups where batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if backup_row and backup_row[0]:
+            _remove_path_if_exists(Path(str(backup_row[0])))
+        conn.execute("delete from file_backups where batch_id = ?", (batch_id,))
+        _delete_batch_scoped_rows(conn, batch_id)
+        _upsert_period_state(
+            conn,
+            period_start,
+            period_end,
+            PERIOD_STATE_DELETED,
+            batch_id,
+            raw_dir,
+            "",
+            now,
+        )
+        conn.commit()
+    return {
+        "batch_id": batch_id,
+        "period_start": period_start,
+        "period_end": period_end,
+        "raw_dir": str(raw_dir),
+        "output_dir": str(output_dir),
+        "archive_dir": str(archive_dir),
+    }
+
+
+def load_category_mappings(db_path: Path) -> dict[str, dict[str, str]]:
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {}
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        try:
+            rows = pd.read_sql_query("select * from category_mappings", conn)
+        except Exception:
+            return {}
+    mappings: dict[str, dict[str, str]] = {}
+    for _, row in rows.iterrows():
+        mapping = {
+            "platform": str(row.get("platform", "")),
+            "platform_group": str(row.get("platform_group", "")),
+            "channel": str(row.get("channel", "")),
+            "content_id": str(row.get("content_id", "")),
+            "material_id": str(row.get("material_id", "")),
+            "title": str(row.get("title", "")),
+            "category_l1": str(row.get("category_l1", "")),
+            "category_l2": str(row.get("category_l2", "")),
+            "category_l3": str(row.get("category_l3", "")),
+        }
+        for key in _mapping_keys(mapping):
+            mappings[key] = mapping
+    return mappings
+
+
+def upsert_category_mappings(db_path: Path, mappings: pd.DataFrame) -> int:
+    if mappings.empty:
+        return 0
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    with closing(sqlite3.connect(db_path)) as conn:
+        for _, row in mappings.iterrows():
+            mapping = {
+                "platform": _clean_text(row.get("platform", "")),
+                "platform_group": _clean_text(row.get("platform_group", "")),
+                "channel": _clean_text(row.get("channel", "")),
+                "content_id": _clean_text(row.get("content_id", "")),
+                "material_id": _clean_text(row.get("material_id", "")),
+                "title": _clean_text(row.get("title", "")),
+                "category_l1": _clean_text(row.get("category_l1", "")),
+                "category_l2": _clean_text(row.get("category_l2", "")),
+                "category_l3": _clean_text(row.get("category_l3", "")),
+            }
+            if not mapping["category_l2"]:
+                continue
+            for mapping_key in _mapping_keys(mapping):
+                conn.execute(
+                    """
+                    insert into category_mappings (
+                        mapping_key, platform, platform_group, channel, content_id, material_id,
+                        title, category_l1, category_l2, category_l3, updated_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(mapping_key) do update set
+                        platform = excluded.platform,
+                        platform_group = excluded.platform_group,
+                        channel = excluded.channel,
+                        content_id = excluded.content_id,
+                        material_id = excluded.material_id,
+                        title = excluded.title,
+                        category_l1 = excluded.category_l1,
+                        category_l2 = excluded.category_l2,
+                        category_l3 = excluded.category_l3,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        mapping_key,
+                        mapping["platform"],
+                        mapping["platform_group"],
+                        mapping["channel"],
+                        mapping["content_id"],
+                        mapping["material_id"],
+                        mapping["title"],
+                        mapping["category_l1"],
+                        mapping["category_l2"],
+                        mapping["category_l3"],
+                        now,
+                    ),
+                )
+                written += 1
+        conn.commit()
+    return written
+
+
+def persist_workflow_result(
+    db_path: Path,
+    batch_id: str,
+    period_start: str,
+    period_end: str,
+    archive_dir: Path,
+    output_dir: Path,
+    archived_files: Iterable[ArchivedFile],
+    canonical: pd.DataFrame,
+    channel_summary: pd.DataFrame,
+    total_summary: pd.DataFrame,
+    platform_summary: pd.DataFrame,
+    platform_category_summary: pd.DataFrame,
+    category_summary: pd.DataFrame,
+    top_content_items: pd.DataFrame,
+    account_audit: pd.DataFrame,
+    cover_metrics: pd.DataFrame,
+    data_quality: pd.DataFrame,
+    review_queue: pd.DataFrame,
+    preprocessing_report: pd.DataFrame,
+    duplicate_merge_details: pd.DataFrame,
+    conflict_retention_details: pd.DataFrame,
+    missing_value_details: pd.DataFrame,
+    channel_comparison: pd.DataFrame,
+    ai_summary: str,
+    comparison_batch_id: Optional[str],
+    comparison_note: str,
+) -> None:
+    init_db(db_path)
+    created_at = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            insert into upload_batches (
+                batch_id, period_start, period_end, created_at, archive_dir,
+                output_dir, status, comparison_batch_id, comparison_note
+            )
+            values (?, ?, ?, ?, ?, ?, 'ok', ?, ?)
+            """,
+            (
+                batch_id,
+                period_start,
+                period_end,
+                created_at,
+                str(archive_dir),
+                str(output_dir),
+                comparison_batch_id or "",
+                comparison_note,
+            ),
+        )
+        conn.execute(
+            "delete from period_file_states where period_key = ?",
+            (_period_key(period_start, period_end),),
+        )
+        for item in archived_files:
+            conn.execute(
+                """
+                insert into uploaded_files (batch_id, source_file, archive_path, sha256, size_bytes)
+                values (?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    item.source_file,
+                    str(item.archive_path),
+                    item.sha256,
+                    item.size_bytes,
+                ),
+            )
+        _append_frame(conn, "canonical_items", batch_id, canonical)
+        _append_frame(conn, "channel_summary_items", batch_id, channel_summary)
+        _append_frame(conn, "total_summary_items", batch_id, total_summary)
+        _append_frame(conn, "platform_summary_items", batch_id, platform_summary)
+        _append_frame(conn, "platform_category_summary_items", batch_id, platform_category_summary)
+        _append_frame(conn, "category_summary_items", batch_id, category_summary)
+        _append_frame(conn, "top_content_items", batch_id, top_content_items)
+        _append_frame(conn, "account_audit_items", batch_id, account_audit)
+        _append_frame(conn, "cover_metric_items", batch_id, cover_metrics)
+        _append_frame(conn, "data_quality_items", batch_id, data_quality)
+        _append_frame(conn, "review_queue_items", batch_id, review_queue)
+        _append_frame(conn, "preprocessing_report_items", batch_id, preprocessing_report)
+        _append_frame(conn, "duplicate_merge_items", batch_id, duplicate_merge_details)
+        _append_frame(conn, "conflict_retention_items", batch_id, conflict_retention_details)
+        _append_frame(conn, "missing_value_items", batch_id, missing_value_details)
+        _append_frame(conn, "channel_comparison_items", batch_id, channel_comparison)
+        conn.execute(
+            """
+            insert or replace into ai_reports (batch_id, provider, model, summary, created_at)
+            values (?, 'deepseek', '', ?, ?)
+            """,
+            (batch_id, ai_summary, created_at),
+        )
+        conn.commit()
+
+
+def purge_history_state(
+    db_path: Path,
+    output_root: Optional[Path] = None,
+    archive_root: Optional[Path] = None,
+) -> None:
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        existing_tables = {
+            row[0]
+            for row in conn.execute("select name from sqlite_master where type = 'table'").fetchall()
+        }
+        for table_name in PERSISTED_RESULT_TABLES:
+            if table_name not in existing_tables:
+                continue
+            conn.execute(f'delete from "{_sqlite_identifier(table_name)}"')
+        conn.commit()
+    for root in [output_root, archive_root]:
+        if root is None:
+            continue
+        _clear_directory(Path(root))
+
+
+def _clear_directory(path: Path) -> None:
+    path = Path(path)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def _period_key(period_start: str, period_end: str) -> str:
+    return f"{period_start}|{period_end}"
+
+
+def _period_dir_name(period_start: str, period_end: str) -> str:
+    return f"{str(period_start).replace('-', '')}-{str(period_end).replace('-', '')}"
+
+
+def _upsert_period_state(
+    conn: sqlite3.Connection,
+    period_start: str,
+    period_end: str,
+    status: str,
+    batch_id: str,
+    raw_dir: Path | str,
+    backup_dir: Path | str,
+    updated_at: str,
+) -> None:
+    conn.execute(
+        """
+        insert into period_file_states (
+            period_key, period_start, period_end, status, batch_id, raw_dir, backup_dir, updated_at
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(period_key) do update set
+            period_start = excluded.period_start,
+            period_end = excluded.period_end,
+            status = excluded.status,
+            batch_id = excluded.batch_id,
+            raw_dir = excluded.raw_dir,
+            backup_dir = excluded.backup_dir,
+            updated_at = excluded.updated_at
+        """,
+        (
+            _period_key(period_start, period_end),
+            period_start,
+            period_end,
+            status,
+            batch_id,
+            str(raw_dir),
+            str(backup_dir),
+            updated_at,
+        ),
+    )
+
+
+def _delete_batch_scoped_rows(conn: sqlite3.Connection, batch_id: str) -> None:
+    for table_name in [
+        "uploaded_files",
+        "ai_reports",
+        "canonical_items",
+        "channel_summary_items",
+        "total_summary_items",
+        "platform_summary_items",
+        "platform_category_summary_items",
+        "category_summary_items",
+        "top_content_items",
+        "account_audit_items",
+        "cover_metric_items",
+        "data_quality_items",
+        "review_queue_items",
+        "preprocessing_report_items",
+        "duplicate_merge_items",
+        "conflict_retention_items",
+        "missing_value_items",
+        "channel_comparison_items",
+        "upload_batches",
+    ]:
+        if not conn.execute(
+            "select 1 from sqlite_master where type = 'table' and name = ?",
+            (table_name,),
+        ).fetchone():
+            continue
+        columns = {
+            row[1]
+            for row in conn.execute(f'pragma table_info("{_sqlite_identifier(table_name)}")').fetchall()
+        }
+        if "batch_id" not in columns:
+            continue
+        conn.execute(f'delete from "{_sqlite_identifier(table_name)}" where batch_id = ?', (batch_id,))
+
+
+def _remove_path_if_exists(path: Path) -> None:
+    path = Path(path)
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _append_frame(conn: sqlite3.Connection, table_name: str, batch_id: str, frame: pd.DataFrame) -> None:
+    if frame.empty:
+        return
+    stored = frame.copy()
+    stored.insert(0, "batch_id", batch_id)
+    _ensure_table_columns(conn, table_name, stored)
+    stored.to_sql(table_name, conn, if_exists="append", index=False)
+
+
+def _ensure_table_columns(conn: sqlite3.Connection, table_name: str, frame: pd.DataFrame) -> None:
+    exists = conn.execute(
+        "select 1 from sqlite_master where type = 'table' and name = ?",
+        (table_name,),
+    ).fetchone()
+    if not exists:
+        return
+
+    existing = {
+        row[1]
+        for row in conn.execute(f'pragma table_info("{_sqlite_identifier(table_name)}")').fetchall()
+    }
+    for column in frame.columns:
+        if column in existing:
+            continue
+        conn.execute(
+            f'alter table "{_sqlite_identifier(table_name)}" add column "{_sqlite_identifier(str(column))}" {_sqlite_type(frame[column])}'
+        )
+
+
+def _sqlite_identifier(value: str) -> str:
+    return value.replace('"', '""')
+
+
+def _sqlite_type(series: pd.Series) -> str:
+    if pd.api.types.is_bool_dtype(series):
+        return "integer"
+    if pd.api.types.is_integer_dtype(series):
+        return "integer"
+    if pd.api.types.is_numeric_dtype(series):
+        return "real"
+    return "text"
+
+
+def _file_record(path: Path, source_file: str) -> ArchivedFile:
+    return ArchivedFile(
+        source_file=source_file,
+        archive_path=path,
+        sha256=_sha256(path),
+        size_bytes=path.stat().st_size,
+    )
+
+
+def _mapping_keys(mapping: dict[str, str]) -> list[str]:
+    keys = []
+    for column in ["content_id", "material_id", "title"]:
+        value = mapping.get(column, "").strip()
+        if value:
+            keys.append(f"{column}:{value}")
+    return keys
+
+
+def _clean_text(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

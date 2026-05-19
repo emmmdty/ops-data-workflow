@@ -1,0 +1,39 @@
+"""Workflow result models."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import pandas as pd
+
+
+@dataclass(frozen=True)
+class WorkflowResult:
+    batch_id: str
+    canonical: pd.DataFrame
+    category_summary: pd.DataFrame
+    channel_summary: pd.DataFrame
+    platform_summary: pd.DataFrame
+    platform_category_summary: pd.DataFrame
+    total_summary: pd.DataFrame
+    raw_category_stats: pd.DataFrame
+    pending_categories: pd.DataFrame
+    account_audit: pd.DataFrame
+    top_content_items: pd.DataFrame
+    cover_metrics: pd.DataFrame
+    data_quality: pd.DataFrame
+    review_queue: pd.DataFrame
+    preprocessing_report: pd.DataFrame
+    duplicate_merge_details: pd.DataFrame
+    conflict_retention_details: pd.DataFrame
+    missing_value_details: pd.DataFrame
+    reference_tables: dict[str, pd.DataFrame]
+    channel_comparison: pd.DataFrame
+    comparison_note: str
+    ai_summary: str
+    report_html: Path
+    analysis_xlsx: Path
+    canonical_csv: Path
+    total_summary_xlsx: Path
+    archive_dir: Path
