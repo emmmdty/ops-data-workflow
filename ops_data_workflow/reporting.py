@@ -68,6 +68,11 @@ COLUMN_LABELS = {
     "needs_manual_review": "需要人工审核",
     "review_reasons": "审核原因",
     "source_file": "来源文件",
+    "source_sheet": "来源Sheet",
+    "source_row": "来源行",
+    "source_file_hash": "来源文件哈希",
+    "duplicate_group_id": "重复组ID",
+    "review_action": "审核动作",
     "missing_column": "缺失字段",
     "action": "处理动作",
     "relative_difference": "相对差异",
@@ -477,20 +482,32 @@ def _write_html(
                 "activations": "激活数",
             },
         ).to_html(full_html=False, include_plotlyjs=True)
-        matrix_chart = px.scatter(
-            category_summary,
-            x="heat_score",
-            y=first_pay_rate,
-            size="spend",
-            color="content_category",
-            hover_name="category_display",
-            title="内容类别热度 x 首次付费率矩阵",
-            labels={
-                "heat_score": "热度评分",
-                first_pay_rate: "首次付费率",
-                "spend": "消耗",
-            },
-        ).to_html(full_html=False, include_plotlyjs=False)
+        matrix_data = category_summary.copy()
+        matrix_data["spend"] = pd.to_numeric(matrix_data["spend"], errors="coerce")
+        matrix_data["heat_score"] = pd.to_numeric(matrix_data["heat_score"], errors="coerce")
+        matrix_data[first_pay_rate] = pd.to_numeric(matrix_data[first_pay_rate], errors="coerce")
+        matrix_data = matrix_data[
+            matrix_data["spend"].gt(0)
+            & matrix_data["heat_score"].notna()
+            & matrix_data[first_pay_rate].notna()
+        ]
+        if matrix_data.empty:
+            matrix_chart = "<p>暂无可绘制消耗气泡。</p>"
+        else:
+            matrix_chart = px.scatter(
+                matrix_data,
+                x="heat_score",
+                y=first_pay_rate,
+                size="spend",
+                color="content_category",
+                hover_name="category_display",
+                title="内容类别热度 x 首次付费率矩阵",
+                labels={
+                    "heat_score": "热度评分",
+                    first_pay_rate: "首次付费率",
+                    "spend": "消耗",
+                },
+            ).to_html(full_html=False, include_plotlyjs=False)
 
     platform_chart_data = platform_category_summary.copy()
     if not platform_chart_data.empty:
@@ -650,6 +667,7 @@ IMPORTANT_COLUMNS_ORDER = [
     "account_id",        # 账号ID
     "author",            # 作者
     "source_file",       # 来源文件
+    "source_sheet",      # 来源Sheet
 ]
 
 

@@ -13,7 +13,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 import pandas as pd
 
 from .comparison import build_channel_comparison
-from .storage import init_db
+from .storage import init_db, normalize_batch_metadata, previous_batch_from_rows
 
 
 METRIC_COLUMNS = [
@@ -50,6 +50,19 @@ CHANNEL_COMPARISON_COLUMNS = [
     "first_pay_rate_previous",
     "first_pay_rate_change_rate",
 ]
+OVERVIEW_TABLE_COLUMNS = [
+    "channel",
+    "spend",
+    "spend_change_rate",
+    "activations",
+    "activations_change_rate",
+    "activation_cost",
+    "activation_cost_change_rate",
+    "first_pay_count",
+    "first_pay_count_change_rate",
+    "first_pay_cost",
+    "first_pay_cost_change_rate",
+]
 
 COST_METRICS = {"activation_cost", "first_pay_cost"}
 BILIBILI_CHANNEL = "B站"
@@ -57,6 +70,30 @@ BILIBILI_CATEGORY = "B站全部"
 LEGACY_BILIBILI_CATEGORY_VALUES = {"", "采访"}
 LEGACY_BILIBILI_TOPIC_VALUES = {"", "新手教学"}
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+BATCH_COLUMNS = [
+    "batch_id",
+    "period_start",
+    "period_end",
+    "created_at",
+    "status",
+    "period_level",
+    "period_key",
+    "period_label",
+    "data_start",
+    "data_end",
+    "source_type",
+]
+CHANNEL_TOPIC_KEYWORD_RULES = [
+    ("品牌歌曲", ("同花顺进行曲", "真英雄", "bgm", "BGM", "唱", "歌", "伴奏", "合唱")),
+    ("新股民教育", ("新股民", "忠告", "K线", "入门", "小白", "启蒙")),
+    ("股民心智", ("股民", "家族", "公平", "竞争", "心态", "亏损", "赚钱", "悟道")),
+    ("财商认知", ("财商", "投资理财", "实践", "总结", "执行力", "聪明", "认知", "选择", "痛苦", "享受")),
+    ("剧情达人", ("达人", "成王败寇", "天才", "证明", "误闯", "剧情")),
+    ("行情资讯", ("资讯", "热点", "行情", "芯片", "复盘")),
+    ("问财问句", ("问财", "问句")),
+    ("社区互动", ("社区", "话题")),
+    ("大佬采访", ("采访", "大佬")),
+]
 
 DETAIL_COLUMNS = [
     "batch_id",
@@ -85,6 +122,11 @@ DETAIL_COLUMNS = [
     "first_pay_cost",
     "first_pay_rate",
     "source_file",
+    "source_sheet",
+    "source_row",
+    "source_file_hash",
+    "duplicate_group_id",
+    "review_action",
 ]
 
 NUMERIC_SOURCE_COLUMNS = [
@@ -132,7 +174,13 @@ def load_dashboard_items(db_path: Path) -> pd.DataFrame:
                     canonical_items.*,
                     upload_batches.period_start as batch_period_start,
                     upload_batches.period_end as batch_period_end,
-                    upload_batches.created_at as batch_created_at
+                    upload_batches.created_at as batch_created_at,
+                    upload_batches.period_level as batch_period_level,
+                    upload_batches.period_key as batch_period_key,
+                    upload_batches.period_label as batch_period_label,
+                    upload_batches.data_start as batch_data_start,
+                    upload_batches.data_end as batch_data_end,
+                    upload_batches.source_type as batch_source_type
                 from canonical_items
                 join upload_batches
                     on canonical_items.batch_id = upload_batches.batch_id
@@ -157,14 +205,16 @@ def load_all_dashboard_items(db_path: Path) -> pd.DataFrame:
 def list_successful_dashboard_batches(db_path: Path) -> pd.DataFrame:
     db_path = Path(db_path)
     if not db_path.exists():
-        return pd.DataFrame(columns=["batch_id", "period_start", "period_end", "created_at", "status", "period_label"])
+        return _empty_batches()
     init_db(db_path)
     with closing(sqlite3.connect(db_path)) as conn:
         try:
             batches = pd.read_sql_query(
                 """
                 select upload_batches.batch_id, upload_batches.period_start, upload_batches.period_end,
-                       upload_batches.created_at, upload_batches.status
+                       upload_batches.created_at, upload_batches.status,
+                       upload_batches.period_level, upload_batches.period_key, upload_batches.period_label,
+                       upload_batches.data_start, upload_batches.data_end, upload_batches.source_type
                 from upload_batches
                 left join period_file_states
                     on period_file_states.period_key = upload_batches.period_start || '|' || upload_batches.period_end
@@ -175,13 +225,17 @@ def list_successful_dashboard_batches(db_path: Path) -> pd.DataFrame:
                 conn,
             )
         except Exception:
-            return pd.DataFrame(columns=["batch_id", "period_start", "period_end", "created_at", "status", "period_label"])
+            return _empty_batches()
     if batches.empty:
-        return pd.DataFrame(columns=["batch_id", "period_start", "period_end", "created_at", "status", "period_label"])
-    batches = batches.copy()
-    batches = batches.drop_duplicates(subset=["period_start", "period_end"], keep="first").reset_index(drop=True)
-    batches["period_label"] = batches["period_start"].astype(str) + " 至 " + batches["period_end"].astype(str)
-    return batches
+        return _empty_batches()
+    batches = normalize_batch_metadata(batches)
+    batches["_source_rank"] = batches["source_type"].map({"upload": 0}).fillna(1).astype(int)
+    batches = batches.sort_values(
+        ["period_end", "period_start", "_source_rank", "created_at"],
+        ascending=[False, False, True, False],
+    )
+    batches = batches.drop_duplicates(subset=["period_level", "period_key", "source_type"], keep="first")
+    return batches[BATCH_COLUMNS].reset_index(drop=True)
 
 
 def format_beijing_datetime(value: object) -> str:
@@ -216,7 +270,13 @@ def load_dashboard_items_for_batch(db_path: Path, batch_id: str) -> pd.DataFrame
                     canonical_items.*,
                     upload_batches.period_start as batch_period_start,
                     upload_batches.period_end as batch_period_end,
-                    upload_batches.created_at as batch_created_at
+                    upload_batches.created_at as batch_created_at,
+                    upload_batches.period_level as batch_period_level,
+                    upload_batches.period_key as batch_period_key,
+                    upload_batches.period_label as batch_period_label,
+                    upload_batches.data_start as batch_data_start,
+                    upload_batches.data_end as batch_data_end,
+                    upload_batches.source_type as batch_source_type
                 from canonical_items
                 join upload_batches
                     on canonical_items.batch_id = upload_batches.batch_id
@@ -278,10 +338,17 @@ def build_period_comparison_for_batch(db_path: Path, batch_id: str) -> pd.DataFr
     db_path = Path(db_path)
     if not batch_id or not db_path.exists():
         return _empty_channel_comparison()
-    current_period_start = _batch_period_start(db_path, batch_id)
+    current = _batch_metadata(db_path, batch_id)
+    current_period_start = str(current.get("period_start", "") or "")
     if not current_period_start:
         return _empty_channel_comparison()
-    previous_batch_id = _previous_batch_id_for_period(db_path, current_period_start)
+    batches = list_successful_dashboard_batches(db_path)
+    previous_batch_id = previous_batch_from_rows(
+        batches,
+        current_period_start,
+        str(current.get("period_level", "") or ""),
+        str(current.get("period_key", "") or ""),
+    )
     if not previous_batch_id:
         return _empty_channel_comparison()
 
@@ -295,6 +362,23 @@ def build_period_comparison_for_batch(db_path: Path, batch_id: str) -> pd.DataFr
         _comparison_summary(previous_items),
     )
     return _normalize_channel_comparison(comparison)
+
+
+def _batch_metadata(db_path: Path, batch_id: str) -> dict[str, str]:
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            select batch_id, period_start, period_end, created_at, status,
+                   period_level, period_key, period_label, data_start, data_end, source_type
+            from upload_batches
+            where batch_id = ?
+            """,
+            (batch_id,),
+        ).fetchone()
+    if row is None:
+        return {}
+    return {column: "" if value is None else str(value) for column, value in zip(BATCH_COLUMNS, row)}
 
 
 def build_period_comparison_between_batches(
@@ -619,6 +703,131 @@ def summarize_dimension_for_metric(
     return _sort_metric_summary(summary, metric).head(int(top_n)).reset_index(drop=True)
 
 
+def summarize_channel_categories(items: pd.DataFrame, channel: str) -> pd.DataFrame:
+    """Summarize every nonblank secondary category for one channel."""
+    normalized = _normalize_items(items)
+    channel_name = str(channel or "").strip()
+    columns = ["category_name", *METRIC_COLUMNS]
+    if normalized.empty or not channel_name:
+        return pd.DataFrame(columns=columns)
+
+    scoped = normalized[normalized["channel"].eq(channel_name)].copy()
+    if scoped.empty:
+        return pd.DataFrame(columns=columns)
+
+    summary = aggregate_dashboard(scoped, ["category_l2"])
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+    summary = summary.rename(columns={"category_l2": "category_name"})
+    summary["category_name"] = summary["category_name"].fillna("").astype(str).str.strip()
+    summary = summary[summary["category_name"].ne("")]
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+    return _sort_metric_summary(summary, "spend")[columns].reset_index(drop=True)
+
+
+def summarize_channel_top_topics(
+    items: pd.DataFrame,
+    channel: str,
+    top_n: int = 20,
+    metric: str = "spend",
+    topic_labels: Mapping[int, str] | None = None,
+) -> pd.DataFrame:
+    """Summarize AI/fallback topics from the channel's Top N rows for one metric."""
+    normalized = _normalize_items(items)
+    channel_name = str(channel or "").strip()
+    columns = ["category_name", "topic_name", *METRIC_COLUMNS]
+    if normalized.empty or not channel_name or metric not in METRIC_COLUMNS:
+        return pd.DataFrame(columns=columns)
+
+    scoped = normalized[normalized["channel"].eq(channel_name)].copy()
+    if scoped.empty:
+        return pd.DataFrame(columns=columns)
+
+    scoped[metric] = pd.to_numeric(scoped[metric], errors="coerce")
+    scoped = scoped.dropna(subset=[metric])
+    if scoped.empty:
+        return pd.DataFrame(columns=columns)
+
+    top_rows = scoped.sort_values(
+        metric,
+        ascending=metric_sort_ascending(metric),
+        na_position="last",
+    ).head(int(top_n)).copy()
+    if top_rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    is_bilibili = channel_name == BILIBILI_CHANNEL
+    top_rows["category_name"] = (
+        BILIBILI_CATEGORY
+        if is_bilibili
+        else top_rows["category_l2"].fillna("").astype(str).str.strip()
+    )
+    top_rows.loc[top_rows["category_name"].eq(""), "category_name"] = "未匹配栏目"
+    labels = topic_labels or {}
+    top_rows["topic_name"] = [
+        _channel_topic_label_for_row(index, row, labels)
+        for index, row in top_rows.iterrows()
+    ]
+
+    summary = aggregate_dashboard(top_rows, ["category_name", "topic_name"])
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+    summary["topic_name"] = summary["topic_name"].fillna("").astype(str).str.strip()
+    summary.loc[summary["topic_name"].eq(""), "topic_name"] = "未命名题材"
+    return _sort_metric_summary(summary, metric).head(int(top_n))[columns].reset_index(drop=True)
+
+
+def build_channel_top_topic_insights(topic_summary: pd.DataFrame) -> str:
+    """Build concise business analysis for a channel's Top 20 topic summary."""
+    summary = topic_summary.copy()
+    if summary.empty:
+        return "#### Top 20 题材分析结论\n- 当前没有可用于分析的 Top 20 题材数据。"
+
+    for column in ["spend", "activations", "activation_cost", "first_pay_count", "first_pay_rate"]:
+        if column not in summary.columns:
+            summary[column] = 0.0
+        summary[column] = pd.to_numeric(summary[column], errors="coerce")
+    if "topic_name" not in summary.columns:
+        summary["topic_name"] = ""
+    summary["topic_name"] = summary["topic_name"].fillna("").astype(str).str.strip()
+    summary.loc[summary["topic_name"].eq(""), "topic_name"] = "未命名题材"
+
+    total_spend = _sum_or_zero(summary["spend"])
+    top_spend = summary.sort_values("spend", ascending=False).iloc[0]
+    top3_spend = _sum_or_zero(summary.sort_values("spend", ascending=False).head(3)["spend"])
+    top_activation = summary.sort_values(["activations", "spend"], ascending=[False, False]).iloc[0]
+    efficient_rows = summary[summary["activations"].gt(0) & summary["activation_cost"].notna()]
+    efficient = efficient_rows.sort_values(["activation_cost", "spend"], ascending=[True, False]).iloc[0] if not efficient_rows.empty else top_activation
+    pay_rows = summary[summary["activations"].gt(0) & summary["first_pay_rate"].notna()]
+    pay_topic = pay_rows.sort_values(["first_pay_rate", "first_pay_count", "spend"], ascending=[False, False, False]).iloc[0] if not pay_rows.empty else top_activation
+
+    top_share = _safe_ratio(float(top_spend.get("spend", 0) or 0), total_spend)
+    top3_share = _safe_ratio(top3_spend, total_spend)
+    return "\n".join(
+        [
+            "#### Top 20 题材分析结论",
+            (
+                f"- 预算集中在 **{top_spend['topic_name']}**：消耗 {_fmt_number(top_spend.get('spend'), 0)}，"
+                f"占 Top 20 消耗 {_fmt_percent_text(top_share)}；Top 3 题材合计占 {_fmt_percent_text(top3_share)}。"
+            ),
+            (
+                f"- 拉新贡献最高的是 **{top_activation['topic_name']}**：激活 {_fmt_number(top_activation.get('activations'), 0)}，"
+                f"激活成本 {_fmt_number(top_activation.get('activation_cost'), 1)}。"
+            ),
+            (
+                f"- 效率最优的是 **{efficient['topic_name']}**：激活成本 {_fmt_number(efficient.get('activation_cost'), 1)}，"
+                f"可作为低成本扩量候选。"
+            ),
+            (
+                f"- 付费转化优先关注 **{pay_topic['topic_name']}**：首次付费率 {_fmt_percent_text(pay_topic.get('first_pay_rate'))}，"
+                f"付费 {_fmt_number(pay_topic.get('first_pay_count'), 0)}。"
+            ),
+            "建议：下一轮素材不要逐条按标题复投，优先围绕高消耗且能带来拉新的题材扩展相邻选题，同时用低成本题材做小预算测试。",
+        ]
+    )
+
+
 def summarize_topics_for_selection(
     items: pd.DataFrame,
     channel: str,
@@ -741,6 +950,73 @@ def build_content_recommendations(
     return "\n".join(lines)
 
 
+def build_overview_table_rows(
+    summary: DashboardSummary,
+    platform_summary: pd.DataFrame,
+    channel_comparison: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Build total-first overview rows with current values and optional period growth."""
+    growth_by_channel = _overview_growth_by_channel(channel_comparison)
+    rows = [
+        _overview_table_row(
+            "汇总",
+            {
+                "spend": summary.total_spend,
+                "activations": summary.activations,
+                "activation_cost": summary.activation_cost,
+                "first_pay_count": summary.first_pay_count,
+                "first_pay_cost": summary.first_pay_cost,
+            },
+            growth_by_channel.get("总计"),
+        )
+    ]
+
+    if not platform_summary.empty:
+        display = platform_summary.copy()
+        name_column = "channel" if "channel" in display.columns else display.columns[0]
+        display["_overview_channel_priority"] = display[name_column].map(_overview_channel_priority)
+        display["_overview_channel_order"] = range(len(display))
+        display = display.sort_values(
+            ["_overview_channel_priority", "_overview_channel_order"],
+            kind="stable",
+        )
+        for _, row in display.iterrows():
+            channel = str(row.get(name_column, "")).strip()
+            rows.append(
+                _overview_table_row(
+                    channel,
+                    {
+                        "spend": row.get("spend", pd.NA),
+                        "activations": row.get("activations", pd.NA),
+                        "activation_cost": row.get("activation_cost", pd.NA),
+                        "first_pay_count": row.get("first_pay_count", pd.NA),
+                        "first_pay_cost": row.get("first_pay_cost", pd.NA),
+                    },
+                    growth_by_channel.get(channel),
+                )
+            )
+
+    result = pd.DataFrame(rows)
+    for column in OVERVIEW_TABLE_COLUMNS:
+        if column not in result.columns:
+            result[column] = "" if column == "channel" else pd.NA
+    for column in OVERVIEW_TABLE_COLUMNS:
+        if column != "channel":
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+    return result[OVERVIEW_TABLE_COLUMNS].reset_index(drop=True)
+
+
+def _overview_channel_priority(channel: object) -> int:
+    name = str(channel or "").strip()
+    if "抖音" in name:
+        return 0
+    if "小红书" in name:
+        return 1
+    if "B站" in name:
+        return 2
+    return 3
+
+
 def build_dashboard_summary(items: pd.DataFrame) -> DashboardSummary:
     items = _normalize_items(items)
     spend = _sum_or_zero(items.get("spend", pd.Series(dtype=float)))
@@ -813,6 +1089,28 @@ def _normalize_channel_comparison(comparison: pd.DataFrame) -> pd.DataFrame:
             continue
         normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
     return normalized[CHANNEL_COMPARISON_COLUMNS].reset_index(drop=True)
+
+
+def _overview_growth_by_channel(channel_comparison: Optional[pd.DataFrame]) -> dict[str, pd.Series]:
+    if channel_comparison is None or channel_comparison.empty or "channel" not in channel_comparison.columns:
+        return {}
+    comparison = channel_comparison.copy()
+    comparison["channel"] = comparison["channel"].fillna("").astype(str).str.strip()
+    comparison = comparison[comparison["channel"].ne("")]
+    return {str(row["channel"]): row for _, row in comparison.iterrows()}
+
+
+def _overview_table_row(
+    channel: str,
+    values: Mapping[str, object],
+    growth_row: Optional[pd.Series],
+) -> dict[str, object]:
+    row: dict[str, object] = {"channel": channel}
+    for metric in ["spend", "activations", "activation_cost", "first_pay_count", "first_pay_cost"]:
+        row[metric] = values.get(metric, pd.NA)
+        rate_column = f"{metric}_change_rate"
+        row[rate_column] = pd.NA if growth_row is None else growth_row.get(rate_column, pd.NA)
+    return row
 
 
 def _batch_period_start(db_path: Path, batch_id: str) -> str:
@@ -894,6 +1192,54 @@ def _topic_label_for_row(index: object, row: pd.Series, topic_labels: Mapping[in
     if label:
         return _clean_topic_label(label)
     return _fallback_topic_label(row)
+
+
+def _channel_topic_label_for_row(index: object, row: pd.Series, topic_labels: Mapping[int, str]) -> str:
+    try:
+        normalized_index = int(index)
+    except (TypeError, ValueError):
+        normalized_index = index
+    label = str(topic_labels.get(normalized_index, "")).strip()
+    if label and not _looks_like_single_title(label, row):
+        return _clean_topic_label(label)
+    return _algorithmic_channel_topic_label(row)
+
+
+def _algorithmic_channel_topic_label(row: pd.Series) -> str:
+    search_text = " ".join(
+        str(row.get(column, "") or "").strip()
+        for column in ["category_l2", "category_l3", "content_category", "title"]
+        if str(row.get(column, "") or "").strip()
+    )
+    for topic_name, keywords in CHANNEL_TOPIC_KEYWORD_RULES:
+        if any(keyword and keyword in search_text for keyword in keywords):
+            return topic_name
+
+    for column in ["category_l2", "content_category", "category_l3"]:
+        label = str(row.get(column, "") or "").strip()
+        if label and label != BILIBILI_CATEGORY and not _looks_like_single_title(label, row):
+            return _clean_topic_label(label)
+    return "未归类题材"
+
+
+def _looks_like_single_title(label: str, row: pd.Series) -> bool:
+    clean = _clean_topic_label(label)
+    compact = re.sub(r"\s+", "", clean)
+    if not compact or clean == "未命名题材":
+        return True
+    if len(compact) > 12:
+        return True
+    title = _compact_text(row.get("title", ""))
+    category_l3 = _compact_text(row.get("category_l3", ""))
+    if compact and title and compact == title:
+        return True
+    if compact and category_l3 and compact == category_l3:
+        return len(compact) >= 8 or clean != compact or bool(re.search(r"[，,。！？?：:/|《》【】（）()]", clean))
+    return False
+
+
+def _compact_text(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip())
 
 
 def _fallback_topic_label(row: pd.Series) -> str:
@@ -1017,6 +1363,13 @@ def _fmt_number(value: object, decimals: int) -> str:
     return f"{float(number):,.{decimals}f}"
 
 
+def _fmt_percent_text(value: object) -> str:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(number):
+        return "暂无"
+    return f"{float(number):.1%}"
+
+
 def _empty_items() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
@@ -1048,6 +1401,10 @@ def _empty_items() -> pd.DataFrame:
             "source_file",
         ]
     )
+
+
+def _empty_batches() -> pd.DataFrame:
+    return pd.DataFrame(columns=BATCH_COLUMNS)
 
 
 def _empty_channel_comparison() -> pd.DataFrame:

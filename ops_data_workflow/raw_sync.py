@@ -6,6 +6,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
+import json
 import sqlite3
 from typing import Callable, Optional
 
@@ -13,6 +14,7 @@ import pandas as pd
 
 from .pipeline import TABULAR_SUFFIXES
 from .reference_tables import parse_period_from_raw_dir
+from .periods import ReviewPeriod, period_metadata_from_dates
 from .storage import is_period_active
 from .workflow import run_archived_workflow
 
@@ -23,6 +25,12 @@ class RawPeriod:
     path: Path
     period_start: str
     period_end: str
+    period_level: str
+    period_key: str
+    period_label: str
+    data_start: str
+    data_end: str
+    source_type: str
 
 
 @dataclass(frozen=True)
@@ -48,7 +56,7 @@ def discover_raw_periods(raw_root: Path) -> list[RawPeriod]:
         if not child.is_dir() or child.name == "uploaded_originals":
             continue
         try:
-            period_start, period_end = parse_period_from_raw_dir(child)
+            metadata = _period_metadata_for_raw_dir(child)
         except ValueError:
             continue
         if not _raw_tabular_files(child):
@@ -57,8 +65,14 @@ def discover_raw_periods(raw_root: Path) -> list[RawPeriod]:
             RawPeriod(
                 name=child.name,
                 path=child,
-                period_start=period_start,
-                period_end=period_end,
+                period_start=metadata.period_start,
+                period_end=metadata.period_end,
+                period_level=metadata.period_level,
+                period_key=metadata.period_key,
+                period_label=metadata.period_label,
+                data_start=metadata.data_start,
+                data_end=metadata.data_end,
+                source_type=metadata.source_type,
             )
         )
     return periods
@@ -116,6 +130,12 @@ def sync_raw_periods(
                 category_rules_path=category_rules_path,
                 env_path=env_path,
                 category_matcher=category_matcher,
+                period_level=period.period_level,
+                period_key=period.period_key,
+                period_label=period.period_label,
+                data_start=period.data_start,
+                data_end=period.data_end,
+                source_type=period.source_type,
             )
             results.append(
                 RawSyncResult(
@@ -147,6 +167,27 @@ def _raw_tabular_files(period_dir: Path) -> list[Path]:
         for path in Path(period_dir).rglob("*")
         if path.is_file() and path.suffix.lower() in TABULAR_SUFFIXES and not path.name.startswith("~$")
     )
+
+
+def _period_metadata_for_raw_dir(period_dir: Path) -> ReviewPeriod:
+    manifest = Path(period_dir) / "period_manifest.json"
+    if manifest.exists():
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            return period_metadata_from_dates(
+                str(payload.get("period_start", "")),
+                str(payload.get("period_end", "")),
+                str(payload.get("period_level", "")),
+                str(payload.get("period_key", "")),
+                str(payload.get("period_label", "")),
+                str(payload.get("data_start", "")),
+                str(payload.get("data_end", "")),
+                str(payload.get("source_type", "")),
+            )
+        except Exception as exc:
+            raise ValueError(f"period_manifest.json 无法解析：{exc}") from exc
+    period_start, period_end = parse_period_from_raw_dir(period_dir)
+    return period_metadata_from_dates(period_start, period_end)
 
 
 def _raw_signature(period_dir: Path) -> list[FileSignature]:

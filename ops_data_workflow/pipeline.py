@@ -63,6 +63,11 @@ STANDARD_COLUMNS = [
     "needs_manual_review",
     "review_reasons",
     "source_file",
+    "source_sheet",
+    "source_row",
+    "source_file_hash",
+    "duplicate_group_id",
+    "review_action",
 ]
 
 INTERNAL_COMPAT_COLUMNS = {"platform", "platform_group"}
@@ -184,14 +189,83 @@ def analyze_input_dir(
     )
 
 
+def analyze_canonical_frame(
+    canonical: pd.DataFrame,
+    period_start: str,
+    period_end: str,
+    category_rules_path: Optional[Path] = None,
+    *,
+    env_path: Optional[Path] = None,
+    category_matcher: Optional[CategoryMatcher] = None,
+    category_mappings: Optional[CategoryMappings] = None,
+    reference_tables_path: Optional[Path] = None,
+) -> AnalysisData:
+    rules = load_category_rules(category_rules_path)
+    references = load_reference_tables(reference_tables_path or Path("config/reference_tables.xlsx"))
+    prepared = canonical.copy()
+    for column in STANDARD_COLUMNS:
+        if column not in prepared.columns:
+            prepared[column] = ""
+    prepared["period_start"] = period_start
+    prepared["period_end"] = period_end
+    prepared = _apply_account_mappings(prepared, references)
+    preprocessing = _preprocess_canonical(prepared)
+    prepared = preprocessing["canonical"]
+    prepared = _complete_categories(
+        prepared,
+        rules,
+        references=references,
+        env_path=env_path,
+        category_matcher=category_matcher,
+        category_mappings=category_mappings or {},
+    )
+    prepared = _derive_metrics(prepared)
+    data_quality = _build_data_quality_report(prepared)
+    preprocessing_report = _build_preprocessing_report(prepared, preprocessing, data_quality)
+    review_queue = _build_review_queue(prepared)
+    channel_summary = _summarize_channels(prepared)
+    platform_summary = _summarize_platforms(prepared)
+    platform_category_summary = _summarize_platform_categories(prepared)
+    total_summary = _make_total_summary(prepared)
+    category_summary = _summarize_categories(prepared)
+    pending = prepared[prepared["content_category"].map(_is_blank)].copy()
+    account_audit = _build_account_audit(prepared)
+    top_content_items = _summarize_top_content(prepared)
+    cover_metrics = _summarize_cover_metrics(prepared)
+    return AnalysisData(
+        canonical=prepared,
+        category_summary=category_summary,
+        channel_summary=channel_summary,
+        platform_summary=platform_summary,
+        platform_category_summary=platform_category_summary,
+        total_summary=total_summary,
+        raw_category_stats=pd.DataFrame(columns=["source_file", "sheet", "raw_field", "value", "count"]),
+        pending_categories=pending,
+        account_audit=account_audit,
+        top_content_items=top_content_items,
+        cover_metrics=cover_metrics,
+        data_quality=data_quality,
+        review_queue=review_queue,
+        preprocessing_report=preprocessing_report,
+        duplicate_merge_details=preprocessing["duplicate_merge_details"],
+        conflict_retention_details=preprocessing["conflict_retention_details"],
+        missing_value_details=preprocessing["missing_value_details"],
+        reference_tables=references,
+    )
+
+
 def _read_available_sources(input_dir: Path, references: ReferenceTables) -> List[pd.DataFrame]:
     frames: List[pd.DataFrame] = []
     used: set[Path] = set()
     reader_specs = [
         (["B站"], _read_bilibili),
+        (["小红书", "市场部"], _read_xiaohongshu_market),
         (["小红书"], _read_xiaohongshu),
+        (["抖音", "达人"], _read_douyin_generic),
         (["抖音", "商业化"], _read_douyin_commercial),
         (["抖音", "市场部"], _read_douyin_market),
+        (["微信", "市场部"], _read_social_market),
+        (["腾讯", "市场部"], _read_social_market),
     ]
     for tokens, reader in reader_specs:
         try:
@@ -219,10 +293,14 @@ def _read_optional_source(path: Path, references: ReferenceTables) -> Optional[p
     name = path.name
     if "抖音" in name:
         return _read_douyin_generic(path)
+    if "小红书" in name and "市场部" in name:
+        return _read_xiaohongshu_market(path)
     if "小红书" in name:
         return _read_xiaohongshu(path)
     if "B站" in name:
         return _read_bilibili(path)
+    if "微信" in name or "腾讯" in name:
+        return _read_social_market(path)
     columns = _read_first_available_columns(path)
     if {"视频BVID", "花费", "展示量"}.issubset(columns) or {"视频AVID", "应用激活数"}.issubset(columns):
         return _read_bilibili(path)
@@ -230,6 +308,8 @@ def _read_optional_source(path: Path, references: ReferenceTables) -> Optional[p
         return _read_xiaohongshu(path)
     if {"视频标题", "消耗", "展示数"}.issubset(columns):
         return _read_douyin_generic(path)
+    if {"创意名称", "花费"}.issubset(columns) or {"链接", "花费"}.issubset(columns):
+        return _read_social_market(path)
     if path.suffix.lower() in {".xls", ".xlsx"}:
         return _read_generic_channel(path, references)
     return None
@@ -322,6 +402,33 @@ def _read_xiaohongshu(path: Path) -> pd.DataFrame:
     )
 
 
+def _read_xiaohongshu_market(path: Path) -> pd.DataFrame:
+    raw = _read_first_sheet_with_columns(path, ["消费"])
+    return _standardize(
+        raw,
+        platform="小红书市场部",
+        platform_group="小红书",
+        channel="小红书市场部",
+        source_file=path.name,
+        fields={
+            "content_id": ["笔记/素材ID", "笔记ID", "素材ID", "计划ID", "链接", "笔记/素材链接"],
+            "material_id": ["笔记/素材ID", "素材ID", "计划ID"],
+            "title": ["标题", "笔记标题", "创意名称", "计划名称", "笔记/素材链接"],
+            "account_id": ["作者ID", "用户ID", "账号ID"],
+            "account": ["发布作者", "账号", "账号名称"],
+            "cover_url": ["封面", "封面图", "图片链接"],
+            "content_url": ["笔记链接", "笔记/素材链接", "链接"],
+            "primary_category": ["类型", "营销诉求"],
+            "manual_category": ["内容分类", "内容类型"],
+            "spend": ["消费", "消耗", "花费"],
+            "impressions": ["展现量", "曝光次数", "展示数"],
+            "clicks": ["点击量", "点击次数", "点击数"],
+            "activations": ["激活数", "激活数(转化时间)", "APP激活次数"],
+            "first_pay_count": ["首次付费次数", "首次付费次数(转化时间)", "付费次数"],
+        },
+    )
+
+
 def _read_douyin_commercial(path: Path) -> pd.DataFrame:
     raw = _read_named_or_first_matching_sheet(path, "Sheet2", ["视频标题", "消耗"])
     return _standardize_douyin(raw, path.name, "抖音商业化")
@@ -337,15 +444,43 @@ def _read_douyin_generic(path: Path) -> pd.DataFrame:
     stem = path.stem
     if "市场部" in stem:
         channel = "抖音市场部"
-    elif "商业化" in stem:
-        channel = "抖音商业化"
     elif "达人" in stem:
         channel = "抖音达人内容"
+    elif "商业化" in stem:
+        channel = "抖音商业化"
     elif "期货" in stem:
         channel = "抖音期货通"
     else:
         channel = stem
     return _standardize_douyin(raw, path.name, channel)
+
+
+def _read_social_market(path: Path) -> pd.DataFrame:
+    raw = _read_first_non_empty_sheet(path)
+    channel = _social_market_channel(path.stem)
+    return _standardize(
+        raw,
+        platform=channel,
+        platform_group=channel.replace("市场部", ""),
+        channel=channel,
+        source_file=path.name,
+        fields={
+            "content_id": ["内容ID", "创意ID", "计划ID", "链接", "落地页", "创意名称"],
+            "material_id": ["素材ID", "创意ID", "计划ID", "链接", "创意名称"],
+            "title": ["创意名称", "标题", "内容标题", "链接", "落地页"],
+            "account_id": ["账号ID", "账户ID"],
+            "account": ["账号", "账号名称", "账户名称"],
+            "cover_url": ["封面", "封面图", "图片链接"],
+            "content_url": ["链接", "落地页"],
+            "primary_category": ["营销诉求", "优化目标"],
+            "manual_category": ["内容分类", "内容类型"],
+            "spend": ["花费", "消费", "消耗"],
+            "impressions": ["曝光次数", "展现量", "展示数"],
+            "clicks": ["点击次数", "点击量", "点击数"],
+            "activations": ["APP激活次数", "激活数", "注册次数"],
+            "first_pay_count": ["注册次数", "注册次数（点击归因）", "付费次数", "首次付费次数"],
+        },
+    )
 
 
 def _read_generic_channel(path: Path, references: ReferenceTables) -> pd.DataFrame:
@@ -355,8 +490,8 @@ def _read_generic_channel(path: Path, references: ReferenceTables) -> pd.DataFra
     channel = path.stem
     fields = {
         "content_id": ["内容ID", "内容id", "视频id", "视频ID", "笔记ID", "作品ID", "id", "ID"],
-        "material_id": ["素材ID", "素材id", "素材中心id", "内容ID", "视频id", "笔记ID"],
-        "title": ["标题", "视频标题", "内容标题", "笔记标题"],
+        "material_id": ["素材ID", "素材id", "素材中心id", "内容ID", "视频id", "笔记ID", "链接", "创意名称"],
+        "title": ["标题", "视频标题", "内容标题", "笔记标题", "创意名称", "链接"],
         "account_id": ["账号ID", "账号id", "作者ID", "用户ID", "uid", "UID", "mid"],
         "account": ["账号", "账号名称", "发布账号", "达人名称", "作者", "发布作者"],
         "cover_url": ["封面", "封面图", "图片链接", "视频封面图", "素材url"],
@@ -367,8 +502,8 @@ def _read_generic_channel(path: Path, references: ReferenceTables) -> pd.DataFra
         "spend": ["消耗", "消费", "花费", "spend"],
         "impressions": ["展示数", "展示量", "展现量", "曝光量", "impressions"],
         "clicks": ["点击数", "点击量", "clicks"],
-        "activations": ["激活数", "应用激活数", "activations"],
-        "first_pay_count": ["付费次数", "首次付费次数", "应用内付费"],
+        "activations": ["激活数", "应用激活数", "APP激活次数", "activations"],
+        "first_pay_count": ["付费次数", "首次付费次数", "应用内付费", "注册次数", "注册次数（点击归因）"],
     }
     return _standardize(
         raw,
@@ -445,9 +580,9 @@ def _standardize_douyin(raw: pd.DataFrame, source_file: str, channel: str) -> pd
         channel=channel,
         source_file=source_file,
         fields={
-            "content_id": ["视频id"],
-            "material_id": ["素材ID"],
-            "title": ["视频标题"],
+            "content_id": ["视频id", "视频链接"],
+            "material_id": ["素材ID", "视频链接"],
+            "title": ["视频标题", "视频链接"],
             "account_id": ["账号ID", "账号id", "抖音号", "达人ID", "作者ID", "uid", "UID"],
             "account": ["账号", "账号名称", "发布账号", "达人名称"],
             "cover_url": ["视频封面图"],
@@ -458,9 +593,18 @@ def _standardize_douyin(raw: pd.DataFrame, source_file: str, channel: str) -> pd
             "impressions": ["展示数"],
             "clicks": ["点击数"],
             "activations": ["激活数"],
-            "first_pay_count": ["付费次数"],
+            "first_pay_count": ["付费次数", "付费数"],
         },
     )
+
+
+def _social_market_channel(stem: str) -> str:
+    name = re.sub(r"[（）()\s_-]+", "", str(stem or ""))
+    if "腾讯" in name:
+        return "腾讯市场部"
+    if "微信" in name:
+        return "微信市场部"
+    return stem
 
 
 def _standardize(
@@ -562,10 +706,11 @@ def _preprocess_canonical(canonical: pd.DataFrame) -> dict[str, pd.DataFrame]:
         if column not in canonical.columns:
             canonical[column] = "" if column not in {"merged_row_count", "needs_manual_review"} else 0
     canonical["dedupe_key"] = canonical.apply(_dedupe_key, axis=1)
-    canonical["merged_row_count"] = 1
-    canonical["conflict_details"] = ""
-    canonical["needs_manual_review"] = False
-    canonical["review_reasons"] = ""
+    canonical["merged_row_count"] = pd.to_numeric(canonical["merged_row_count"], errors="coerce").fillna(0).astype(int)
+    canonical["merged_row_count"] = canonical["merged_row_count"].where(canonical["merged_row_count"].gt(0), 1)
+    canonical["conflict_details"] = canonical["conflict_details"].fillna("").astype(str)
+    canonical["needs_manual_review"] = canonical["needs_manual_review"].fillna(False).astype(bool)
+    canonical["review_reasons"] = canonical["review_reasons"].fillna("").astype(str)
 
     rows: list[pd.Series] = []
     duplicate_rows: list[dict[str, object]] = []
@@ -614,9 +759,14 @@ def _preprocess_canonical(canonical: pd.DataFrame) -> dict[str, pd.DataFrame]:
 def _dedupe_key(row: pd.Series) -> str:
     channel = "" if _is_blank(row.get("channel")) else str(row.get("channel")).strip()
     content_id = "" if _is_blank(row.get("content_id")) else str(row.get("content_id")).strip()
-    if not channel or not content_id:
+    if not channel:
         return ""
-    return f"{channel}::{content_id}"
+    if content_id:
+        return f"{channel}::id::{content_id}"
+    title = "" if _is_blank(row.get("title")) else re.sub(r"\s+", "", str(row.get("title")).strip()).lower()
+    if not title:
+        return ""
+    return f"{channel}::title::{title}"
 
 
 def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[str, object]]]:
@@ -663,12 +813,22 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
             merged[column] = group[column].iloc[0]
         else:
             merged[column] = _first_non_blank_value(group[column])
+    existing_reasons: list[str] = []
+    for value in group.get("review_reasons", pd.Series(dtype=object)).tolist():
+        existing_reasons.extend(_split_reasons(value))
+    existing_conflicts = [
+        str(value).strip()
+        for value in group.get("conflict_details", pd.Series(dtype=object)).tolist()
+        if not _is_blank(value)
+    ]
     if conflict_columns:
-        merged["conflict_details"] = "; ".join(
-            f"{item['column']}={item['values']}->{item['action']}" for item in conflicts
-        )
+        existing_conflicts.extend(f"{item['column']}={item['values']}->{item['action']}" for item in conflicts)
         merged["needs_manual_review"] = True
-        merged["review_reasons"] = "数值冲突"
+        existing_reasons.append("数值冲突")
+    elif bool(group.get("needs_manual_review", pd.Series(dtype=bool)).astype(bool).any()):
+        merged["needs_manual_review"] = True
+    merged["conflict_details"] = "; ".join(dict.fromkeys(existing_conflicts))
+    merged["review_reasons"] = "；".join(dict.fromkeys(reason for reason in existing_reasons if reason))
     return merged, conflicts
 
 
@@ -1461,6 +1621,11 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
                 "activations",
                 "activation_cost",
                 "source_file",
+                "source_sheet",
+                "source_row",
+                "source_file_hash",
+                "duplicate_group_id",
+                "review_action",
             ]
         )
     columns = [
@@ -1486,6 +1651,11 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
         "activations",
         "activation_cost",
         "source_file",
+        "source_sheet",
+        "source_row",
+        "source_file_hash",
+        "duplicate_group_id",
+        "review_action",
     ]
     return queue.sort_values(["spend", "activations"], ascending=[False, False])[columns].reset_index(drop=True)
 

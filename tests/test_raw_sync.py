@@ -1,6 +1,7 @@
 from contextlib import closing
 from pathlib import Path
 import sqlite3
+import json
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -45,6 +46,50 @@ class RawSyncTests(unittest.TestCase):
 
             self.assertEqual([period.name for period in periods], ["20260501-20260507", "20260508-20260514"])
 
+    def test_discover_raw_periods_reads_manifest_period_metadata(self):
+        with TemporaryDirectory() as tmp:
+            raw_root = Path(tmp) / "data" / "raw"
+            period_dir = raw_root / "20260301-20260331"
+            _write_xiaohongshu_file(period_dir / "小红书账号投放数据.xlsx", "note-mar", 10.0)
+            (period_dir / "period_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "period_level": "month",
+                        "period_key": "2026-03",
+                        "period_label": "月｜2026年03月（数据时间：2026-03-01 至 2026-03-23）",
+                        "period_start": "2026-03-01",
+                        "period_end": "2026-03-31",
+                        "data_start": "2026-03-01",
+                        "data_end": "2026-03-23",
+                        "source_type": "upload",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            periods = discover_raw_periods(raw_root)
+
+            self.assertEqual(len(periods), 1)
+            self.assertEqual(periods[0].period_level, "month")
+            self.assertEqual(periods[0].period_key, "2026-03")
+            self.assertEqual(periods[0].period_end, "2026-03-31")
+            self.assertEqual(periods[0].data_end, "2026-03-23")
+
+    def test_discover_raw_periods_treats_legacy_long_range_as_month(self):
+        with TemporaryDirectory() as tmp:
+            raw_root = Path(tmp) / "data" / "raw"
+            _write_xiaohongshu_file(raw_root / "20260401-20260427" / "小红书账号投放数据.xlsx", "note-apr", 10.0)
+
+            periods = discover_raw_periods(raw_root)
+
+            self.assertEqual(len(periods), 1)
+            self.assertEqual(periods[0].period_level, "month")
+            self.assertEqual(periods[0].period_key, "2026-04")
+            self.assertEqual(periods[0].period_start, "2026-04-01")
+            self.assertEqual(periods[0].period_end, "2026-04-30")
+            self.assertEqual(periods[0].data_end, "2026-04-27")
+
     def test_sync_raw_periods_generates_once_and_regenerates_after_file_change(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -87,9 +132,9 @@ class RawSyncTests(unittest.TestCase):
             with closing(sqlite3.connect(tmp_path / "workflow.sqlite3")) as conn:
                 periods = conn.execute(
                     """
-                    select period_start, period_end, count(*)
+                    select period_start, period_end, period_level, source_type, count(*)
                     from upload_batches
-                    group by period_start, period_end
+                    group by period_start, period_end, period_level, source_type
                     order by period_start
                     """
                 ).fetchall()
@@ -101,7 +146,13 @@ class RawSyncTests(unittest.TestCase):
                     """,
                     (third[1].batch_id,),
                 ).fetchone()[0]
-            self.assertEqual(periods, [("2026-05-01", "2026-05-07", 1), ("2026-05-08", "2026-05-14", 2)])
+            self.assertEqual(
+                periods,
+                [
+                    ("2026-05-01", "2026-05-07", "week", "upload", 1),
+                    ("2026-05-08", "2026-05-14", "week", "upload", 2),
+                ],
+            )
             self.assertEqual(latest_new_count, 1)
 
     def test_sync_raw_periods_skips_backed_up_periods(self):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import html
+import json
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -13,7 +15,8 @@ from ops_data_workflow.ai import group_topic_labels, resolve_deepseek_settings
 from ops_data_workflow.dashboard import (
     DashboardFilters,
     aggregate_dashboard,
-    build_period_comparison_between_batches,
+    build_channel_top_topic_insights,
+    build_overview_table_rows,
     build_period_comparison_for_batch,
     build_content_recommendations,
     build_dashboard_summary,
@@ -30,7 +33,8 @@ from ops_data_workflow.dashboard import (
     load_review_queue_for_batch,
     list_successful_dashboard_batches,
     metric_sort_ascending,
-    summarize_dimension_for_metric,
+    summarize_channel_categories,
+    summarize_channel_top_topics,
     summarize_topics_for_selection,
     summarize_content_type_trends,
     summarize_content_types,
@@ -39,6 +43,16 @@ from ops_data_workflow.dashboard import (
 from ops_data_workflow.reporting import localize_columns, localize_and_sort_columns
 from ops_data_workflow.reference_tables import load_reference_tables
 from ops_data_workflow.raw_sync import sync_raw_periods
+from ops_data_workflow.periods import PERIOD_LEVEL_LABELS, PERIOD_LEVELS, PERIOD_LEVEL_WEEK, SOURCE_TYPE_UPLOAD, review_period_from_dates
+from ops_data_workflow.raw_cleaning import clean_raw_period_dir
+from ops_data_workflow.raw_normalization import normalize_uploaded_periods, preview_uploaded_period_buckets, preview_uploaded_periods
+from ops_data_workflow.review_resolutions import (
+    REVIEW_ACTIONS,
+    apply_review_resolutions_and_regenerate,
+    load_data_review_items,
+    save_review_resolutions,
+)
+from ops_data_workflow.rollups import rollup_period_for, select_rollup_component_batches
 from ops_data_workflow.storage import (
     delete_batch_permanently,
     list_file_backups,
@@ -49,7 +63,7 @@ from ops_data_workflow.storage import (
     upsert_category_mappings,
 )
 from ops_data_workflow.upload_input import infer_period_from_upload_names, materialize_uploaded_files
-from ops_data_workflow.workflow import run_archived_workflow
+from ops_data_workflow.workflow import run_archived_workflow, run_rollup_workflow
 
 
 APP_DB = Path("data/workflow.sqlite3")
@@ -68,6 +82,24 @@ CHART_METRICS = {
     "激活成本": ("activation_cost", "activations", "激活成本", "激活数"),
     "付费成本": ("first_pay_cost", "first_pay_count", "付费成本", "付费数"),
     "付费率": ("first_pay_rate", "activations", "付费率", "激活数"),
+}
+GENERATION_PROGRESS_STEPS = (
+    "正在识别上传文件和复盘周期",
+    "正在整理 raw 周期目录",
+    "正在归档原始文件",
+    "正在读取渠道数据并标准化",
+    "正在校验数据质量与题材分类",
+    "正在写入历史库并生成下载文件",
+    "报告生成完成",
+)
+GENERATION_PROGRESS_VALUES = {
+    "正在识别上传文件和复盘周期": 5,
+    "正在整理 raw 周期目录": 15,
+    "正在归档原始文件": 25,
+    "正在读取渠道数据并标准化": 45,
+    "正在校验数据质量与题材分类": 70,
+    "正在写入历史库并生成下载文件": 90,
+    "报告生成完成": 95,
 }
 GROWTH_METRICS = {
     "消耗": ("spend_current", "spend_change_rate", 0, "normal"),
@@ -91,6 +123,7 @@ BAR_COLOR_SEQUENCE = [
 ]
 BAR_CONTINUOUS_SCALE = ["#D7ECFF", "#64D2FF", "#0A84FF", "#0B3D91"]
 RATE_METRIC_COLUMNS = {"ctr", "first_pay_rate", "spend_change_rate", "activations_change_rate", "first_pay_count_change_rate", "activation_cost_change_rate", "first_pay_cost_change_rate"}
+SOURCE_TYPE_LABELS = {SOURCE_TYPE_UPLOAD: "上传原始包", "rollup": "系统汇总"}
 
 
 def _get_logo_base64() -> str:
@@ -181,16 +214,30 @@ def _inject_theme() -> None:
         .stButton > button,
         [data-testid="stDownloadButton"] > button {
             border-radius: 16px;
-            border: 0;
             min-height: 46px;
+            font-weight: 650;
+        }
+        .stButton > button[kind="primary"],
+        [data-testid="stDownloadButton"] > button {
+            border: 0;
             background: linear-gradient(180deg, #3da2ff 0%, #0a84ff 100%);
             color: #ffffff;
-            font-weight: 650;
             box-shadow: 0 14px 30px rgba(10, 132, 255, 0.28);
         }
-        .stButton > button:hover,
+        .stButton > button[kind="primary"]:hover,
         [data-testid="stDownloadButton"] > button:hover {
             background: linear-gradient(180deg, #2496ff 0%, #0071e3 100%);
+        }
+        .stButton > button[kind="secondary"] {
+            border: 1px solid rgba(182, 198, 224, 0.68);
+            background: rgba(255, 255, 255, 0.92);
+            color: var(--text-main);
+            box-shadow: 0 8px 18px rgba(68, 89, 126, 0.08);
+        }
+        .stButton > button[kind="secondary"]:hover {
+            border-color: rgba(10, 132, 255, 0.45);
+            color: #0a84ff;
+            background: rgba(247, 251, 255, 0.98);
         }
         .stSegmentedControl [role="radiogroup"] {
             background: rgba(229, 236, 247, 0.9);
@@ -225,6 +272,57 @@ def _inject_theme() -> None:
         }
         .dataframe td {
             background: rgba(255, 255, 255, 0.72);
+        }
+        .overview-summary-table-wrap {
+            overflow-x: auto;
+            margin: 0.2rem 0 1.1rem;
+            border: 1px solid rgba(113, 135, 168, 0.2);
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.92);
+            box-shadow: 0 10px 24px rgba(68, 89, 126, 0.08);
+        }
+        .overview-summary-table {
+            width: 100%;
+            min-width: 760px;
+            border-collapse: collapse;
+            color: var(--text-main);
+            font-variant-numeric: tabular-nums;
+        }
+        .overview-summary-table th,
+        .overview-summary-table td {
+            padding: 0.48rem 0.65rem;
+            border-bottom: 1px solid rgba(113, 135, 168, 0.14);
+            text-align: center;
+            white-space: nowrap;
+            line-height: 1.25;
+        }
+        .overview-summary-table th {
+            background: rgba(240, 245, 252, 0.82);
+            color: var(--text-muted);
+            font-size: 0.86rem;
+            font-weight: 700;
+        }
+        .overview-summary-table td:first-child {
+            text-align: left;
+            font-weight: 700;
+        }
+        .overview-summary-table tr:first-child td {
+            background: rgba(248, 251, 255, 0.95);
+            font-weight: 700;
+        }
+        .overview-summary-table .overview-delta {
+            display: inline-block;
+            margin-left: 0.25rem;
+            font-size: 0.84rem;
+        }
+        .overview-summary-table .overview-delta-red {
+            color: #d92d20;
+        }
+        .overview-summary-table .overview-delta-green {
+            color: #079455;
+        }
+        .overview-summary-table .overview-delta-neutral {
+            color: var(--text-muted);
         }
         [data-testid="stExpander"] details summary {
             padding: 0.35rem 0.2rem;
@@ -358,6 +456,7 @@ def _ensure_generate_period_defaults() -> None:
     st.session_state.setdefault("generate_period_end", st.session_state["generate_period_start"] + timedelta(days=6))
     st.session_state.setdefault("generate_period_end_touched", False)
     st.session_state.setdefault("generate_period_source", "")
+    st.session_state.setdefault("generate_period_level", PERIOD_LEVEL_WEEK)
 
 
 def _sync_generate_period_end() -> None:
@@ -383,6 +482,20 @@ def _apply_inferred_generate_period(uploads) -> None:
     start, end = inferred
     st.session_state["generate_period_start"] = start
     st.session_state["generate_period_end"] = end
+    st.session_state["generate_period_end_touched"] = False
+    st.session_state["generate_period_source"] = signature
+
+
+def _apply_previewed_generate_period(periods, uploads) -> None:
+    if len(periods) != 1:
+        return
+    signature = "preview|" + "|".join(sorted(upload.name for upload in uploads))
+    if st.session_state.get("generate_period_source") == signature:
+        return
+    period = periods[0]
+    st.session_state["generate_period_start"] = pd.to_datetime(period.period_start).date()
+    st.session_state["generate_period_end"] = pd.to_datetime(period.period_end).date()
+    st.session_state["generate_period_level"] = period.period_level
     st.session_state["generate_period_end_touched"] = False
     st.session_state["generate_period_source"] = signature
 
@@ -471,14 +584,38 @@ def _get_common_period_selector(key_prefix: str) -> tuple[str, pd.DataFrame]:
     if batches.empty:
         return "", batches
 
-    batch_ids = [str(value) for value in batches["batch_id"]]
-    label_by_id = dict(zip(batch_ids, batches["period_label"].astype(str)))
+    available_levels = [level for level in PERIOD_LEVELS if level in set(batches["period_level"].astype(str))]
+    if not available_levels:
+        available_levels = [PERIOD_LEVEL_WEEK]
+    level_key = f"{key_prefix}_period_level"
+    current_level = st.session_state.get(level_key, st.session_state.get("global_period_level", available_levels[0]))
+    if current_level not in available_levels:
+        current_level = available_levels[0]
+    selected_level = st.selectbox(
+        "选择复盘层级",
+        available_levels,
+        index=available_levels.index(current_level),
+        key=level_key,
+        format_func=lambda level: PERIOD_LEVEL_LABELS.get(level, level),
+        width="stretch",
+    )
+    st.session_state["global_period_level"] = selected_level
+
+    level_batches = batches[batches["period_level"].astype(str).eq(str(selected_level))].copy()
+    if level_batches.empty:
+        return "", level_batches
+
+    batch_ids = [str(value) for value in level_batches["batch_id"]]
+    label_by_id = {
+        str(row["batch_id"]): _period_selector_label(row)
+        for _, row in level_batches.iterrows()
+    }
     created_by_id = {
         str(row["batch_id"]): format_beijing_datetime(row.get("created_at", ""))
-        for _, row in batches.iterrows()
+        for _, row in level_batches.iterrows()
     }
 
-    latest_batch_id = str(batches.iloc[0]["batch_id"])
+    latest_batch_id = str(level_batches.iloc[0]["batch_id"])
     session_key = f"{key_prefix}_batch_id"
     current_batch_id = st.session_state.get(session_key, latest_batch_id)
     if "global_batch_id" in st.session_state and st.session_state["global_batch_id"] in batch_ids:
@@ -503,7 +640,96 @@ def _get_common_period_selector(key_prefix: str) -> tuple[str, pd.DataFrame]:
     # 同步到全局
     st.session_state["global_batch_id"] = selected_batch_id
 
-    return selected_batch_id, batches
+    return selected_batch_id, level_batches
+
+
+def _get_overview_period_selector(key_prefix: str) -> tuple[str, pd.DataFrame]:
+    batches = list_successful_dashboard_batches(APP_DB)
+    if batches.empty:
+        return "", batches
+
+    selected_level = _render_review_level_cards(key_prefix, batches)
+    level_batches = batches[batches["period_level"].astype(str).eq(str(selected_level))].copy()
+    if level_batches.empty:
+        return "", level_batches
+
+    batch_ids = [str(value) for value in level_batches["batch_id"]]
+    label_by_id = {
+        str(row["batch_id"]): _period_selector_label(row)
+        for _, row in level_batches.iterrows()
+    }
+    created_by_id = {
+        str(row["batch_id"]): format_beijing_datetime(row.get("created_at", ""))
+        for _, row in level_batches.iterrows()
+    }
+
+    latest_batch_id = str(level_batches.iloc[0]["batch_id"])
+    session_key = f"{key_prefix}_batch_id"
+    current_batch_id = st.session_state.get(session_key, latest_batch_id)
+    if "global_batch_id" in st.session_state and st.session_state["global_batch_id"] in batch_ids:
+        if st.session_state.get(f"{key_prefix}_sync_global", True):
+            current_batch_id = st.session_state["global_batch_id"]
+    if current_batch_id not in batch_ids:
+        current_batch_id = latest_batch_id
+    if session_key in st.session_state and st.session_state[session_key] != current_batch_id:
+        del st.session_state[session_key]
+
+    selected_batch_id = st.selectbox(
+        "选择周期",
+        batch_ids,
+        index=batch_ids.index(current_batch_id),
+        key=session_key,
+        format_func=lambda batch_id: f"{label_by_id.get(batch_id, batch_id)}｜{created_by_id.get(batch_id, '')}",
+        on_change=_set_global_period_selection,
+        args=(session_key,),
+        width="stretch",
+    )
+    st.session_state["global_batch_id"] = selected_batch_id
+    return selected_batch_id, level_batches
+
+
+def _render_review_level_cards(key_prefix: str, batches: pd.DataFrame) -> str:
+    available_levels = {str(level) for level in batches["period_level"].dropna().astype(str)}
+    ordered_available = [level for level in PERIOD_LEVELS if level in available_levels]
+    if not ordered_available:
+        ordered_available = [PERIOD_LEVEL_WEEK]
+
+    default_level = PERIOD_LEVEL_WEEK if PERIOD_LEVEL_WEEK in ordered_available else ordered_available[0]
+    level_key = f"{key_prefix}_period_level"
+    current_level = st.session_state.get(level_key, default_level)
+    if current_level not in ordered_available:
+        current_level = default_level
+    st.session_state[level_key] = current_level
+    st.session_state["global_period_level"] = current_level
+
+    cols = st.columns(4)
+    for col, level in zip(cols, PERIOD_LEVELS):
+        is_available = level in available_levels
+        if col.button(
+            PERIOD_LEVEL_LABELS.get(level, level),
+            key=f"{key_prefix}_review_level_{level}",
+            type="primary" if current_level == level else "secondary",
+            disabled=not is_available,
+            width="stretch",
+        ):
+            st.session_state[level_key] = level
+            st.session_state["global_period_level"] = level
+            batch_session_key = f"{key_prefix}_batch_id"
+            if batch_session_key in st.session_state:
+                del st.session_state[batch_session_key]
+            st.rerun()
+    return current_level
+
+
+def _period_selector_label(row: pd.Series) -> str:
+    label = str(row.get("period_label", "") or "").strip()
+    data_start = str(row.get("data_start", "") or "").strip()
+    data_end = str(row.get("data_end", "") or "").strip()
+    source_type = str(row.get("source_type", "") or SOURCE_TYPE_UPLOAD).strip()
+    source_label = SOURCE_TYPE_LABELS.get(source_type, source_type or "上传原始包")
+    data_label = f"数据时间 {data_start} 至 {data_end}" if data_start and data_end else ""
+    parts = [label, f"来源类型 {source_label}", data_label]
+    return "｜".join(part for part in parts if part)
 
 
 def _get_comparison_period_selector(
@@ -562,8 +788,7 @@ def _default_comparison_batch_id(current_batch_id: str, batches: pd.DataFrame) -
         & normalized["_period_end_dt"].lt(current_start)
     ]
     if earlier.empty:
-        fallback = normalized[normalized["batch_id"].ne(current_batch_id)]
-        return "" if fallback.empty else str(fallback.iloc[0]["batch_id"])
+        return ""
     earlier = earlier.sort_values(["_period_end_dt", "period_start", "created_at"], ascending=[False, False, False])
     return str(earlier.iloc[0]["batch_id"])
 
@@ -602,15 +827,90 @@ def _render_section_shell(icon: str, title: str, description: str) -> None:
     )
 
 
+def _preview_generate_periods(uploaded) -> list:
+    try:
+        return preview_uploaded_period_buckets(uploaded, default_year=date.today().year)
+    except Exception:
+        return []
+
+
+def _normalize_generate_uploads(uploaded) -> list:
+    try:
+        buckets = normalize_uploaded_periods(uploaded, APP_RAW, default_year=date.today().year)
+        return [
+            clean_raw_period_dir(bucket.raw_dir, bucket.review_period, default_year=date.today().year)
+            for bucket in buckets
+        ]
+    except ValueError:
+        return []
+
+
+def _render_generate_period_preview(buckets: list) -> None:
+    if not buckets:
+        return
+    preview = pd.DataFrame(
+        [
+            {
+                "复盘层级": PERIOD_LEVEL_LABELS.get(bucket.review_period.period_level, bucket.review_period.period_level),
+                "复盘周期": bucket.review_period.period_label,
+                "数据时间": f"{bucket.review_period.data_start} 至 {bucket.review_period.data_end}",
+                "文件数": bucket.file_count,
+                "来源路径": "；".join(bucket.source_paths[:3]) + ("；..." if len(bucket.source_paths) > 3 else ""),
+                "来源类型": SOURCE_TYPE_LABELS.get(bucket.review_period.source_type, bucket.review_period.source_type),
+                "period_key": bucket.review_period.period_key,
+            }
+            for bucket in buckets
+        ]
+    )
+    st.caption("系统已按路径识别复盘周期；生成时会写入 period_manifest.json，可在生成前核对复盘层级和数据时间。")
+    st.dataframe(preview, width="stretch", hide_index=True)
+
+
+def _period_for_generate_bucket(bucket, bucket_count: int, period_start: date, period_end: date):
+    period = bucket.review_period
+    if bucket_count != 1:
+        return period
+    level = st.session_state.get("generate_period_level", period.period_level)
+    return review_period_from_dates(
+        pd.to_datetime(period.data_start).date(),
+        pd.to_datetime(period.data_end).date(),
+        level,
+        logic_start=period_start,
+        logic_end=period_end,
+        source_type=period.source_type,
+    )
+
+
+def _update_bucket_manifest(bucket, period) -> None:
+    try:
+        payload = json.loads(bucket.manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    payload.update(
+        {
+            "period_level": period.period_level,
+            "period_key": period.period_key,
+            "period_label": period.period_label,
+            "period_start": period.period_start,
+            "period_end": period.period_end,
+            "data_start": period.data_start,
+            "data_end": period.data_end,
+            "source_type": period.source_type,
+        }
+    )
+    try:
+        bucket.manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _page_overview() -> None:
-    _render_section_shell("􀍟", "总览", "最新成功批次的核心指标、渠道表现和内容建议。")
     st.title("总览")
-    st.caption("选择一个周期后会联动到其他分析页；raw 目录有新增或变更时会自动生成并刷新。")
     notice = st.session_state.pop("raw_sync_notice", "")
     if notice:
         st.info(notice)
 
-    selected_batch_id, batches = _get_common_period_selector("overview")
+    selected_batch_id, _ = _get_overview_period_selector("overview")
     if not selected_batch_id:
         st.info("还没有成功批次。请先到“生成报告”上传数据并生成存档。")
         return
@@ -629,61 +929,135 @@ def _page_overview() -> None:
         st.info("当前周期没有可展示的数据。")
         return
 
-    comparison_batch_id = _get_comparison_period_selector("overview", selected_batch_id, batches)
     summary = build_dashboard_summary(items)
     platform_summary = aggregate_dashboard(items, ["channel"])
-    channel_comparison = build_period_comparison_between_batches(APP_DB, selected_batch_id, comparison_batch_id)
+    channel_comparison = build_period_comparison_for_batch(APP_DB, selected_batch_id)
     content_type_summary = summarize_content_types(items)
-    recommendations = build_content_recommendations(summary, platform_summary, content_type_summary)
+    recommendations = _compact_recommendations(
+        build_content_recommendations(summary, platform_summary, content_type_summary)
+    )
 
-    st.subheader("总体核心指标")
+    st.subheader("本周期数据总览")
     _render_kpis(summary)
 
-    st.subheader("环比增长")
-    _render_growth_overview(channel_comparison)
+    st.subheader("环比变化")
+    _render_overview_summary_table(summary, platform_summary, channel_comparison)
 
-    st.subheader("分平台核心结果")
-    _render_platform_kpis(platform_summary, channel_comparison)
-
-    st.subheader("直接建议")
+    st.subheader("内容题材建议摘要")
     st.markdown(recommendations)
 
-    st.subheader("分渠道表现")
-    selected_metric_name = st.selectbox(
-        "选择图表指标",
-        list(CHART_METRICS.keys()),
-        key="overview_chart_metric",
-        width="stretch",
-    )
+    st.subheader("分渠道图")
+    selected_metric_name = _render_overview_metric_buttons()
     y_metric, color_metric, y_label, color_label = CHART_METRICS[selected_metric_name]
     _render_platform_chart(platform_summary, y_metric, color_metric, y_label, color_label)
 
-    st.subheader("渠道栏目分析")
-    available_channels = sorted(platform_summary["channel"].dropna().unique()) if not platform_summary.empty else []
-    selected_channel = st.selectbox(
-        "选择渠道查看二级栏目数据",
-        [""] + available_channels,
-        key="overview_drill_channel",
-        format_func=lambda x: "请选择渠道" if x == "" else x,
-        width="stretch",
-    )
 
-    if selected_channel:
-        channel_items = items[items["channel"] == selected_channel]
-        category_summary = summarize_dimension_for_metric(channel_items, "category_l2", y_metric, top_n=15)
-        if category_summary.empty:
-            st.info("当前渠道没有可展示的栏目数据。")
-        else:
-            _render_vertical_bar_chart(
-                category_summary.sort_values(y_metric, ascending=metric_sort_ascending(y_metric)),
-                "category_name",
-                y_metric,
-                "二级栏目",
-                y_label,
-                f"{selected_channel} 二级栏目{selected_metric_name} Top 15",
-                color_metric,
-                color_label,
+def _render_overview_summary_table(
+    summary,
+    platform_summary: pd.DataFrame,
+    channel_comparison: pd.DataFrame | None = None,
+) -> None:
+    rows = build_overview_table_rows(summary, platform_summary, channel_comparison)
+    if rows.empty:
+        st.info("当前没有可展示的环比数据。")
+        return
+
+    metrics = [
+        ("消耗", "spend", "spend_change_rate", 0, False),
+        ("激活", "activations", "activations_change_rate", 0, False),
+        ("激活成本", "activation_cost", "activation_cost_change_rate", 2, True),
+        ("付费", "first_pay_count", "first_pay_count_change_rate", 0, False),
+        ("付费成本", "first_pay_cost", "first_pay_cost_change_rate", 2, True),
+    ]
+    headers = "".join(f"<th>{html.escape(label)}</th>" for label, *_ in metrics)
+    body_rows = []
+    for _, row in rows.iterrows():
+        channel = str(row.get("channel", "") or "").strip() or "-"
+        cells = [f"<td>{html.escape(channel)}</td>"]
+        for _, value_column, rate_column, digits, is_cost in metrics:
+            cells.append(
+                "<td>"
+                + _overview_metric_cell(row.get(value_column), row.get(rate_column), digits, is_cost)
+                + "</td>"
             )
+        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    table_html = f"""
+    <div class="overview-summary-table-wrap">
+      <table class="overview-summary-table">
+        <thead>
+          <tr><th>渠道</th>{headers}</tr>
+        </thead>
+        <tbody>
+          {''.join(body_rows)}
+        </tbody>
+      </table>
+    </div>
+    """
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+def _overview_metric_cell(value: object, rate: object, digits: int, is_cost: bool) -> str:
+    formatted_value = html.escape(_fmt_overview_value(value, digits))
+    formatted_rate = html.escape(_fmt_overview_growth(rate))
+    delta_class = _overview_growth_class(rate, is_cost)
+    return f'{formatted_value}<span class="overview-delta {delta_class}">{formatted_rate}</span>'
+
+
+def _fmt_overview_value(value: object, digits: int) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "-"
+    return f"{float(numeric):.{digits}f}"
+
+
+def _fmt_overview_growth(value: object) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "（-）"
+    return f"（{float(numeric):+.0%}）"
+
+
+def _overview_growth_class(value: object, is_cost: bool) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric) or float(numeric) == 0.0:
+        return "overview-delta-neutral"
+    if float(numeric) > 0:
+        return "overview-delta-green" if is_cost else "overview-delta-red"
+    return "overview-delta-red" if is_cost else "overview-delta-green"
+
+
+def _compact_recommendations(markdown: str, max_items: int = 4) -> str:
+    bullets = []
+    for line in str(markdown or "").splitlines():
+        item = line.strip()
+        if not item or item.startswith("#"):
+            continue
+        if item.startswith("- "):
+            bullets.append(item)
+        if len(bullets) >= max_items:
+            break
+    return "\n".join(bullets) if bullets else str(markdown or "").strip()
+
+
+def _render_overview_metric_buttons() -> str:
+    metric_names = list(CHART_METRICS.keys())
+    selected_metric_name = st.session_state.get("overview_chart_metric", metric_names[0])
+    if selected_metric_name not in metric_names:
+        selected_metric_name = metric_names[0]
+        st.session_state["overview_chart_metric"] = selected_metric_name
+
+    cols = st.columns(6)
+    for col, metric_name in zip(cols, metric_names):
+        if col.button(
+            metric_name,
+            key=f"overview_metric_button_{metric_name}",
+            type="primary" if selected_metric_name == metric_name else "secondary",
+            width="stretch",
+        ):
+            st.session_state["overview_chart_metric"] = metric_name
+            st.rerun()
+    return selected_metric_name
 
 
 def _page_generate() -> None:
@@ -701,9 +1075,24 @@ def _page_generate() -> None:
             accept_multiple_files="directory",
         )
         if uploaded:
-            _apply_inferred_generate_period(uploaded)
+            preview_buckets = _preview_generate_periods(uploaded)
+            preview_periods = [bucket.review_period for bucket in preview_buckets]
+            if preview_buckets:
+                _apply_previewed_generate_period(preview_periods, uploaded)
+                _render_generate_period_preview(preview_buckets)
+            else:
+                _apply_inferred_generate_period(uploaded)
+        else:
+            preview_buckets = []
         st.caption(resolve_deepseek_settings(ENV_PATH).public_status)
-        c1, c2 = st.columns(2)
+        c0, c1, c2 = st.columns([1, 1, 1])
+        c0.selectbox(
+            "复盘层级",
+            PERIOD_LEVELS,
+            key="generate_period_level",
+            format_func=lambda level: PERIOD_LEVEL_LABELS.get(level, level),
+            width="stretch",
+        )
         period_start = c1.date_input(
             "周期开始",
             key="generate_period_start",
@@ -715,7 +1104,7 @@ def _page_generate() -> None:
             on_change=_mark_generate_period_end_touched,
         )
         if uploaded and st.session_state.get("generate_period_source"):
-            st.caption("已根据上传文件夹名自动回填周期，仍可手动调整。")
+            st.caption("已根据上传文件夹名自动回填周期，仍可手动调整复盘层级、周期日期；识别结果会展示数据时间和来源类型。")
         generate = st.button("生成并存档", type="primary", width="stretch")
 
     if generate:
@@ -725,26 +1114,11 @@ def _page_generate() -> None:
             st.error("周期开始日期不能晚于结束日期。")
         else:
             try:
-                with st.spinner("正在读取上传文件、校验、入库并生成报告..."):
-                    period_dir = f"{period_start:%Y%m%d}-{period_end:%Y%m%d}"
-                    materialized = materialize_uploaded_files(
-                        uploaded,
-                        APP_RAW / period_dir,
-                        strip_common_period_root=True,
-                    )
-                    result = run_archived_workflow(
-                        materialized.raw_dir,
-                        period_start.isoformat(),
-                        period_end.isoformat(),
-                        output_root=APP_OUTPUTS,
-                        archive_root=APP_ARCHIVE,
-                        db_path=APP_DB,
-                        category_rules_path=CATEGORY_RULES,
-                        env_path=ENV_PATH,
-                    )
-                    _store_artifacts(result)
+                _run_with_generation_progress(uploaded, period_start, period_end)
             except Exception as exc:
                 st.error(f"生成失败：{exc}")
+
+    _render_rollup_generator()
 
     if "total_summary" in st.session_state:
         _display_generation_results()
@@ -752,6 +1126,120 @@ def _page_generate() -> None:
         st.info("可点击选择目录，或把多个 CSV / Excel / ZIP 拖入上传区；目录上传会保留子目录结构。")
 
     _render_historical_reports()
+
+
+def _run_with_generation_progress(uploaded, period_start: date, period_end: date):
+    with st.status(GENERATION_PROGRESS_STEPS[0], expanded=True) as status:
+        progress_bar = st.progress(0, text=GENERATION_PROGRESS_STEPS[0])
+        detail = st.empty()
+        messages: list[str] = []
+
+        def progress_callback(message: str) -> None:
+            message = str(message)
+            if message not in messages:
+                messages.append(message)
+            percent = GENERATION_PROGRESS_VALUES.get(message, min(95, max(5, len(messages) * 12)))
+            progress_bar.progress(percent, text=message)
+            detail.markdown("\n".join(f"- {item}" for item in messages))
+            status.update(label=message, state="running", expanded=True)
+
+        try:
+            progress_callback("正在识别上传文件和复盘周期")
+            normalized_buckets = _normalize_generate_uploads(uploaded)
+            progress_callback("正在整理 raw 周期目录")
+            if normalized_buckets:
+                result = None
+                for bucket in normalized_buckets:
+                    period = _period_for_generate_bucket(bucket, len(normalized_buckets), period_start, period_end)
+                    _update_bucket_manifest(bucket, period)
+                    result = run_archived_workflow(
+                        bucket.raw_dir,
+                        period.period_start,
+                        period.period_end,
+                        output_root=APP_OUTPUTS,
+                        archive_root=APP_ARCHIVE,
+                        db_path=APP_DB,
+                        category_rules_path=CATEGORY_RULES,
+                        env_path=ENV_PATH,
+                        period_level=period.period_level,
+                        period_key=period.period_key,
+                        period_label=period.period_label,
+                        data_start=period.data_start,
+                        data_end=period.data_end,
+                        source_type=period.source_type,
+                        progress_callback=progress_callback,
+                    )
+                assert result is not None
+            else:
+                period_dir = f"{period_start:%Y%m%d}-{period_end:%Y%m%d}"
+                materialized = materialize_uploaded_files(
+                    uploaded,
+                    APP_RAW / period_dir,
+                    strip_common_period_root=True,
+                )
+                result = run_archived_workflow(
+                    materialized.raw_dir,
+                    period_start.isoformat(),
+                    period_end.isoformat(),
+                    output_root=APP_OUTPUTS,
+                    archive_root=APP_ARCHIVE,
+                    db_path=APP_DB,
+                    category_rules_path=CATEGORY_RULES,
+                    env_path=ENV_PATH,
+                    period_level=st.session_state.get("generate_period_level", PERIOD_LEVEL_WEEK),
+                    source_type=SOURCE_TYPE_UPLOAD,
+                    progress_callback=progress_callback,
+                )
+            _store_artifacts(result)
+            progress_bar.progress(100, text="报告生成完成")
+            status.update(label="报告生成完成", state="complete", expanded=False)
+            return result
+        except Exception:
+            status.update(label="生成失败", state="error", expanded=True)
+            raise
+
+
+def _render_rollup_generator() -> None:
+    with st.container(border=True):
+        st.subheader("季度/年度汇总复盘")
+        st.caption("季度、年度可直接上传原始包生成，也可以由已入库周期汇总生成；汇总规则为月度优先、周级补缺。")
+        c1, c2, c3 = st.columns(3)
+        level = c1.selectbox(
+            "汇总复盘层级",
+            ["quarter", "year"],
+            format_func=lambda value: PERIOD_LEVEL_LABELS.get(value, value),
+            key="rollup_period_level",
+            width="stretch",
+        )
+        year = int(c2.number_input("汇总年份", min_value=2020, max_value=2100, value=date.today().year, step=1))
+        quarter = 1
+        if level == "quarter":
+            quarter = int(c3.selectbox("汇总季度", [1, 2, 3, 4], format_func=lambda value: f"第{value}季度", key="rollup_quarter"))
+        else:
+            c3.caption("年度汇总覆盖 1 月 1 日至 12 月 31 日。")
+
+        try:
+            period = rollup_period_for(level, year, quarter if level == "quarter" else None)
+            components = select_rollup_component_batches(APP_DB, period)
+        except Exception as exc:
+            st.warning(f"暂无法计算汇总周期：{exc}")
+            return
+        st.caption(f"将生成：{period.period_label}；来源类型：系统汇总；可用组成批次 {len(components)} 个。")
+        if st.button("生成季度/年度汇总", width="stretch", disabled=not components):
+            try:
+                result = run_rollup_workflow(
+                    APP_DB,
+                    components,
+                    period,
+                    output_root=APP_OUTPUTS,
+                    archive_root=APP_ARCHIVE,
+                    category_rules_path=CATEGORY_RULES,
+                    env_path=ENV_PATH,
+                )
+                _store_artifacts(result)
+                st.success(f"已生成汇总复盘：{period.period_label}")
+            except Exception as exc:
+                st.error(f"汇总生成失败：{exc}")
 
 
 def _render_historical_reports() -> None:
@@ -1036,6 +1524,76 @@ def _page_data_quality() -> None:
     st.dataframe(localize_and_sort_columns(quality), width="stretch", hide_index=True)
 
 
+def _page_data_review() -> None:
+    _render_section_shell("􀬚", "数据审核", "审核重复文件、标题冲突、数值冲突和缺失关键字段，并实时同步 cleaned.xlsx。")
+    st.title("数据审核")
+    st.caption("保存审核后会写入 review_resolutions，原子回写 cleaned.xlsx，并立即重新生成当前周期的分析数据。")
+
+    selected_batch_id, batches = _get_common_period_selector("data_review")
+    if not selected_batch_id:
+        st.info("还没有可审核的数据。请先到「生成报告」导入并生成存档。")
+        return
+
+    review_items = load_data_review_items(APP_DB, selected_batch_id)
+    if review_items.empty:
+        st.info("当前周期没有重复、冲突或缺失字段审核项。")
+        return
+
+    st.caption(f"当前批次：{selected_batch_id}；审核项 {len(review_items)} 条。")
+    editable_columns = [
+        "issue_id",
+        "issue_type",
+        "review_action",
+        "channel",
+        "title",
+        "content_id",
+        "material_id",
+        "dedupe_key",
+        "duplicate_group_id",
+        "conflict_details",
+        "source_file",
+        "source_sheet",
+        "field_name",
+        "new_value",
+        "merge_target_content_id",
+    ]
+    for column in editable_columns:
+        if column not in review_items.columns:
+            review_items[column] = ""
+    edited = st.data_editor(
+        review_items[editable_columns],
+        width="stretch",
+        hide_index=True,
+        disabled=["issue_id", "issue_type", "channel", "title", "content_id", "material_id", "dedupe_key", "duplicate_group_id", "conflict_details", "source_file", "source_sheet"],
+        column_config={
+            "review_action": st.column_config.SelectboxColumn("审核动作", options=REVIEW_ACTIONS, required=True),
+            "issue_id": st.column_config.TextColumn("审核ID", disabled=True),
+            "issue_type": st.column_config.TextColumn("问题类型", disabled=True),
+            "field_name": st.column_config.TextColumn("改字段名"),
+            "new_value": st.column_config.TextColumn("新值"),
+            "merge_target_content_id": st.column_config.TextColumn("合并到主ID"),
+        },
+        key=f"data_review_editor_{selected_batch_id}",
+    )
+    if st.button("保存审核并同步 Excel", type="primary", width="stretch"):
+        try:
+            saved = save_review_resolutions(APP_DB, selected_batch_id, edited)
+            with st.spinner("正在同步 cleaned.xlsx 并重新生成分析数据..."):
+                result = apply_review_resolutions_and_regenerate(
+                    APP_DB,
+                    selected_batch_id,
+                    output_root=APP_OUTPUTS,
+                    archive_root=APP_ARCHIVE,
+                    category_rules_path=CATEGORY_RULES,
+                    env_path=ENV_PATH,
+                )
+                _store_artifacts(result)
+            st.success(f"已保存 {saved} 条审核结果，并生成新批次：{result.batch_id}")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"同步失败：{exc}")
+
+
 def _page_reference_tables() -> None:
     _render_section_shell("􀉉", "维护台账", "查看本地映射表和处理规则，确认账号与字段口径。")
     st.title("维护台账")
@@ -1293,140 +1851,93 @@ def _page_file_backup() -> None:
             st.error(f"恢复失败：{exc}")
 
 
-def _page_drill_down_analysis() -> None:
-    """内容分析页面，支持按渠道、栏目和题材逐级查看表现。"""
-    _render_section_shell("", "内容分析", "按渠道、栏目和题材逐级查看内容表现。")
-    st.title("内容分析")
-    st.caption("先定位渠道，再定位二级栏目，最后查看题材 Top N。B站统一归入 B站全部，直接进入题材分析。")
+def _render_channel_page(channel_name: str) -> None:
+    _render_section_shell("", channel_name, "按当前总览周期展示该渠道全部栏目数据和消耗 Top 20 题材。")
+    st.title(channel_name)
 
-    selected_batch_id, batches = _get_common_period_selector("drill_down")
+    selected_batch_id, batches = _selected_or_latest_batch_id()
     if not selected_batch_id:
-        st.info("还没有可分析的成功批次。")
+        st.info("还没有可分析的成功批次。请先到“生成报告”上传数据并生成存档。")
         return
+
+    period_caption = _period_caption_for_batch(batches, selected_batch_id)
+    if period_caption:
+        st.caption(f"当前周期：{period_caption}。周期跟随“总览”页全局选择。")
 
     items = load_dashboard_items_for_batch(APP_DB, selected_batch_id)
     if items.empty:
         st.info("当前周期没有可分析的数据。")
         return
 
-    available_channels = sorted(items["channel"].dropna().unique())
-    if not available_channels:
-        st.info("当前数据没有渠道信息。")
-        return
-
-    col1, col2, col3 = st.columns([2, 2, 1])
-    selected_channel = col1.selectbox(
-        "选择渠道",
-        available_channels,
-        key="drill_channel",
-        width="stretch",
-    )
-    sort_metric_name = col2.selectbox(
-        "排序指标",
-        list(CHART_METRICS.keys()),
-        key="drill_sort_metric",
-        width="stretch",
-    )
-    top_n = col3.number_input(
-        "显示 Top N",
-        min_value=5,
-        max_value=50,
-        value=15,
-        key="drill_top_n",
-        width="stretch",
-    )
-
-    sort_metric, color_metric, sort_label, color_label = CHART_METRICS[sort_metric_name]
-    channel_items = items[items["channel"] == selected_channel]
-
+    channel_items = items[items["channel"].eq(channel_name)].copy()
     if channel_items.empty:
-        st.info(f"渠道 {selected_channel} 没有数据。")
+        st.info(f"当前周期没有 {channel_name} 数据。")
         return
 
-    st.subheader(f"{selected_channel} 渠道总览")
+    st.subheader("渠道核心指标")
     channel_summary = aggregate_dashboard(channel_items, ["channel"])
     if not channel_summary.empty:
         _render_channel_summary_metrics(channel_summary)
 
-    is_bilibili = selected_channel == "B站"
-    category_summary = summarize_dimension_for_metric(channel_items, "category_l2", sort_metric, top_n=int(top_n))
-
-    if is_bilibili:
-        st.info("B站不区分栏目层级，本页统一按 B站全部 分析题材。")
-        selected_category_l2 = BILIBILI_CATEGORY
+    category_summary = summarize_channel_categories(items, channel_name)
+    st.subheader("二级栏目汇总")
+    if category_summary.empty:
+        st.info("当前渠道没有可展示的二级栏目数据。")
     else:
-        if category_summary.empty:
-            st.warning("当前渠道没有二级栏目数据，请先补充分类。")
-            return
-        else:
-            selected_category_l2 = st.selectbox(
-                "选择二级栏目",
-                list(category_summary["category_name"]),
-                key="drill_category_l2",
-                width="stretch",
-            )
-
-    if not category_summary.empty:
-        st.subheader(f"{selected_channel} 二级栏目分布")
         _render_vertical_bar_chart(
-            category_summary.sort_values(sort_metric, ascending=metric_sort_ascending(sort_metric)),
+            category_summary,
             "category_name",
-            sort_metric,
+            "spend",
             "二级栏目",
-            sort_label,
-            f"{selected_channel} 二级栏目{sort_metric_name} Top {top_n}",
-            color_metric,
-            color_label,
+            "消耗",
+            f"{channel_name} 二级栏目消耗",
+            "activations",
+            "激活数",
         )
+        _render_short_table_blocks(_category_table_display(category_summary), "二级栏目汇总")
 
-    st.subheader("题材分析")
-    if is_bilibili:
-        topic_items = channel_items
-    elif selected_category_l2:
-        topic_items = channel_items[channel_items["category_l2"] == selected_category_l2]
+    st.subheader("Top 20 题材分析")
+    topic_candidates = _channel_top_topic_candidates(items, channel_name)
+    if topic_candidates.empty:
+        st.info("当前渠道没有可归纳的题材数据。")
     else:
-        topic_items = pd.DataFrame()
+        topic_cache_key = f"topic_labels_channel_{selected_batch_id}_{channel_name}_top20_spend"
+        if topic_cache_key not in st.session_state:
+            st.session_state[topic_cache_key] = group_topic_labels(topic_candidates, env_path=ENV_PATH)
+        topic_labels = st.session_state.get(topic_cache_key, {})
+        if topic_labels:
+            st.caption("题材分组：DeepSeek 归纳消耗 Top 20 素材。")
+        else:
+            st.caption("题材分组：DeepSeek 未返回结果，使用本地关键词/栏目规则兜底。")
 
-    if topic_items.empty:
-        st.info("请先选择栏目查看题材数据。")
-        return
-
-    topic_cache_key = f"topic_labels_{selected_batch_id}_{selected_channel}_{selected_category_l2}"
-    if topic_cache_key not in st.session_state:
-        st.session_state[topic_cache_key] = group_topic_labels(topic_items, env_path=ENV_PATH)
-    topic_labels = st.session_state.get(topic_cache_key, {})
-    if topic_labels:
-        st.caption("题材分组：DeepSeek 归纳。")
-    else:
-        st.caption("题材分组：本地规则兜底。")
-
-    topic_summary = summarize_topics_for_selection(
-        topic_items,
-        selected_channel,
-        selected_category_l2,
-        sort_metric,
-        top_n=int(top_n),
-        topic_labels=topic_labels,
-    )
-    if topic_summary.empty:
-        st.warning("当前数据没有可归纳的题材信息。")
-        return
-
-    _render_vertical_bar_chart(
-        topic_summary.sort_values(sort_metric, ascending=metric_sort_ascending(sort_metric)),
-        "topic_name",
-        sort_metric,
-        "题材",
-        sort_label,
-        f"题材{sort_metric_name} Top {top_n}",
-        color_metric,
-        color_label,
-    )
-    st.subheader("题材明细")
-    st.dataframe(localize_and_sort_columns(topic_summary), width="stretch", hide_index=True)
+        topic_summary = summarize_channel_top_topics(
+            items,
+            channel_name,
+            top_n=20,
+            metric="spend",
+            topic_labels=topic_labels,
+        )
+        if topic_summary.empty:
+            st.warning("当前数据没有可归纳的题材信息。")
+        else:
+            topic_insights = build_channel_top_topic_insights(topic_summary)
+            if "Top 20 题材分析结论" not in topic_insights:
+                topic_insights = f"#### Top 20 题材分析结论\n{topic_insights}"
+            st.markdown(topic_insights)
+            _render_vertical_bar_chart(
+                topic_summary,
+                "topic_name",
+                "spend",
+                "题材",
+                "消耗",
+                f"{channel_name} Top 20 题材消耗",
+                "activations",
+                "激活数",
+            )
+            _render_short_table_blocks(_topic_table_display(topic_summary), "Top 20 题材明细")
 
     st.subheader("异常数据检测")
-    _detect_and_display_anomalies(topic_items, topic_summary, sort_metric, int(top_n))
+    _detect_and_display_anomalies(channel_items, pd.DataFrame(), "activation_cost", 20)
 
 
 def _render_channel_summary_metrics(channel_summary: pd.DataFrame) -> None:
@@ -1499,6 +2010,92 @@ def _render_anomaly_block(rows: pd.DataFrame, warning_label: str, empty_label: s
         ]
         display_cols = [column for column in display_cols if column in rows.columns]
         st.dataframe(localize_and_sort_columns(rows[display_cols]), width="stretch", hide_index=True)
+
+
+def _selected_or_latest_batch_id() -> tuple[str, pd.DataFrame]:
+    batches = list_successful_dashboard_batches(APP_DB)
+    if batches.empty:
+        return "", batches
+
+    batch_ids = [str(value) for value in batches["batch_id"]]
+    latest_batch_id = batch_ids[0]
+    selected_batch_id = str(st.session_state.get("global_batch_id", latest_batch_id))
+    if selected_batch_id not in batch_ids:
+        selected_batch_id = latest_batch_id
+    st.session_state["global_batch_id"] = selected_batch_id
+    return selected_batch_id, batches
+
+
+def _period_caption_for_batch(batches: pd.DataFrame, batch_id: str) -> str:
+    if batches.empty or not batch_id:
+        return ""
+    match = batches[batches["batch_id"].astype(str).eq(str(batch_id))]
+    if match.empty:
+        return ""
+    row = match.iloc[0]
+    label = str(row.get("period_label", "") or "").strip()
+    created_at = format_beijing_datetime(row.get("created_at", ""))
+    return f"{label}｜生成时间 {created_at}" if created_at else label
+
+
+def _channel_top_topic_candidates(items: pd.DataFrame, channel_name: str, top_n: int = 20) -> pd.DataFrame:
+    if items.empty or "channel" not in items.columns:
+        return pd.DataFrame()
+    scoped = items[items["channel"].eq(channel_name)].copy()
+    if scoped.empty or "spend" not in scoped.columns:
+        return pd.DataFrame()
+    scoped["spend"] = pd.to_numeric(scoped["spend"], errors="coerce")
+    scoped = scoped.dropna(subset=["spend"])
+    return scoped.sort_values("spend", ascending=False).head(int(top_n)).copy()
+
+
+def _category_table_display(category_summary: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "category_name",
+        "item_count",
+        "spend",
+        "impressions",
+        "clicks",
+        "ctr",
+        "activations",
+        "activation_cost",
+        "first_pay_count",
+        "first_pay_cost",
+        "first_pay_rate",
+    ]
+    display = category_summary[[column for column in columns if column in category_summary.columns]].copy()
+    return display.rename(columns={"category_name": "category_l2"})
+
+
+def _topic_table_display(topic_summary: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "category_name",
+        "topic_name",
+        "item_count",
+        "spend",
+        "impressions",
+        "clicks",
+        "ctr",
+        "activations",
+        "activation_cost",
+        "first_pay_count",
+        "first_pay_cost",
+        "first_pay_rate",
+    ]
+    display = topic_summary[[column for column in columns if column in topic_summary.columns]].copy()
+    return display.rename(columns={"category_name": "category_l2", "topic_name": "category_l3"})
+
+
+def _render_short_table_blocks(frame: pd.DataFrame, label: str, rows_per_block: int = 8) -> None:
+    if frame.empty:
+        return
+    total_rows = len(frame)
+    for start in range(0, total_rows, rows_per_block):
+        block = frame.iloc[start : start + rows_per_block].copy()
+        if total_rows > rows_per_block:
+            st.caption(f"{label} {start + 1}-{start + len(block)} / {total_rows}")
+        display = localize_and_sort_columns(block).reset_index(drop=True)
+        st.table(display.style.hide(axis="index"))
 
 
 def _display_generation_results() -> None:
@@ -1908,24 +2505,48 @@ def _localized_label_map() -> dict[str, str]:
     ]}
 
 
-_inject_theme()
+def _available_channels_for_current_period() -> list[str]:
+    selected_batch_id, _ = _selected_or_latest_batch_id()
+    if not selected_batch_id:
+        return []
+    items = load_dashboard_items_for_batch(APP_DB, selected_batch_id)
+    return _dashboard_options(items, "channel")
 
-page = st.navigation(
-    [
+
+def _make_channel_page(channel: str):
+    def _page_channel() -> None:
+        _render_channel_page(channel)
+
+    safe_name = "".join(char if char.isascii() and char.isalnum() else "_" for char in channel).strip("_")
+    _page_channel.__name__ = f"_page_channel_{safe_name or abs(hash(channel))}"
+    return _page_channel
+
+
+def _build_navigation_pages() -> list:
+    pages = [
         st.Page(_page_overview, title="总览", default=True),
         st.Page(_page_generate, title="生成报告"),
-        st.Page(_page_drill_down_analysis, title="内容分析"),
-        st.Page(_page_content_types, title="内容类型统计"),
-        st.Page(_page_trends, title="历史趋势"),
-        st.Page(_page_content_details, title="内容明细"),
-        st.Page(_page_data_quality, title="数据质量"),
-        st.Page(_page_reference_tables, title="维护台账"),
-        st.Page(_page_category_review, title="分类审核"),
-        st.Page(_page_file_backup, title="文件备份"),
-        st.Page(_page_history, title="历史批次"),
-    ],
-    position="sidebar",
-    expanded=True,
-)
+    ]
+    for channel in _available_channels_for_current_period():
+        pages.append(st.Page(_make_channel_page(channel), title=channel))
+    pages.extend(
+        [
+            st.Page(_page_content_types, title="内容类型统计"),
+            st.Page(_page_trends, title="历史趋势"),
+            st.Page(_page_content_details, title="内容明细"),
+            st.Page(_page_data_quality, title="数据质量"),
+            st.Page(_page_data_review, title="数据审核"),
+            st.Page(_page_reference_tables, title="维护台账"),
+            st.Page(_page_category_review, title="分类审核"),
+            st.Page(_page_file_backup, title="文件备份"),
+            st.Page(_page_history, title="历史批次"),
+        ]
+    )
+    return pages
+
+
+_inject_theme()
+
+page = st.navigation(_build_navigation_pages(), position="sidebar", expanded=True)
 page.run()
 _sync_raw_data_fragment()

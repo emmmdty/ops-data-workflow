@@ -256,8 +256,16 @@ class ProductizedWorkflowTests(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             with closing(sqlite3.connect(tmp_path / "workflow.sqlite3")) as conn:
-                period = conn.execute("select period_start, period_end from upload_batches").fetchone()
-            self.assertEqual(period, ("2026-04-01", "2026-04-27"))
+                period = conn.execute(
+                    """
+                    select period_start, period_end, period_level, period_key, data_start, data_end, source_type
+                    from upload_batches
+                    """
+                ).fetchone()
+            self.assertEqual(
+                period,
+                ("2026-04-01", "2026-04-30", "month", "2026-04", "2026-04-01", "2026-04-27", "upload"),
+            )
 
     def test_resolve_deepseek_settings_reads_explicit_env_without_leaking_secret(self):
         with TemporaryDirectory() as tmp:
@@ -362,6 +370,31 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertGreaterEqual(file_count, 4)
             self.assertEqual(item_count, len(result.canonical))
             self.assertEqual(ai_count, 1)
+
+    def test_archived_workflow_emits_progress_messages(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            _write_raw_fixture(raw_dir)
+            messages: list[str] = []
+
+            run_archived_workflow(
+                raw_dir,
+                "2026-04-01",
+                "2026-04-27",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=tmp_path / "workflow.sqlite3",
+                env_path=tmp_path / "missing.env",
+                progress_callback=messages.append,
+            )
+
+            self.assertIn("正在归档原始文件", messages)
+            self.assertIn("正在读取渠道数据并标准化", messages)
+            self.assertIn("正在校验数据质量与题材分类", messages)
+            self.assertIn("正在写入历史库并生成下载文件", messages)
+            self.assertEqual(messages[-1], "报告生成完成")
 
     def test_archived_workflow_adds_new_columns_to_existing_sqlite_tables(self):
         with TemporaryDirectory() as tmp:

@@ -793,6 +793,78 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(row["content_id"], "zh-1")
             self.assertEqual(row["category_l2"], "投教问答")
 
+    def test_market_and_new_platform_sources_are_mapped_to_distinct_channels(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            raw_dir.mkdir()
+            with pd.ExcelWriter(raw_dir / "小红书（市场部）.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "笔记/素材ID": "xhs-market-1",
+                            "笔记/素材链接": "https://xhs.example/1",
+                            "消费": 10,
+                            "展现量": 100,
+                            "点击量": 20,
+                            "激活数(转化时间)": 3,
+                            "首次付费次数(转化时间)": 1,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="计划-数据", index=False)
+            with pd.ExcelWriter(raw_dir / "微信市场部.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "创意名称": "微信创意一",
+                            "花费": 20,
+                            "曝光次数": 200,
+                            "点击次数": 30,
+                            "APP激活次数": 4,
+                            "注册次数": 2,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="Sheet1", index=False)
+            with pd.ExcelWriter(raw_dir / "腾讯（市场部）.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "链接": "https://tencent.example/creative",
+                            "花费": 30,
+                            "曝光次数": 300,
+                            "点击次数": 40,
+                            "APP激活次数": 5,
+                            "注册次数（点击归因）": 2,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="Sheet1", index=False)
+            with pd.ExcelWriter(raw_dir / "抖音原生-达人数据情况（商业化）.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "视频链接": "https://douyin.example/video/1",
+                            "消耗": 40,
+                            "展示数": 400,
+                            "激活数": 6,
+                            "付费数": 3,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="Sheet4", index=False)
+
+            result = analyze_input_dir(
+                raw_dir,
+                "2026-05-08",
+                "2026-05-14",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            channels = set(result.canonical["channel"])
+            self.assertIn("小红书市场部", channels)
+            self.assertIn("微信市场部", channels)
+            self.assertIn("腾讯市场部", channels)
+            self.assertIn("抖音达人内容", channels)
+            self.assertEqual(len(result.canonical[result.canonical["channel"].eq("微信市场部")]), 1)
+            self.assertEqual(len(result.canonical[result.canonical["channel"].eq("腾讯市场部")]), 1)
+
     def test_raw_extra_columns_export_with_chinese_display_names(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -948,6 +1020,34 @@ class WorkflowTests(unittest.TestCase):
             )
             workbook.close()
             self.assertTrue(result.total_summary_xlsx.exists())
+
+    def test_workflow_writes_report_when_category_spend_is_blank(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            output_dir = Path(tmp) / "out"
+            raw_dir.mkdir()
+            with pd.ExcelWriter(raw_dir / "抖音商业化.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "视频标题": "有曝光但无消耗的内容",
+                            "视频id": "dy-organic",
+                            "视频链接": "https://douyin.example/organic",
+                            "内容类型": "股友说",
+                            "消耗": "",
+                            "展示数": 5317,
+                            "激活数": "",
+                            "付费次数": "",
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="Sheet2", index=False)
+
+            result = run_workflow(raw_dir, "2026-04-10", "2026-04-16", output_dir)
+
+            self.assertTrue(result.report_html.exists())
+            html = result.report_html.read_text(encoding="utf-8")
+            self.assertIn("暂无可绘制消耗气泡", html)
+            self.assertEqual(list(result.canonical["content_id"]), ["dy-organic"])
 
     def test_exported_tables_use_readable_chinese_column_names(self):
         with TemporaryDirectory() as tmp:

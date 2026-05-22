@@ -9,6 +9,8 @@ import pandas as pd
 from ops_data_workflow.dashboard import (
     DashboardFilters,
     aggregate_dashboard,
+    build_channel_top_topic_insights,
+    build_overview_table_rows,
     build_period_comparison_between_batches,
     build_period_comparison_for_batch,
     build_content_recommendations,
@@ -23,6 +25,8 @@ from ops_data_workflow.dashboard import (
     load_latest_dashboard_items,
     list_successful_dashboard_batches,
     metric_sort_ascending,
+    summarize_channel_categories,
+    summarize_channel_top_topics,
     summarize_dimension_for_metric,
     summarize_topics_for_selection,
     summarize_content_type_trends,
@@ -30,13 +34,79 @@ from ops_data_workflow.dashboard import (
     summarize_unique_content,
 )
 from ops_data_workflow.reporting import localize_and_sort_columns
-from ops_data_workflow.storage import init_db
+from ops_data_workflow.periods import PERIOD_LEVEL_MONTH, PERIOD_LEVEL_WEEK, SOURCE_TYPE_ROLLUP, SOURCE_TYPE_UPLOAD
+from ops_data_workflow.storage import init_db, previous_successful_batch_id_for_period
 
 
 def _append_frame(conn: sqlite3.Connection, table_name: str, batch_id: str, frame: pd.DataFrame) -> None:
     stored = frame.copy()
     stored.insert(0, "batch_id", batch_id)
     stored.to_sql(table_name, conn, if_exists="append", index=False)
+
+
+def _insert_period_batch(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    period_start: str,
+    period_end: str,
+    *,
+    period_level: str = PERIOD_LEVEL_WEEK,
+    period_key: str = "",
+    source_type: str = SOURCE_TYPE_UPLOAD,
+    created_at: str = "2026-05-13T00:00:00+00:00",
+) -> None:
+    if not period_key:
+        period_key = period_start.replace("-", "") + "-" + period_end.replace("-", "")
+    conn.execute(
+        """
+        insert into upload_batches (
+            batch_id, period_start, period_end, created_at, archive_dir,
+            output_dir, status, comparison_batch_id, comparison_note,
+            period_level, period_key, period_label, data_start, data_end, source_type
+        )
+        values (?, ?, ?, ?, '', '', 'ok', '', '', ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            batch_id,
+            period_start,
+            period_end,
+            created_at,
+            period_level,
+            period_key,
+            f"{period_level}:{period_key}",
+            period_start,
+            period_end,
+            source_type,
+        ),
+    )
+
+
+def _append_single_metric_row(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    period_start: str,
+    period_end: str,
+    spend: float,
+) -> None:
+    _append_frame(
+        conn,
+        "canonical_items",
+        batch_id,
+        pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "content_id": batch_id,
+                    "spend": spend,
+                    "activations": 10.0,
+                    "first_pay_count": 2.0,
+                }
+            ]
+        ),
+    )
 
 
 def _seed_dashboard_db(db_path: Path) -> None:
@@ -205,7 +275,7 @@ class DashboardTests(unittest.TestCase):
             items = load_dashboard_items_for_batch(db_path, "batch-old")
 
             self.assertEqual(list(batches["batch_id"]), ["batch-new", "batch-old"])
-            self.assertEqual(list(batches["period_label"]), ["2026-04-08 至 2026-04-14", "2026-04-01 至 2026-04-07"])
+            self.assertEqual(list(batches["period_label"]), ["周｜2026-04-08 至 2026-04-14", "周｜2026-04-01 至 2026-04-07"])
             self.assertEqual(set(items["batch_id"]), {"batch-old"})
             self.assertEqual(set(items["content_id"]), {"dy-1", "bv-1"})
 
@@ -270,9 +340,9 @@ class DashboardTests(unittest.TestCase):
             init_db(db_path)
             with closing(sqlite3.connect(db_path)) as conn:
                 rows = [
-                    ("batch-current", "2026-05-01", "2026-05-07", "2026-05-01T00:00:00+00:00"),
-                    ("batch-previous", "2026-04-24", "2026-04-30", "2026-05-10T00:00:00+00:00"),
-                    ("batch-older", "2026-04-10", "2026-04-16", "2026-05-20T00:00:00+00:00"),
+                    ("batch-current", "2026-05-15", "2026-05-21", "2026-05-01T00:00:00+00:00"),
+                    ("batch-previous", "2026-05-08", "2026-05-14", "2026-05-10T00:00:00+00:00"),
+                    ("batch-older", "2026-05-01", "2026-05-07", "2026-05-20T00:00:00+00:00"),
                 ]
                 for batch_id, period_start, period_end, created_at in rows:
                     conn.execute(
@@ -294,8 +364,8 @@ class DashboardTests(unittest.TestCase):
                             {
                                 "platform": "抖音",
                                 "channel": "抖音商业化",
-                                "period_start": "2026-05-01",
-                                "period_end": "2026-05-07",
+                                "period_start": "2026-05-15",
+                                "period_end": "2026-05-21",
                                 "content_id": "current",
                                 "spend": 200.0,
                                 "activations": 20.0,
@@ -313,8 +383,8 @@ class DashboardTests(unittest.TestCase):
                             {
                                 "platform": "抖音",
                                 "channel": "抖音商业化",
-                                "period_start": "2026-04-24",
-                                "period_end": "2026-04-30",
+                                "period_start": "2026-05-08",
+                                "period_end": "2026-05-14",
                                 "content_id": "previous",
                                 "spend": 100.0,
                                 "activations": 10.0,
@@ -332,8 +402,8 @@ class DashboardTests(unittest.TestCase):
                             {
                                 "platform": "抖音",
                                 "channel": "抖音商业化",
-                                "period_start": "2026-04-10",
-                                "period_end": "2026-04-16",
+                                "period_start": "2026-05-01",
+                                "period_end": "2026-05-07",
                                 "content_id": "older",
                                 "spend": 20.0,
                                 "activations": 2.0,
@@ -353,6 +423,151 @@ class DashboardTests(unittest.TestCase):
             self.assertAlmostEqual(comparison.loc["抖音商业化", "first_pay_rate_current"], 0.5)
             self.assertAlmostEqual(comparison.loc["抖音商业化", "first_pay_rate_previous"], 0.5)
             self.assertAlmostEqual(comparison.loc["抖音商业化", "first_pay_rate_change_rate"], 0.0)
+
+    def test_week_comparison_first_week_uses_previous_month_third_week_not_month(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = [
+                    ("apr-w1", "2026-04-03", "2026-04-09", PERIOD_LEVEL_WEEK, "20260403-20260409", 10.0),
+                    ("apr-w2", "2026-04-10", "2026-04-16", PERIOD_LEVEL_WEEK, "20260410-20260416", 20.0),
+                    ("apr-w3", "2026-04-17", "2026-04-23", PERIOD_LEVEL_WEEK, "20260417-20260423", 30.0),
+                    ("apr-month", "2026-04-01", "2026-04-30", PERIOD_LEVEL_MONTH, "2026-04", 999.0),
+                    ("may-w1", "2026-05-08", "2026-05-14", PERIOD_LEVEL_WEEK, "20260508-20260514", 60.0),
+                ]
+                for batch_id, start, end, level, key, spend in rows:
+                    _insert_period_batch(conn, batch_id, start, end, period_level=level, period_key=key)
+                    _append_single_metric_row(conn, batch_id, start, end, spend)
+                conn.commit()
+
+            comparison = build_period_comparison_for_batch(db_path, "may-w1").set_index("channel")
+            previous_batch_id = previous_successful_batch_id_for_period(
+                db_path,
+                "2026-05-08",
+                PERIOD_LEVEL_WEEK,
+                "20260508-20260514",
+            )
+
+            self.assertIn("总计", comparison.index)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_previous"], 30.0)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_change_rate"], 1.0)
+            self.assertEqual(previous_batch_id, "apr-w3")
+
+    def test_week_comparison_ignores_duplicate_reimport_batches_when_selecting_previous_month_week(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = [
+                    ("apr-w1-old", "2026-04-03", "2026-04-09", "20260403-20260409", 10.0, "2026-05-13T00:00:00+00:00"),
+                    ("apr-w1-new", "2026-04-03", "2026-04-09", "20260403-20260409", 11.0, "2026-05-13T01:00:00+00:00"),
+                    ("apr-w2", "2026-04-10", "2026-04-16", "20260410-20260416", 20.0, "2026-05-13T02:00:00+00:00"),
+                    ("apr-w3", "2026-04-17", "2026-04-23", "20260417-20260423", 30.0, "2026-05-13T03:00:00+00:00"),
+                    ("may-w1", "2026-05-08", "2026-05-14", "20260508-20260514", 60.0, "2026-05-13T04:00:00+00:00"),
+                ]
+                for batch_id, start, end, key, spend, created_at in rows:
+                    _insert_period_batch(
+                        conn,
+                        batch_id,
+                        start,
+                        end,
+                        period_level=PERIOD_LEVEL_WEEK,
+                        period_key=key,
+                        created_at=created_at,
+                    )
+                    _append_single_metric_row(conn, batch_id, start, end, spend)
+                conn.commit()
+
+            comparison = build_period_comparison_for_batch(db_path, "may-w1").set_index("channel")
+            previous_batch_id = previous_successful_batch_id_for_period(
+                db_path,
+                "2026-05-08",
+                PERIOD_LEVEL_WEEK,
+                "20260508-20260514",
+            )
+
+            self.assertIn("总计", comparison.index)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_previous"], 30.0)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_change_rate"], 1.0)
+            self.assertEqual(previous_batch_id, "apr-w3")
+
+    def test_first_week_without_previous_month_third_week_has_no_comparison(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                _insert_period_batch(
+                    conn,
+                    "apr-w1",
+                    "2026-04-03",
+                    "2026-04-09",
+                    period_level=PERIOD_LEVEL_WEEK,
+                    period_key="20260403-20260409",
+                )
+                _append_single_metric_row(conn, "apr-w1", "2026-04-03", "2026-04-09", 10.0)
+                conn.commit()
+
+            comparison = build_period_comparison_for_batch(db_path, "apr-w1")
+
+            self.assertTrue(comparison.empty)
+
+    def test_month_comparison_uses_previous_month_and_ignores_week_batches(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = [
+                    ("mar-month", "2026-03-01", "2026-03-31", PERIOD_LEVEL_MONTH, "2026-03", 100.0),
+                    ("apr-week", "2026-04-17", "2026-04-23", PERIOD_LEVEL_WEEK, "20260417-20260423", 900.0),
+                    ("apr-month", "2026-04-01", "2026-04-30", PERIOD_LEVEL_MONTH, "2026-04", 200.0),
+                    ("may-month", "2026-05-01", "2026-05-31", PERIOD_LEVEL_MONTH, "2026-05", 300.0),
+                ]
+                for batch_id, start, end, level, key, spend in rows:
+                    _insert_period_batch(conn, batch_id, start, end, period_level=level, period_key=key)
+                    _append_single_metric_row(conn, batch_id, start, end, spend)
+                conn.commit()
+
+            comparison = build_period_comparison_for_batch(db_path, "may-month").set_index("channel")
+
+            self.assertIn("总计", comparison.index)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_previous"], 200.0)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_change_rate"], 0.5)
+
+    def test_successful_batch_list_keeps_direct_and_rollup_sources_for_same_period(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                _insert_period_batch(
+                    conn,
+                    "q1-rollup",
+                    "2026-01-01",
+                    "2026-03-31",
+                    period_level="quarter",
+                    period_key="2026-Q1",
+                    source_type=SOURCE_TYPE_ROLLUP,
+                    created_at="2026-04-01T00:00:00+00:00",
+                )
+                _insert_period_batch(
+                    conn,
+                    "q1-upload",
+                    "2026-01-01",
+                    "2026-03-31",
+                    period_level="quarter",
+                    period_key="2026-Q1",
+                    source_type=SOURCE_TYPE_UPLOAD,
+                    created_at="2026-04-02T00:00:00+00:00",
+                )
+                conn.commit()
+
+            batches = list_successful_dashboard_batches(db_path)
+
+            self.assertIn("period_level", batches.columns)
+            self.assertIn("period_key", batches.columns)
+            self.assertIn("source_type", batches.columns)
+            self.assertEqual(batches["batch_id"].tolist(), ["q1-upload", "q1-rollup"])
+            self.assertEqual(batches["source_type"].tolist(), [SOURCE_TYPE_UPLOAD, SOURCE_TYPE_ROLLUP])
 
     def test_build_period_comparison_between_batches_uses_selected_batch(self):
         with TemporaryDirectory() as tmp:
@@ -410,6 +625,102 @@ class DashboardTests(unittest.TestCase):
             self.assertAlmostEqual(comparison.loc["总计", "spend_previous"], 50.0)
             self.assertAlmostEqual(comparison.loc["总计", "spend_change_rate"], 3.0)
             self.assertAlmostEqual(comparison.loc["抖音商业化", "first_pay_count_change_rate"], 9.0)
+
+    def test_build_overview_table_rows_places_total_first_and_merges_growth(self):
+        items = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "spend": 200.0, "activations": 20.0, "first_pay_count": 5.0},
+                {"channel": "B站", "spend": 50.0, "activations": 5.0, "first_pay_count": 1.0},
+            ]
+        )
+        summary = build_dashboard_summary(items)
+        platform_summary = aggregate_dashboard(items, ["channel"])
+        channel_comparison = pd.DataFrame(
+            [
+                {
+                    "channel": "总计",
+                    "spend_change_rate": 0.5,
+                    "activations_change_rate": -0.2,
+                    "activation_cost_change_rate": 0.1,
+                    "first_pay_count_change_rate": 0.0,
+                    "first_pay_cost_change_rate": -0.3,
+                },
+                {
+                    "channel": "抖音商业化",
+                    "spend_change_rate": 1.0,
+                    "activations_change_rate": 0.5,
+                    "activation_cost_change_rate": -0.25,
+                    "first_pay_count_change_rate": 0.25,
+                    "first_pay_cost_change_rate": 0.6,
+                },
+            ]
+        )
+
+        rows = build_overview_table_rows(summary, platform_summary, channel_comparison)
+
+        self.assertEqual(
+            list(rows.columns),
+            [
+                "channel",
+                "spend",
+                "spend_change_rate",
+                "activations",
+                "activations_change_rate",
+                "activation_cost",
+                "activation_cost_change_rate",
+                "first_pay_count",
+                "first_pay_count_change_rate",
+                "first_pay_cost",
+                "first_pay_cost_change_rate",
+            ],
+        )
+        self.assertEqual(rows["channel"].tolist(), ["汇总", "抖音商业化", "B站"])
+        self.assertAlmostEqual(rows.iloc[0]["spend"], 250.0)
+        self.assertAlmostEqual(rows.iloc[0]["activation_cost"], 10.0)
+        self.assertAlmostEqual(rows.iloc[0]["first_pay_cost"], 250.0 / 6.0)
+        self.assertAlmostEqual(rows.iloc[0]["spend_change_rate"], 0.5)
+        self.assertAlmostEqual(rows.iloc[1]["activation_cost_change_rate"], -0.25)
+        self.assertTrue(pd.isna(rows.iloc[2]["spend_change_rate"]))
+        self.assertTrue(pd.isna(rows.iloc[2]["first_pay_cost_change_rate"]))
+
+    def test_build_overview_table_rows_keeps_values_without_comparison(self):
+        items = pd.DataFrame(
+            [
+                {"channel": "小红书商业化", "spend": 120.0, "activations": 10.0, "first_pay_count": 2.0},
+            ]
+        )
+        summary = build_dashboard_summary(items)
+        platform_summary = aggregate_dashboard(items, ["channel"])
+
+        rows = build_overview_table_rows(summary, platform_summary, pd.DataFrame())
+
+        self.assertEqual(rows["channel"].tolist(), ["汇总", "小红书商业化"])
+        self.assertAlmostEqual(rows.iloc[1]["spend"], 120.0)
+        self.assertAlmostEqual(rows.iloc[1]["activation_cost"], 12.0)
+        self.assertTrue(rows.filter(like="_change_rate").isna().all().all())
+
+    def test_build_overview_table_rows_sorts_channels_by_business_priority(self):
+        items = pd.DataFrame(
+            [
+                {"channel": "其他渠道", "spend": 400.0, "activations": 40.0, "first_pay_count": 8.0},
+                {"channel": "B站", "spend": 300.0, "activations": 30.0, "first_pay_count": 6.0},
+                {"channel": "小红书商业化", "spend": 200.0, "activations": 20.0, "first_pay_count": 4.0},
+                {"channel": "抖音商业化", "spend": 100.0, "activations": 10.0, "first_pay_count": 2.0},
+            ]
+        )
+        summary = build_dashboard_summary(items)
+        platform_summary = pd.DataFrame(
+            [
+                {"channel": "其他渠道", "spend": 400.0, "activations": 40.0, "activation_cost": 10.0, "first_pay_count": 8.0, "first_pay_cost": 50.0},
+                {"channel": "B站", "spend": 300.0, "activations": 30.0, "activation_cost": 10.0, "first_pay_count": 6.0, "first_pay_cost": 50.0},
+                {"channel": "小红书商业化", "spend": 200.0, "activations": 20.0, "activation_cost": 10.0, "first_pay_count": 4.0, "first_pay_cost": 50.0},
+                {"channel": "抖音商业化", "spend": 100.0, "activations": 10.0, "activation_cost": 10.0, "first_pay_count": 2.0, "first_pay_cost": 50.0},
+            ]
+        )
+
+        rows = build_overview_table_rows(summary, platform_summary, pd.DataFrame())
+
+        self.assertEqual(rows["channel"].tolist(), ["汇总", "抖音商业化", "小红书商业化", "B站", "其他渠道"])
 
     def test_format_beijing_datetime_converts_utc_created_at_for_selector(self):
         result = format_beijing_datetime("2026-05-19T01:02:03+00:00")
@@ -656,6 +967,166 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(list(volume_rows["category_name"]), ["资讯", "盘点"])
         self.assertEqual(list(cost_rows["category_name"]), ["股友说", "盘点"])
         self.assertAlmostEqual(cost_rows.iloc[0]["activation_cost"], 2.0)
+
+    def test_summarize_channel_categories_returns_all_nonblank_categories(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "category_l2": f"栏目{i:02d}",
+                    "content_id": f"dy-{i}",
+                    "spend": float(i),
+                    "activations": float(i % 3 + 1),
+                    "first_pay_count": float(i % 2),
+                }
+                for i in range(1, 13)
+            ]
+            + [
+                {"channel": "抖音商业化", "category_l2": "", "content_id": "blank", "spend": 999.0},
+                {"channel": "B站", "category_l2": "栏目99", "content_id": "bv-1", "spend": 999.0},
+            ]
+        )
+
+        result = summarize_channel_categories(frame, "抖音商业化")
+
+        self.assertEqual(len(result), 12)
+        self.assertEqual(result.iloc[0]["category_name"], "栏目12")
+        self.assertNotIn("", set(result["category_name"]))
+        self.assertNotIn("栏目99", set(result["category_name"]))
+        self.assertIn("first_pay_rate", result.columns)
+
+    def test_summarize_channel_top_topics_uses_top_20_spend_candidates_and_ai_labels(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "title": f"标题{i:02d}",
+                    "category_l2": "资讯",
+                    "category_l3": f"原题材{i:02d}",
+                    "content_id": f"dy-{i:02d}",
+                    "spend": float(100 - i),
+                    "activations": 1.0,
+                    "first_pay_count": 1.0 if i < 5 else 0.0,
+                }
+                for i in range(25)
+            ]
+            + [
+                {
+                    "channel": "B站",
+                    "title": "其他渠道",
+                    "category_l2": "B站全部",
+                    "category_l3": "其他题材",
+                    "content_id": "bv-1",
+                    "spend": 500.0,
+                    "activations": 5.0,
+                    "first_pay_count": 1.0,
+                }
+            ]
+        )
+
+        result = summarize_channel_top_topics(
+            frame,
+            "抖音商业化",
+            top_n=20,
+            topic_labels={0: "趋势交易", 1: "趋势交易", 2: "芯片行情"},
+        )
+
+        self.assertLessEqual(len(result), 20)
+        self.assertIn("趋势交易", set(result["topic_name"]))
+        trend = result[result["topic_name"].eq("趋势交易")].iloc[0]
+        self.assertAlmostEqual(trend["spend"], 199.0)
+        self.assertNotIn("原题材20", set(result["topic_name"]))
+        self.assertNotIn("其他题材", set(result["topic_name"]))
+
+    def test_summarize_channel_top_topics_falls_back_to_algorithmic_categories_without_ai_labels(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "channel": "小红书商业化",
+                    "title": "成王败寇 一念之差",
+                    "category_l2": "达人内容",
+                    "category_l3": "",
+                    "content_id": "note-1",
+                    "spend": 50.0,
+                    "activations": 5.0,
+                    "first_pay_count": 1.0,
+                },
+                {
+                    "channel": "小红书商业化",
+                    "title": "达人投流剧情",
+                    "category_l2": "达人内容",
+                    "category_l3": "很长很像标题的低消耗题材",
+                    "content_id": "note-2",
+                    "spend": 1.0,
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                },
+            ]
+        )
+
+        result = summarize_channel_top_topics(frame, "小红书商业化", top_n=2)
+
+        self.assertEqual(list(result["topic_name"]), ["剧情达人"])
+        self.assertAlmostEqual(result.iloc[0]["spend"], 51.0)
+        self.assertNotIn("成王败寇 一念之差", set(result["topic_name"]))
+        self.assertNotIn("很长很像标题的低消耗题材", set(result["topic_name"]))
+
+    def test_summarize_channel_top_topics_rejects_ai_labels_that_copy_titles(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "channel": "小红书商业化",
+                    "title": "成王败寇 一念之差",
+                    "category_l2": "达人内容",
+                    "category_l3": "",
+                    "content_id": "note-1",
+                    "spend": 50.0,
+                    "activations": 5.0,
+                    "first_pay_count": 1.0,
+                }
+            ]
+        )
+
+        result = summarize_channel_top_topics(
+            frame,
+            "小红书商业化",
+            top_n=1,
+            topic_labels={0: "成王败寇 一念之差"},
+        )
+
+        self.assertEqual(list(result["topic_name"]), ["剧情达人"])
+        self.assertNotIn("成王败寇 一念之差", set(result["topic_name"]))
+
+    def test_build_channel_top_topic_insights_summarizes_budget_activation_and_efficiency(self):
+        topic_summary = pd.DataFrame(
+            [
+                {
+                    "topic_name": "剧情达人",
+                    "spend": 300.0,
+                    "activations": 30.0,
+                    "activation_cost": 10.0,
+                    "first_pay_count": 9.0,
+                    "first_pay_rate": 0.3,
+                },
+                {
+                    "topic_name": "财商认知",
+                    "spend": 100.0,
+                    "activations": 20.0,
+                    "activation_cost": 5.0,
+                    "first_pay_count": 4.0,
+                    "first_pay_rate": 0.2,
+                },
+            ]
+        )
+
+        markdown = build_channel_top_topic_insights(topic_summary)
+
+        self.assertIn("Top 20 题材分析结论", markdown)
+        self.assertIn("剧情达人", markdown)
+        self.assertIn("财商认知", markdown)
+        self.assertIn("预算集中", markdown)
+        self.assertIn("拉新", markdown)
+        self.assertIn("效率", markdown)
 
     def test_summarize_topics_for_selection_uses_single_bilibili_bucket(self):
         frame = pd.DataFrame(

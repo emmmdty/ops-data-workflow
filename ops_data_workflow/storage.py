@@ -13,6 +13,13 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
+from .periods import (
+    PERIOD_LEVEL_MONTH,
+    PERIOD_LEVEL_WEEK,
+    SOURCE_TYPE_UPLOAD,
+    period_metadata_from_dates,
+)
+
 
 SUCCESS_BATCH_ORDER = "period_end desc, period_start desc, created_at desc"
 SUCCESS_BATCH_ORDER_ASC = "period_end asc, period_start asc, created_at asc"
@@ -68,10 +75,17 @@ def init_db(db_path: Path) -> None:
                 output_dir text not null,
                 status text not null,
                 comparison_batch_id text,
-                comparison_note text
+                comparison_note text,
+                period_level text not null default '',
+                period_key text not null default '',
+                period_label text not null default '',
+                data_start text not null default '',
+                data_end text not null default '',
+                source_type text not null default ''
             )
             """
         )
+        _ensure_upload_batch_metadata_columns(conn)
         conn.execute(
             """
             create table if not exists uploaded_files (
@@ -192,8 +206,152 @@ def find_previous_batch(db_path: Path, period_start: str) -> Optional[str]:
 
 
 def previous_successful_batch_id(db_path: Path, period_start: str) -> Optional[str]:
+    return previous_successful_batch_id_for_period(
+        db_path,
+        period_start,
+        "",
+        "",
+    )
+
+
+def previous_successful_batch_id_for_period(
+    db_path: Path,
+    period_start: str,
+    period_level: str = "",
+    period_key: str = "",
+) -> Optional[str]:
     if not Path(db_path).exists():
         return None
+    with closing(sqlite3.connect(db_path)) as conn:
+        try:
+            batches = pd.read_sql_query(
+                """
+                select batch_id, period_start, period_end, created_at, status,
+                       period_level, period_key, period_label, data_start, data_end, source_type
+                from upload_batches
+                where status = 'ok'
+                order by period_end desc, period_start desc, created_at desc
+                """,
+                conn,
+            )
+        except Exception:
+            row = conn.execute(
+                """
+                select batch_id
+                from upload_batches
+                where status = 'ok' and period_end < ?
+                order by period_end desc, period_start desc, created_at desc
+                limit 1
+                """,
+                (period_start,),
+            ).fetchone()
+            return str(row[0]) if row else None
+    previous = previous_batch_from_rows(batches, period_start, period_level, period_key)
+    return previous or None
+
+
+def previous_batch_from_rows(
+    batches: pd.DataFrame,
+    period_start: str,
+    period_level: str = "",
+    period_key: str = "",
+) -> str:
+    if batches.empty or not period_start:
+        return ""
+    normalized = normalize_batch_metadata(batches)
+    if normalized.empty:
+        return ""
+    start = pd.to_datetime(period_start, errors="coerce")
+    if pd.isna(start):
+        return ""
+    level = str(period_level or "").strip()
+    if not level:
+        current = normalized[normalized["period_start"].astype(str).eq(str(period_start))]
+        level = str(current.iloc[0].get("period_level", "")) if not current.empty else PERIOD_LEVEL_WEEK
+    level = level or PERIOD_LEVEL_WEEK
+    scoped = normalized[normalized["period_level"].eq(level)].copy()
+    scoped["_start_dt"] = pd.to_datetime(scoped["period_start"], errors="coerce")
+    scoped["_end_dt"] = pd.to_datetime(scoped["period_end"], errors="coerce")
+    scoped = scoped[scoped["_start_dt"].notna() & scoped["_end_dt"].notna() & scoped["_start_dt"].lt(start)]
+    scoped = _latest_batch_rows_per_period(scoped)
+    if scoped.empty:
+        return ""
+
+    if level == PERIOD_LEVEL_WEEK:
+        same_month = scoped[
+            scoped["_start_dt"].dt.year.eq(start.year)
+            & scoped["_start_dt"].dt.month.eq(start.month)
+        ].sort_values(["_start_dt", "created_at"], ascending=[False, False])
+        if not same_month.empty:
+            return str(same_month.iloc[0]["batch_id"])
+
+        previous_month_start = (start.replace(day=1) - pd.Timedelta(days=1)).replace(day=1)
+        previous_month = scoped[
+            scoped["_start_dt"].dt.year.eq(previous_month_start.year)
+            & scoped["_start_dt"].dt.month.eq(previous_month_start.month)
+        ].sort_values(["_start_dt", "created_at"], ascending=[True, False])
+        return str(previous_month.iloc[2]["batch_id"]) if len(previous_month) >= 3 else ""
+
+    previous = scoped.sort_values(["_end_dt", "_start_dt", "created_at"], ascending=[False, False, False])
+    return str(previous.iloc[0]["batch_id"]) if not previous.empty else ""
+
+
+def _latest_batch_rows_per_period(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    prepared = rows.copy()
+    key_columns = ["period_level", "period_key", "period_start", "period_end"]
+    for column in key_columns:
+        if column not in prepared.columns:
+            prepared[column] = ""
+    prepared["_created_dt"] = pd.to_datetime(prepared.get("created_at", ""), errors="coerce", utc=True)
+    return (
+        prepared.sort_values(key_columns + ["_created_dt"], ascending=[True, True, True, True, False])
+        .drop_duplicates(subset=key_columns, keep="first")
+        .drop(columns=["_created_dt"], errors="ignore")
+    )
+
+
+def normalize_batch_metadata(batches: pd.DataFrame) -> pd.DataFrame:
+    if batches.empty:
+        return batches.copy()
+    normalized = batches.copy()
+    for column in ["period_level", "period_key", "period_label", "data_start", "data_end", "source_type"]:
+        if column not in normalized.columns:
+            normalized[column] = ""
+    for index, row in normalized.iterrows():
+        try:
+            period = period_metadata_from_dates(
+                str(row.get("period_start", "")),
+                str(row.get("period_end", "")),
+                str(row.get("period_level", "") or ""),
+                str(row.get("period_key", "") or ""),
+                str(row.get("period_label", "") or ""),
+                str(row.get("data_start", "") or ""),
+                str(row.get("data_end", "") or ""),
+                str(row.get("source_type", "") or SOURCE_TYPE_UPLOAD),
+            )
+        except Exception:
+            continue
+        normalized.at[index, "period_level"] = period.period_level
+        normalized.at[index, "period_key"] = period.period_key
+        normalized.at[index, "period_label"] = period.period_label
+        normalized.at[index, "data_start"] = period.data_start
+        normalized.at[index, "data_end"] = period.data_end
+        normalized.at[index, "source_type"] = period.source_type
+    return normalized
+
+
+def _legacy_period_level(period_start: str, period_end: str) -> str:
+    try:
+        start = pd.Timestamp(period_start)
+        end = pd.Timestamp(period_end)
+    except Exception:
+        return PERIOD_LEVEL_WEEK
+    return PERIOD_LEVEL_MONTH if (end - start).days + 1 >= 21 else PERIOD_LEVEL_WEEK
+
+
+def _legacy_previous_successful_batch_id(db_path: Path, period_start: str) -> Optional[str]:
     with closing(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
             """
@@ -612,17 +770,34 @@ def persist_workflow_result(
     ai_summary: str,
     comparison_batch_id: Optional[str],
     comparison_note: str,
+    period_level: str = "",
+    period_key: str = "",
+    period_label: str = "",
+    data_start: str = "",
+    data_end: str = "",
+    source_type: str = SOURCE_TYPE_UPLOAD,
 ) -> None:
     init_db(db_path)
     created_at = datetime.now(timezone.utc).isoformat()
+    period = period_metadata_from_dates(
+        period_start,
+        period_end,
+        period_level,
+        period_key,
+        period_label,
+        data_start,
+        data_end,
+        source_type,
+    )
     with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             insert into upload_batches (
                 batch_id, period_start, period_end, created_at, archive_dir,
-                output_dir, status, comparison_batch_id, comparison_note
+                output_dir, status, comparison_batch_id, comparison_note,
+                period_level, period_key, period_label, data_start, data_end, source_type
             )
-            values (?, ?, ?, ?, ?, ?, 'ok', ?, ?)
+            values (?, ?, ?, ?, ?, ?, 'ok', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 batch_id,
@@ -633,6 +808,12 @@ def persist_workflow_result(
                 str(output_dir),
                 comparison_batch_id or "",
                 comparison_note,
+                period.period_level,
+                period.period_key,
+                period.period_label,
+                period.data_start,
+                period.data_end,
+                period.source_type,
             ),
         )
         conn.execute(
@@ -832,6 +1013,16 @@ def _ensure_table_columns(conn: sqlite3.Connection, table_name: str, frame: pd.D
         conn.execute(
             f'alter table "{_sqlite_identifier(table_name)}" add column "{_sqlite_identifier(str(column))}" {_sqlite_type(frame[column])}'
         )
+
+
+def _ensure_upload_batch_metadata_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        row[1]
+        for row in conn.execute('pragma table_info("upload_batches")').fetchall()
+    }
+    for column in ["period_level", "period_key", "period_label", "data_start", "data_end", "source_type"]:
+        if column not in existing:
+            conn.execute(f'alter table "upload_batches" add column "{column}" text not null default ""')
 
 
 def _sqlite_identifier(value: str) -> str:
