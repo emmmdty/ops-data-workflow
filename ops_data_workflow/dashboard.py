@@ -13,6 +13,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 import pandas as pd
 
 from .comparison import build_channel_comparison
+from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, social_platform_from_name
 from .storage import init_db, normalize_batch_metadata, previous_batch_from_rows
 
 
@@ -779,10 +780,10 @@ def summarize_channel_top_topics(
 
 
 def build_channel_top_topic_insights(topic_summary: pd.DataFrame) -> str:
-    """Build concise business analysis for a channel's Top 20 topic summary."""
+    """Build concise business analysis for a channel's focused topic summary."""
     summary = topic_summary.copy()
     if summary.empty:
-        return "#### Top 20 题材分析结论\n- 当前没有可用于分析的 Top 20 题材数据。"
+        return "#### 重点题材分析结论\n- 当前没有可用于分析的重点题材数据。"
 
     for column in ["spend", "activations", "activation_cost", "first_pay_count", "first_pay_rate"]:
         if column not in summary.columns:
@@ -806,10 +807,10 @@ def build_channel_top_topic_insights(topic_summary: pd.DataFrame) -> str:
     top3_share = _safe_ratio(top3_spend, total_spend)
     return "\n".join(
         [
-            "#### Top 20 题材分析结论",
+            "#### 重点题材分析结论",
             (
                 f"- 预算集中在 **{top_spend['topic_name']}**：消耗 {_fmt_number(top_spend.get('spend'), 0)}，"
-                f"占 Top 20 消耗 {_fmt_percent_text(top_share)}；Top 3 题材合计占 {_fmt_percent_text(top3_share)}。"
+                f"占重点内容消耗 {_fmt_percent_text(top_share)}；Top 3 题材合计占 {_fmt_percent_text(top3_share)}。"
             ),
             (
                 f"- 拉新贡献最高的是 **{top_activation['topic_name']}**：激活 {_fmt_number(top_activation.get('activations'), 0)}，"
@@ -1071,6 +1072,7 @@ def _normalize_items(items: pd.DataFrame) -> pd.DataFrame:
     if "platform" in normalized.columns:
         missing_platform = normalized["platform"].str.strip().eq("")
         normalized.loc[missing_platform, "platform"] = normalized.loc[missing_platform, "channel"]
+    _normalize_social_display_dimensions(normalized)
     _normalize_bilibili_display_categories(normalized)
     normalized["batch_period_start"] = normalized["batch_period_start"].fillna(normalized["period_start"]).astype(str)
     normalized["batch_period_end"] = normalized["batch_period_end"].fillna(normalized["period_end"]).astype(str)
@@ -1084,6 +1086,7 @@ def _normalize_channel_comparison(comparison: pd.DataFrame) -> pd.DataFrame:
         if column not in normalized.columns:
             normalized[column] = "" if column == "channel" else pd.NA
     normalized["channel"] = normalized["channel"].fillna("").astype(str)
+    normalized["channel"] = normalized["channel"].map(normalize_channel_name)
     for column in CHANNEL_COMPARISON_COLUMNS:
         if column == "channel":
             continue
@@ -1165,6 +1168,19 @@ def _normalize_bilibili_display_categories(items: pd.DataFrame) -> None:
         values = items[column].fillna("").astype(str).str.strip()
         legacy_or_blank = values.isin(LEGACY_BILIBILI_CATEGORY_VALUES)
         items.loc[bilibili & legacy_or_blank, column] = BILIBILI_CATEGORY
+
+
+def _normalize_social_display_dimensions(items: pd.DataFrame) -> None:
+    platform_from_platform = items["platform"].map(social_platform_from_name)
+    platform_from_channel = items["channel"].map(social_platform_from_name)
+    social_platform = platform_from_platform.where(platform_from_platform.ne(""), platform_from_channel)
+    social_mask = social_platform.ne("")
+    if not social_mask.any():
+        return
+    items.loc[social_mask, "platform"] = social_platform[social_mask]
+    items.loc[social_mask, "platform_group"] = SOCIAL_PLATFORM_GROUP
+    channel_source = items["channel"].where(items["channel"].str.strip().ne(""), items["platform"])
+    items.loc[social_mask, "channel"] = channel_source.loc[social_mask].map(normalize_channel_name)
 
 
 def _filter_in(items: pd.DataFrame, column: str, values: Iterable[str]) -> pd.DataFrame:
@@ -1360,14 +1376,18 @@ def _fmt_number(value: object, decimals: int) -> str:
     number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(number):
         return "暂无"
-    return f"{float(number):,.{decimals}f}"
+    if decimals <= 0:
+        return f"{float(number):,.0f}"
+    text = f"{float(number):,.{decimals}f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _fmt_percent_text(value: object) -> str:
     number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(number):
         return "暂无"
-    return f"{float(number):.1%}"
+    text = f"{float(number) * 100:.1f}".rstrip("0").rstrip(".")
+    return f"{text}%"
 
 
 def _empty_items() -> pd.DataFrame:

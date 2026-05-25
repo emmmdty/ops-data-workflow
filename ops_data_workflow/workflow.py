@@ -25,6 +25,7 @@ from .storage import (
     previous_successful_batch_id_for_period,
     read_total_summary,
 )
+from .topic_analysis import build_topic_label_frame
 
 
 def run_workflow(
@@ -190,6 +191,8 @@ def run_archived_workflow(
         platform_summary=analysis.platform_summary,
         platform_category_summary=analysis.platform_category_summary,
     )
+    progress("正在固化重点题材")
+    topic_label_items = build_topic_label_frame(analysis.canonical, env_path=env_path)
 
     output_dir = Path(output_root) / batch_id
     progress("正在写入历史库并生成下载文件")
@@ -243,6 +246,7 @@ def run_archived_workflow(
         analysis.conflict_retention_details,
         analysis.missing_value_details,
         channel_comparison,
+        topic_label_items,
         ai_summary,
         previous_batch_id,
         comparison_note,
@@ -357,6 +361,7 @@ def run_rollup_workflow(
         platform_summary=analysis.platform_summary,
         platform_category_summary=analysis.platform_category_summary,
     )
+    topic_label_items = build_topic_label_frame(analysis.canonical, env_path=env_path)
     output_dir = Path(output_root) / batch_id
     report_html, analysis_xlsx, canonical_csv, total_summary_xlsx = write_outputs(
         output_dir,
@@ -408,6 +413,7 @@ def run_rollup_workflow(
         analysis.conflict_retention_details,
         analysis.missing_value_details,
         channel_comparison,
+        topic_label_items,
         ai_summary,
         previous_batch_id,
         comparison_note,

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from typing import Iterable, Protocol
 
+from .source_channels import infer_channel_from_path
 from .zip_input import extract_zip
 
 
@@ -45,6 +46,7 @@ def materialize_uploaded_files(
     target_dir: Path,
     *,
     strip_common_period_root: bool = False,
+    replace_same_channel: bool = False,
 ) -> MaterializedUploads:
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -53,6 +55,13 @@ def materialize_uploaded_files(
     original_files: list[Path] = []
     normalized_uploads = [(upload, _normalize_upload_relative_path(upload.name)) for upload in uploads]
     period_root = _common_period_root(normalized_uploads) if strip_common_period_root else ""
+    if replace_same_channel:
+        incoming_channels = {
+            infer_channel_from_path(_strip_period_root(relative_path, period_root))
+            for _, relative_path in normalized_uploads
+            if relative_path.suffix.lower() != ".zip"
+        }
+        _remove_channel_files(target_dir, incoming_channels)
 
     for upload, relative_path in normalized_uploads:
         destination_relative_path = _strip_period_root(relative_path, period_root)
@@ -112,6 +121,20 @@ def _strip_period_root(relative_path: Path, period_root: str) -> Path:
     if not period_root or not relative_path.parts or relative_path.parts[0] != period_root:
         return relative_path
     return Path(*relative_path.parts[1:])
+
+
+def _remove_channel_files(target_dir: Path, channels: set[str]) -> None:
+    if not channels:
+        return
+    for path in sorted(Path(target_dir).rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name.startswith("~$") or path.name == "period_manifest.json":
+            continue
+        if path.suffix.lower() not in SUPPORTED_UPLOAD_SUFFIXES - {".zip"}:
+            continue
+        if infer_channel_from_path(path.relative_to(target_dir)) in channels:
+            path.unlink()
 
 
 def _parse_period_folder_name(folder_name: str) -> tuple[date, date] | None:

@@ -163,6 +163,7 @@ def group_topic_labels(
                 "title": _json_text(row.get("title", "")),
                 "content_id": _json_text(row.get("content_id", "")),
                 "material_id": _json_text(row.get("material_id", "")),
+                "content_type": _json_text(row.get("content_type", "")),
                 "category_l2": _json_text(row.get("category_l2", "")),
                 "category_l3": _json_text(row.get("category_l3", "")),
                 "spend": _json_number(row.get("spend", 0)),
@@ -174,7 +175,7 @@ def group_topic_labels(
     }
     prompt = (
         "请把这些投放内容归纳成适合运营复盘的三级题材。"
-        "只能根据标题、已有栏目题材和内容标识命名，不要编造指标。"
+        "只能根据标题、内容类型、已有栏目题材和内容标识命名，不要编造指标。"
         "不要直接复用原标题、整句标题、内容 ID 或单条视频标题。"
         "请把相似创意归并成少量主题，通常 4-8 个主题即可。"
         "相似标题必须合并为同一个简短题材名，题材名不超过12个中文字符。"

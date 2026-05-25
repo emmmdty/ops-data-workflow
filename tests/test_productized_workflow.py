@@ -13,11 +13,13 @@ from openpyxl import load_workbook
 
 from ops_data_workflow.ai import _build_payload, group_topic_labels, resolve_deepseek_settings
 from ops_data_workflow.categories import CATEGORY_TAG_MAP, category_from_tags
+from ops_data_workflow.source_channels import infer_channel_from_path
 from ops_data_workflow.storage import init_db
 from ops_data_workflow.storage import (
     delete_batch_permanently,
     list_file_backups,
     load_category_mappings,
+    load_topic_labels_for_batch,
     move_batch_to_file_backup,
     purge_history_state,
     read_batch_record,
@@ -88,6 +90,76 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertTrue((result.raw_dir / "小红书商业化.csv").exists())
             self.assertTrue((result.raw_dir / "抖音商业化.csv").exists())
             self.assertEqual(len(result.original_files), 3)
+
+    def test_materialize_uploaded_files_replaces_same_channel_and_keeps_other_channels(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw" / "20260401-20260407"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "抖音商业化旧文件.csv").write_text(
+                "视频标题,视频id,素材ID,消耗,展示数,点击数,激活数,付费次数,内容类型\n旧标题,old,old-mat,1,2,1,1,0,资讯\n",
+                encoding="utf-8-sig",
+            )
+            (raw_dir / "B站.csv").write_text(
+                "视频BVID,视频标题,花费,展示量,点击量,应用激活数,应用内付费\nBV1,B站标题,10,100,10,1,0\n",
+                encoding="utf-8-sig",
+            )
+
+            materialize_uploaded_files(
+                [
+                    FakeUpload(
+                        "抖音商业化新文件.csv",
+                        "视频标题,视频id,素材ID,消耗,展示数,点击数,激活数,付费次数,内容类型\n新标题,new,new-mat,9,20,10,3,1,股友说\n".encode(
+                            "utf-8-sig"
+                        ),
+                    )
+                ],
+                raw_dir,
+                replace_same_channel=True,
+            )
+
+            self.assertFalse((raw_dir / "抖音商业化旧文件.csv").exists())
+            self.assertTrue((raw_dir / "抖音商业化新文件.csv").exists())
+            self.assertTrue((raw_dir / "B站.csv").exists())
+
+    def test_social_uploads_replace_same_business_channel_across_wechat_tencent_video_account(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw" / "20260401-20260407"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "微信市场部旧文件.csv").write_text(
+                "创意名称,花费,曝光次数,点击次数,APP激活次数,注册次数\n旧微信创意,1,2,1,1,0\n",
+                encoding="utf-8-sig",
+            )
+            (raw_dir / "B站.csv").write_text(
+                "视频BVID,视频标题,花费,展示量,点击量,应用激活数,应用内付费\nBV1,B站标题,10,100,10,1,0\n",
+                encoding="utf-8-sig",
+            )
+
+            self.assertEqual(infer_channel_from_path("微信市场部.xlsx"), "微信市场部")
+            self.assertEqual(infer_channel_from_path("腾讯（市场部）.xlsx"), "微信市场部")
+            self.assertEqual(infer_channel_from_path("视频号投放.xlsx"), "微信市场部")
+            self.assertEqual(infer_channel_from_path("微信投放.xlsx"), "微信市场部")
+            self.assertEqual(infer_channel_from_path("腾讯商业化.xlsx"), "微信商业化")
+            self.assertEqual(infer_channel_from_path("视频号商业化.xlsx"), "微信商业化")
+            self.assertEqual(infer_channel_from_path("快手投放.xlsx"), "快手投放")
+
+            materialize_uploaded_files(
+                [
+                    FakeUpload(
+                        "视频号投放.csv",
+                        "创意名称,花费,曝光次数,点击次数,APP激活次数,注册次数\n新视频号创意,9,20,10,3,1\n".encode(
+                            "utf-8-sig"
+                        ),
+                    )
+                ],
+                raw_dir,
+                replace_same_channel=True,
+            )
+
+            self.assertFalse((raw_dir / "微信市场部旧文件.csv").exists())
+            self.assertTrue((raw_dir / "视频号投放.csv").exists())
+            self.assertTrue((raw_dir / "B站.csv").exists())
 
     def test_materialize_uploaded_files_writes_to_period_raw_directory(self):
         with TemporaryDirectory() as tmp:
@@ -659,6 +731,31 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertFalse(raw_dir.exists())
             self.assertFalse(result.report_html.parent.exists())
             self.assertFalse(result.archive_dir.exists())
+
+    def test_archived_workflow_persists_focused_topic_labels(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            _write_raw_fixture(raw_dir)
+
+            result = run_archived_workflow(
+                raw_dir,
+                "2026-04-01",
+                "2026-04-07",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=db_path,
+                env_path=tmp_path / "missing.env",
+            )
+
+            labels = load_topic_labels_for_batch(db_path, result.batch_id)
+
+            self.assertFalse(labels.empty)
+            self.assertIn("topic_name", labels.columns)
+            self.assertNotIn("达人数据", set(labels["channel"]))
+            self.assertTrue(labels["rank_position"].ge(1).all())
 
     def test_category_mapping_overrides_are_reused_by_archived_workflow(self):
         with TemporaryDirectory() as tmp:

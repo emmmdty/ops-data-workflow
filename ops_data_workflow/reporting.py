@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 from pathlib import Path
 from typing import Optional
@@ -40,10 +41,10 @@ COLUMN_LABELS = {
     "author": "作者",
     "cover_url": "封面/素材链接",
     "content_url": "内容链接",
-    "category_l2": "二级栏目",
+    "category_l2": "栏目",
     "category_l3": "三级题材",
     "category_source": "分类来源",
-    "category_l2_source": "二级栏目来源",
+    "category_l2_source": "栏目来源",
     "category_confidence": "分类置信度",
     "review_status": "审核状态",
     "manual_category": "人工内容类别",
@@ -53,7 +54,7 @@ COLUMN_LABELS = {
     "suggested_category": "AI生成内容类别",
     "category_status": "内容类别来源",
     "spend": "消耗",
-    "impressions": "展示/曝光量",
+    "impressions": "曝光量",
     "clicks": "点击量",
     "activations": "激活数",
     "first_pay_count": "首次付费次数",
@@ -110,6 +111,14 @@ COLUMN_LABELS = {
     "account_count": "覆盖账号数",
     "item_count": "素材数",
     "unique_content_count": "唯一视频数",
+    "content_type": "内容类型",
+    "topic_name": "题材",
+    "content_types": "涉及内容类型",
+    "material_count": "素材数",
+    "rank_metric": "排序指标",
+    "rank_value": "排序值",
+    "rank_position": "排序",
+    "input_hash": "输入哈希",
     "trend_period": "趋势周期",
     "channels": "覆盖渠道",
     "channel_count": "覆盖渠道数",
@@ -131,6 +140,59 @@ COLUMN_LABELS = {
     "raw_field": "原始字段",
     "value": "原始分类值",
     "count": "出现次数",
+}
+
+DISPLAY_NUMERIC_COLUMNS = {
+    "spend",
+    "spend_share",
+    "impressions",
+    "clicks",
+    "ctr",
+    "activations",
+    "activation_cost",
+    "activation_rate",
+    "first_pay_count",
+    "first_pay_cost",
+    "first_pay_rate",
+    "item_count",
+    "unique_content_count",
+    "material_count",
+    "channel_count",
+    "merged_row_count",
+    "rank_value",
+    "rank_position",
+    "activation_share",
+    "first_pay_share",
+    "pending_item_count",
+    "pending_spend",
+    "pending_spend_share",
+    "secondary_category_count",
+    "observed_count",
+    "count",
+    "total",
+    "value",
+    "heat_score",
+    "acquisition_score",
+    "overall_score",
+    "missing_spend_share",
+    "spend_current",
+    "spend_previous",
+    "spend_change_rate",
+    "activations_current",
+    "activations_previous",
+    "activations_change_rate",
+    "activation_cost_current",
+    "activation_cost_previous",
+    "activation_cost_change_rate",
+    "first_pay_count_current",
+    "first_pay_count_previous",
+    "first_pay_count_change_rate",
+    "first_pay_cost_current",
+    "first_pay_cost_previous",
+    "first_pay_cost_change_rate",
+    "first_pay_rate_current",
+    "first_pay_rate_previous",
+    "first_pay_rate_change_rate",
 }
 
 
@@ -232,7 +294,7 @@ FIELD_MAPPING_ROWS = [
         "说明": "投放消耗金额。",
     },
     {
-        "输出字段": "展示/曝光量",
+        "输出字段": "曝光量",
         "B站.xlsx": "展示量",
         "小红书商业化.xlsx": "展现量",
         "抖音商业化.xlsx": "展示数",
@@ -584,12 +646,12 @@ def _write_html(
     </div>
   </div>
   <section class="metric-grid">
-    <div class="metric">消耗<strong>{total_spend:,.0f}</strong></div>
-    <div class="metric">激活<strong>{total_activations:,.0f}</strong></div>
-    <div class="metric">激活成本<strong>{activation_cost:,.1f}</strong></div>
-    <div class="metric">首次付费<strong>{total_first_pay:,.0f}</strong></div>
-    <div class="metric">首次付费成本<strong>{first_pay_cost:,.1f}</strong></div>
-    <div class="metric">缺失分类消耗占比<strong>{pending_ratio:.1%}</strong></div>
+    <div class="metric">消耗<strong>{format_display_number(total_spend, 0)}</strong></div>
+    <div class="metric">激活<strong>{format_display_number(total_activations, 0)}</strong></div>
+    <div class="metric">激活成本<strong>{format_display_number(activation_cost, 1)}</strong></div>
+    <div class="metric">首次付费<strong>{format_display_number(total_first_pay, 0)}</strong></div>
+    <div class="metric">首次付费成本<strong>{format_display_number(first_pay_cost, 1)}</strong></div>
+    <div class="metric">缺失分类消耗占比<strong>{format_display_number(pending_ratio * 100, 1)}%</strong></div>
   </section>
   <h2>AI 数据结论</h2>
   <div class="ai">{escape(ai_summary or "未生成 AI 结论。")}</div>
@@ -618,8 +680,8 @@ def _write_html(
   {_localized(cover_metrics).to_html(index=False, classes="dataframe", border=0)}
   <h2>缺失分类影响说明</h2>
   <div class="warning">
-    共有 {len(pending_categories)} 条素材缺少最终内容类别，消耗 {pending_spend:,.0f}，
-    占全部消耗 {pending_ratio:.1%}。明细会同时保留人工内容类别和 AI生成内容类别，便于复核。
+    共有 {len(pending_categories)} 条素材缺少最终内容类别，消耗 {format_display_number(pending_spend, 0)}，
+    占全部消耗 {format_display_number(pending_ratio * 100, 1)}%。明细会同时保留人工内容类别和 AI生成内容类别，便于复核。
   </div>
   <h2>分类审核队列</h2>
   {_localized(review_queue.head(50)).to_html(index=False, classes="dataframe", border=0)}
@@ -632,8 +694,33 @@ def _write_html(
     path.write_text(html, encoding="utf-8")
 
 
+def format_display_number(value: object, max_decimals: int = 2) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return ""
+    try:
+        number = Decimal(str(numeric))
+    except InvalidOperation:
+        return ""
+    if number == 0:
+        return "0"
+    if max_decimals <= 0:
+        rounded = number.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        return "0" if rounded == 0 else f"{rounded:,.0f}"
+    quantum = Decimal("1").scaleb(-int(max_decimals))
+    rounded = number.quantize(quantum, rounding=ROUND_HALF_UP)
+    if rounded == 0:
+        return "0"
+    text = f"{rounded:,.{max_decimals}f}".rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
+
+
 def localize_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    return frame.rename(columns={column: _localized_column_name(column) for column in frame.columns})
+    display = frame.copy()
+    for column in display.columns:
+        if column in DISPLAY_NUMERIC_COLUMNS:
+            display[column] = display[column].map(format_display_number)
+    return display.rename(columns={column: _localized_column_name(column) for column in display.columns})
 
 
 # 重要字段优先顺序定义
@@ -652,16 +739,16 @@ IMPORTANT_COLUMNS_ORDER = [
     "first_pay_cost",    # 付费成本
     "first_pay_rate",    # 付费率
     # 分类字段
-    "category_l2",       # 二级栏目
+    "category_l2",       # 栏目
     "category_l3",       # 三级题材
     "category_source",   # 分类来源
-    "category_l2_source",  # 二级栏目来源
+    "category_l2_source",  # 栏目来源
     "content_category",  # 最终内容类别
     "category_display",  # 内容分类
     # 辅助字段
     "item_count",        # 素材数
     "unique_content_count",  # 唯一视频数
-    "impressions",       # 展示/曝光量
+    "impressions",       # 曝光量
     "clicks",            # 点击量
     "ctr",               # 点击率
     "account_id",        # 账号ID

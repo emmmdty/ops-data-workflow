@@ -16,6 +16,7 @@ from zipfile import ZipFile
 
 from .periods import ReviewPeriod, infer_review_period_from_text, period_raw_dir_name, review_period_from_dates
 from .pipeline import TABULAR_SUFFIXES
+from .source_channels import infer_channel_from_path
 
 
 class UploadedFileLike(Protocol):
@@ -86,6 +87,7 @@ def normalize_uploaded_periods(
         period = _combine_periods([entry[0] for entry in entries])
         raw_dir = raw_root / period_raw_dir_name(period)
         raw_dir.mkdir(parents=True, exist_ok=True)
+        _remove_existing_channels(raw_dir, {infer_channel_from_path(entry[2]) for entry in entries})
         copied: list[Path] = []
         source_paths: list[str] = []
         for _, path, source_name in entries:
@@ -238,3 +240,15 @@ def _unique_destination(raw_dir: Path, file_name: str, source_name: str) -> Path
         candidate = raw_dir / f"{stem}_{source_slug}_{counter}{suffix}"
         counter += 1
     return candidate
+
+
+def _remove_existing_channels(raw_dir: Path, channels: set[str]) -> None:
+    if not raw_dir.exists() or not channels:
+        return
+    for path in sorted(raw_dir.rglob("*")):
+        if not path.is_file() or path.name == "cleaned.xlsx" or path.name == "period_manifest.json":
+            continue
+        if path.suffix.lower() not in TABULAR_SUFFIXES:
+            continue
+        if infer_channel_from_path(path.relative_to(raw_dir)) in channels:
+            path.unlink()

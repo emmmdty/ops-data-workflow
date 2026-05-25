@@ -33,7 +33,7 @@ from ops_data_workflow.dashboard import (
     summarize_content_types,
     summarize_unique_content,
 )
-from ops_data_workflow.reporting import localize_and_sort_columns
+from ops_data_workflow.reporting import format_display_number, localize_and_sort_columns
 from ops_data_workflow.periods import PERIOD_LEVEL_MONTH, PERIOD_LEVEL_WEEK, SOURCE_TYPE_ROLLUP, SOURCE_TYPE_UPLOAD
 from ops_data_workflow.storage import init_db, previous_successful_batch_id_for_period
 
@@ -1121,7 +1121,7 @@ class DashboardTests(unittest.TestCase):
 
         markdown = build_channel_top_topic_insights(topic_summary)
 
-        self.assertIn("Top 20 题材分析结论", markdown)
+        self.assertIn("重点题材分析结论", markdown)
         self.assertIn("剧情达人", markdown)
         self.assertIn("财商认知", markdown)
         self.assertIn("预算集中", markdown)
@@ -1268,6 +1268,7 @@ class DashboardTests(unittest.TestCase):
                 "spend",
                 "category_l2",
                 "category_source",
+                "impressions",
             ]
         )
 
@@ -1275,8 +1276,25 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(
             list(result.columns)[:6],
-            ["渠道", "标题", "消耗", "首次付费成本", "二级栏目", "分类来源"],
+            ["渠道", "标题", "消耗", "首次付费成本", "栏目", "分类来源"],
         )
+        self.assertIn("曝光量", result.columns)
+        self.assertNotIn("展示/曝光量", result.columns)
+
+    def test_display_numbers_trim_insignificant_trailing_zeroes(self):
+        self.assertEqual(format_display_number(67.90), "67.9")
+        self.assertEqual(format_display_number(79.0), "79")
+        self.assertEqual(format_display_number(1000.0), "1,000")
+        self.assertEqual(format_display_number(1000.0, 0), "1,000")
+        self.assertEqual(format_display_number(0.16667), "0.17")
+        self.assertEqual(format_display_number(0.125), "0.13")
+
+        frame = pd.DataFrame({"channel": ["抖音商业化"], "spend": [67.90], "activation_cost": [79.0], "ctr": [0.16667]})
+        result = localize_and_sort_columns(frame)
+
+        self.assertEqual(result.iloc[0]["消耗"], "67.9")
+        self.assertEqual(result.iloc[0]["激活成本"], "79")
+        self.assertEqual(result.iloc[0]["点击率"], "0.17")
 
     def test_summarize_content_types_counts_rows_unique_content_and_missing_share(self):
         frame = pd.DataFrame(

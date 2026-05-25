@@ -13,6 +13,7 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
+from .title_matching import normalized_title_key
 from .periods import (
     PERIOD_LEVEL_MONTH,
     PERIOD_LEVEL_WEEK,
@@ -49,6 +50,7 @@ PERSISTED_RESULT_TABLES = [
     "conflict_retention_items",
     "missing_value_items",
     "channel_comparison_items",
+    "topic_label_items",
 ]
 
 
@@ -118,6 +120,7 @@ def init_db(db_path: Path) -> None:
                 content_id text not null,
                 material_id text not null,
                 title text not null,
+                title_key text not null default '',
                 category_l1 text not null,
                 category_l2 text not null,
                 category_l3 text not null,
@@ -152,6 +155,36 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            create table if not exists topic_label_items (
+                batch_id text not null,
+                channel text not null default '',
+                content_id text not null default '',
+                material_id text not null default '',
+                title text not null default '',
+                content_type text not null default '',
+                topic_name text not null default '',
+                rank_metric text not null default '',
+                rank_value real not null default 0,
+                rank_position integer not null default 0,
+                source text not null default '',
+                provider text not null default '',
+                model text not null default '',
+                input_hash text not null default '',
+                created_at text not null default '',
+                spend real not null default 0,
+                impressions real not null default 0,
+                clicks real not null default 0,
+                ctr real not null default 0,
+                activations real not null default 0,
+                activation_cost real not null default 0,
+                first_pay_count real not null default 0,
+                first_pay_cost real not null default 0,
+                first_pay_rate real not null default 0
+            )
+            """
+        )
         _ensure_table_columns(
             conn,
             "category_mappings",
@@ -164,6 +197,7 @@ def init_db(db_path: Path) -> None:
                     "content_id",
                     "material_id",
                     "title",
+                    "title_key",
                     "category_l1",
                     "category_l2",
                     "category_l3",
@@ -674,6 +708,7 @@ def load_category_mappings(db_path: Path) -> dict[str, dict[str, str]]:
             "content_id": str(row.get("content_id", "")),
             "material_id": str(row.get("material_id", "")),
             "title": str(row.get("title", "")),
+            "title_key": str(row.get("title_key", "")),
             "category_l1": str(row.get("category_l1", "")),
             "category_l2": str(row.get("category_l2", "")),
             "category_l3": str(row.get("category_l3", "")),
@@ -698,10 +733,13 @@ def upsert_category_mappings(db_path: Path, mappings: pd.DataFrame) -> int:
                 "content_id": _clean_text(row.get("content_id", "")),
                 "material_id": _clean_text(row.get("material_id", "")),
                 "title": _clean_text(row.get("title", "")),
+                "title_key": _clean_text(row.get("title_key", "")),
                 "category_l1": _clean_text(row.get("category_l1", "")),
                 "category_l2": _clean_text(row.get("category_l2", "")),
                 "category_l3": _clean_text(row.get("category_l3", "")),
             }
+            if not mapping["title_key"]:
+                mapping["title_key"] = normalized_title_key(mapping["title"])
             if not mapping["category_l2"]:
                 continue
             for mapping_key in _mapping_keys(mapping):
@@ -709,9 +747,9 @@ def upsert_category_mappings(db_path: Path, mappings: pd.DataFrame) -> int:
                     """
                     insert into category_mappings (
                         mapping_key, platform, platform_group, channel, content_id, material_id,
-                        title, category_l1, category_l2, category_l3, updated_at
+                        title, title_key, category_l1, category_l2, category_l3, updated_at
                     )
-                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     on conflict(mapping_key) do update set
                         platform = excluded.platform,
                         platform_group = excluded.platform_group,
@@ -719,6 +757,7 @@ def upsert_category_mappings(db_path: Path, mappings: pd.DataFrame) -> int:
                         content_id = excluded.content_id,
                         material_id = excluded.material_id,
                         title = excluded.title,
+                        title_key = excluded.title_key,
                         category_l1 = excluded.category_l1,
                         category_l2 = excluded.category_l2,
                         category_l3 = excluded.category_l3,
@@ -732,6 +771,7 @@ def upsert_category_mappings(db_path: Path, mappings: pd.DataFrame) -> int:
                         mapping["content_id"],
                         mapping["material_id"],
                         mapping["title"],
+                        mapping["title_key"],
                         mapping["category_l1"],
                         mapping["category_l2"],
                         mapping["category_l3"],
@@ -741,6 +781,46 @@ def upsert_category_mappings(db_path: Path, mappings: pd.DataFrame) -> int:
                 written += 1
         conn.commit()
     return written
+
+
+def persist_topic_labels(db_path: Path, batch_id: str, topic_labels: pd.DataFrame) -> int:
+    """Replace persisted focused topic labels for one batch."""
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("delete from topic_label_items where batch_id = ?", (batch_id,))
+        if topic_labels.empty:
+            conn.commit()
+            return 0
+        _append_frame(conn, "topic_label_items", batch_id, topic_labels)
+        conn.commit()
+        return int(len(topic_labels))
+
+
+def load_topic_labels_for_batch(db_path: Path, batch_id: str) -> pd.DataFrame:
+    if not batch_id or not Path(db_path).exists():
+        return pd.DataFrame()
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        try:
+            return pd.read_sql_query(
+                """
+                select *
+                from topic_label_items
+                where batch_id = ?
+                order by channel, rank_position, rowid
+                """,
+                conn,
+                params=(batch_id,),
+            ).drop(columns=["batch_id"], errors="ignore")
+        except Exception:
+            return pd.DataFrame()
+
+
+def delete_topic_labels_for_batch(db_path: Path, batch_id: str) -> None:
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("delete from topic_label_items where batch_id = ?", (batch_id,))
+        conn.commit()
 
 
 def persist_workflow_result(
@@ -767,6 +847,7 @@ def persist_workflow_result(
     conflict_retention_details: pd.DataFrame,
     missing_value_details: pd.DataFrame,
     channel_comparison: pd.DataFrame,
+    topic_label_items: Optional[pd.DataFrame],
     ai_summary: str,
     comparison_batch_id: Optional[str],
     comparison_note: str,
@@ -850,6 +931,7 @@ def persist_workflow_result(
         _append_frame(conn, "conflict_retention_items", batch_id, conflict_retention_details)
         _append_frame(conn, "missing_value_items", batch_id, missing_value_details)
         _append_frame(conn, "channel_comparison_items", batch_id, channel_comparison)
+        _append_frame(conn, "topic_label_items", batch_id, topic_label_items if topic_label_items is not None else pd.DataFrame())
         conn.execute(
             """
             insert or replace into ai_reports (batch_id, provider, model, summary, created_at)
@@ -960,6 +1042,7 @@ def _delete_batch_scoped_rows(conn: sqlite3.Connection, batch_id: str) -> None:
         "conflict_retention_items",
         "missing_value_items",
         "channel_comparison_items",
+        "topic_label_items",
         "upload_batches",
     ]:
         if not conn.execute(
@@ -1054,6 +1137,9 @@ def _mapping_keys(mapping: dict[str, str]) -> list[str]:
         value = mapping.get(column, "").strip()
         if value:
             keys.append(f"{column}:{value}")
+    title_key = mapping.get("title_key", "").strip() or normalized_title_key(mapping.get("title", ""))
+    if title_key:
+        keys.append(f"title_key:{title_key}")
     return keys
 
 

@@ -163,6 +163,71 @@ class RawCleaningTests(unittest.TestCase):
             ignored = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="忽略sheet")
             self.assertTrue(ignored["reason"].astype(str).str.contains("汇总行").any())
 
+    def test_clean_source_directory_dedupes_bilibili_duplicate_summary_sheets_by_unit_name(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            sheet2 = pd.DataFrame(
+                [
+                    {
+                        "单元名称": "BV001",
+                        "求和项:总花费": 10.0,
+                        "求和项:应用激活数": 2,
+                        "求和项:应用内首次付费次数": 1,
+                    },
+                    {
+                        "单元名称": "BV002",
+                        "求和项:总花费": 20.0,
+                        "求和项:应用激活数": 4,
+                        "求和项:应用内首次付费次数": 2,
+                    },
+                    {
+                        "单元名称": "BV000",
+                        "求和项:总花费": 0.0,
+                        "求和项:应用激活数": 0,
+                        "求和项:应用内首次付费次数": 0,
+                    },
+                ]
+            )
+            sheet1 = pd.DataFrame(
+                [
+                    {
+                        "单元名称": "BV001",
+                        "总花费": 10.0,
+                        "应用激活数": 2,
+                        "应用内首次付费次数": 1,
+                        "激活成本": 5.0,
+                        "付费成本": 10.0,
+                    },
+                    {
+                        "单元名称": "BV002",
+                        "总花费": 20.0,
+                        "应用激活数": 4,
+                        "应用内首次付费次数": 2,
+                        "激活成本": 5.0,
+                        "付费成本": 10.0,
+                    },
+                    {
+                        "单元名称": "BV000",
+                        "总花费": 0.0,
+                        "应用激活数": 0,
+                        "应用内首次付费次数": 0,
+                        "激活成本": "",
+                        "付费成本": "",
+                    },
+                ]
+            )
+            _write_xlsx(source / "0515-0521 数据" / "B站.xlsx", {"Sheet2": sheet2, "Sheet1": sheet1})
+
+            buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
+
+            cleaned = load_cleaned_canonical(buckets[0].cleaned_workbook)
+            self.assertEqual(set(cleaned["content_id"]), {"BV001", "BV002"})
+            self.assertEqual(len(cleaned), 2)
+            self.assertEqual(float(cleaned["spend"].sum()), 30.0)
+            self.assertEqual(float(cleaned["activations"].sum()), 6.0)
+            self.assertEqual(float(cleaned["first_pay_count"].sum()), 3.0)
+
     def test_clean_source_directory_generates_row_ids_for_identityless_social_details_and_excludes_total(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -181,6 +246,8 @@ class RawCleaningTests(unittest.TestCase):
             cleaned = load_cleaned_canonical(buckets[0].cleaned_workbook)
             self.assertEqual(len(cleaned), 2)
             self.assertEqual(set(cleaned["channel"]), {"微信市场部"})
+            self.assertEqual(set(cleaned["platform"]), {"微信"})
+            self.assertEqual(set(cleaned["platform_group"]), {"微信"})
             self.assertEqual(float(cleaned["spend"].sum()), 30.0)
             self.assertTrue(cleaned["content_id"].astype(str).str.startswith("row:").all())
             ignored = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="忽略sheet")
@@ -368,6 +435,62 @@ class RawCleaningTests(unittest.TestCase):
 
             self.assertEqual(list(result.canonical["content_id"]), ["BV001"])
             self.assertNotIn("噪声人工统计.xlsx", set(result.canonical["source_file"]))
+
+    def test_archived_workflow_backfills_metric_counts_from_cleaned_raw_columns(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_dir = root / "data" / "raw" / "20260515-20260521"
+            raw_dir.mkdir(parents=True)
+            _write_xlsx(
+                raw_dir / "cleaned.xlsx",
+                {
+                    "清洗后明细": pd.DataFrame(
+                        [
+                            {
+                                "platform": "小红书商业化",
+                                "platform_group": "小红书",
+                                "channel": "小红书商业化",
+                                "content_id": "note-cleaned",
+                                "material_id": "note-cleaned",
+                                "title": "清洗后小红书内容",
+                                "manual_category": "产品科普",
+                                "spend": 100.0,
+                                "impressions": 1000,
+                                "clicks": 100,
+                                "activations": pd.NA,
+                                "first_pay_count": pd.NA,
+                                "source_file": "小红书商业化.xlsx",
+                                "source_sheet": "kos账号笔记投放数据",
+                                "source_row": 2,
+                                "raw__小红书商业化__APP激活数": 11,
+                                "raw__小红书商业化__首次付费数": 4,
+                            }
+                        ]
+                    )
+                },
+            )
+            (raw_dir / "period_manifest.json").write_text(
+                '{"files":["cleaned.xlsx"],"cleaned_workbook":"cleaned.xlsx"}',
+                encoding="utf-8",
+            )
+
+            result = run_archived_workflow(
+                raw_dir,
+                "2026-05-15",
+                "2026-05-21",
+                output_root=root / "outputs",
+                archive_root=root / "archive",
+                db_path=root / "data" / "workflow.sqlite3",
+                env_path=root / "missing.env",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            row = result.canonical.iloc[0]
+            self.assertAlmostEqual(row["activations"], 11.0)
+            self.assertAlmostEqual(row["first_pay_count"], 4.0)
+            channel_summary = result.channel_summary.set_index("channel")
+            self.assertAlmostEqual(channel_summary.loc["小红书商业化", "activations"], 11.0)
+            self.assertAlmostEqual(channel_summary.loc["小红书商业化", "first_pay_count"], 4.0)
 
     def test_reset_runtime_data_clears_generated_runtime_dirs_and_reinitializes_db(self):
         with TemporaryDirectory() as tmp:

@@ -23,6 +23,7 @@ from .pipeline import (
     _preprocess_canonical,
     _read_table,
     _social_market_channel,
+    _social_market_platform,
     _standardize,
     _standardize_douyin,
     parse_number,
@@ -55,6 +56,7 @@ HEADER_TOKENS = {
     "视频bvid",
     "视频AVID",
     "视频标题",
+    "单元名称",
     "视频id",
     "素材ID",
     "素材中心id",
@@ -140,6 +142,7 @@ IDENTITY_TOKENS = {
     "视频bvid",
     "视频AVID",
     "视频标题",
+    "单元名称",
     "视频id",
     "素材ID",
     "素材中心id",
@@ -629,9 +632,9 @@ def _standardize_candidate(
             channel="B站",
             source_file=candidate.relative_source,
             fields={
-                "content_id": ["视频BVID", "视频bvid", "视频AVID", "视频avid", SYNTHETIC_ROW_ID_COLUMN],
-                "material_id": ["素材中心id", "素材中心ID", "视频BVID", "视频bvid", SYNTHETIC_ROW_ID_COLUMN],
-                "title": ["视频标题", SYNTHETIC_ROW_TITLE_COLUMN],
+                "content_id": ["视频BVID", "视频bvid", "视频AVID", "视频avid", "单元名称", SYNTHETIC_ROW_ID_COLUMN],
+                "material_id": ["素材中心id", "素材中心ID", "视频BVID", "视频bvid", "单元名称", SYNTHETIC_ROW_ID_COLUMN],
+                "title": ["视频标题", "单元名称", SYNTHETIC_ROW_TITLE_COLUMN],
                 "account_id": ["Up主mid", "UID", "uid", "mid"],
                 "account": ["Up主名称", "UP主名称", "UP主昵称", "账号名称"],
                 "cover_url": ["素材url"],
@@ -653,7 +656,8 @@ def _standardize_candidate(
         return _standardize_douyin_cleaning(raw, candidate.relative_source, kind.split(":", 1)[1])
     if kind == "social":
         channel = _social_market_channel(candidate.source_path.stem)
-        return _standardize_social(raw, candidate.relative_source, channel)
+        platform = _social_market_platform(candidate.source_path.stem)
+        return _standardize_social(raw, candidate.relative_source, channel, platform=platform)
     return _standardize_generic(raw, candidate.relative_source, candidate.source_path.stem)
 
 
@@ -710,11 +714,11 @@ def _standardize_xiaohongshu_market(raw: pd.DataFrame, source_file: str) -> pd.D
     )
 
 
-def _standardize_social(raw: pd.DataFrame, source_file: str, channel: str) -> pd.DataFrame:
+def _standardize_social(raw: pd.DataFrame, source_file: str, channel: str, *, platform: str = "") -> pd.DataFrame:
     return _standardize(
         raw,
-        platform=channel,
-        platform_group=channel.replace("市场部", ""),
+        platform=platform or channel,
+        platform_group="微信" if platform else channel.replace("市场部", ""),
         channel=channel,
             source_file=source_file,
             fields={
@@ -800,7 +804,7 @@ def _source_kind(path: Path, columns: Iterable[object]) -> str:
         if "市场部" in name:
             channel = "抖音市场部"
         elif "达人" in name:
-            channel = "抖音达人内容"
+            channel = "达人数据"
         elif "商业化" in name:
             channel = "抖音商业化"
         elif "期货" in name:
@@ -808,7 +812,7 @@ def _source_kind(path: Path, columns: Iterable[object]) -> str:
         else:
             channel = path.stem
         return f"douyin:{channel}"
-    if "微信" in name or "腾讯" in name:
+    if "微信" in name or "腾讯" in name or "视频号" in name:
         return "social"
     return "generic"
 
@@ -946,7 +950,7 @@ def _drop_standardized_rows_without_metrics(
     if not metric_columns:
         return standardized, []
     metric_values = standardized[metric_columns].apply(pd.to_numeric, errors="coerce")
-    has_any_metric = ~metric_values.isna().all(axis=1)
+    has_any_metric = metric_values.fillna(0).abs().gt(1e-9).any(axis=1)
     synthetic_content_id = (
         standardized.get("content_id", pd.Series("", index=standardized.index))
         .fillna("")

@@ -244,6 +244,78 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(first["category_l2"], "B站全部")
             self.assertEqual(first["category_l3"], "")
 
+    def test_xiaohongshu_commercial_metric_count_aliases_are_ingested(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            raw_dir.mkdir()
+            with pd.ExcelWriter(raw_dir / "小红书商业化.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "时间": "2026-05-15~2026-05-21",
+                            "标题": "小红书投放内容",
+                            "笔记ID": "note-app-activation",
+                            "发布作者": "同花顺理财",
+                            "内容分类": "产品科普",
+                            "消费": 100.0,
+                            "展现量": 1000,
+                            "点击量": 100,
+                            "APP激活数": 9,
+                            "首次付费数": 3,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="kos账号笔记投放数据", index=False)
+
+            result = analyze_input_dir(
+                raw_dir,
+                "2026-05-15",
+                "2026-05-21",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            row = result.canonical.iloc[0]
+            self.assertEqual(row["channel"], "小红书商业化")
+            self.assertAlmostEqual(row["activations"], 9.0)
+            self.assertAlmostEqual(row["first_pay_count"], 3.0)
+            channel_summary = result.channel_summary.set_index("channel")
+            self.assertAlmostEqual(channel_summary.loc["小红书商业化", "activations"], 9.0)
+            self.assertAlmostEqual(channel_summary.loc["小红书商业化", "first_pay_count"], 3.0)
+
+    def test_xiaohongshu_commercial_metric_rates_are_not_ingested_as_counts(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            raw_dir.mkdir()
+            with pd.ExcelWriter(raw_dir / "小红书商业化.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "时间": "2026-05-15~2026-05-21",
+                            "标题": "小红书投放内容",
+                            "笔记ID": "note-rate-only",
+                            "发布作者": "同花顺理财",
+                            "内容分类": "产品科普",
+                            "消费": 100.0,
+                            "展现量": 1000,
+                            "点击量": 100,
+                            "激活成本": 12.3,
+                            "激活率": 0.12,
+                            "首次付费成本": 33.3,
+                            "首次付费率": 0.25,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="kos账号笔记投放数据", index=False)
+
+            result = analyze_input_dir(
+                raw_dir,
+                "2026-05-15",
+                "2026-05-21",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            row = result.canonical.iloc[0]
+            self.assertTrue(pd.isna(row["activations"]))
+            self.assertTrue(pd.isna(row["first_pay_count"]))
+
     def test_missing_manual_category_is_completed_by_injected_ai_matcher(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -837,6 +909,19 @@ class WorkflowTests(unittest.TestCase):
                         }
                     ]
                 ).to_excel(writer, sheet_name="Sheet1", index=False)
+            with pd.ExcelWriter(raw_dir / "视频号投放.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "创意名称": "视频号创意一",
+                            "花费": 25,
+                            "曝光次数": 250,
+                            "点击次数": 35,
+                            "APP激活次数": 7,
+                            "注册次数": 3,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="Sheet1", index=False)
             with pd.ExcelWriter(raw_dir / "抖音原生-达人数据情况（商业化）.xlsx", engine="openpyxl") as writer:
                 pd.DataFrame(
                     [
@@ -860,10 +945,14 @@ class WorkflowTests(unittest.TestCase):
             channels = set(result.canonical["channel"])
             self.assertIn("小红书市场部", channels)
             self.assertIn("微信市场部", channels)
-            self.assertIn("腾讯市场部", channels)
-            self.assertIn("抖音达人内容", channels)
-            self.assertEqual(len(result.canonical[result.canonical["channel"].eq("微信市场部")]), 1)
-            self.assertEqual(len(result.canonical[result.canonical["channel"].eq("腾讯市场部")]), 1)
+            self.assertIn("达人数据", channels)
+            self.assertNotIn("微信/腾讯/视频号市场部", channels)
+            self.assertNotIn("腾讯市场部", channels)
+            self.assertNotIn("抖音达人内容", channels)
+            social_rows = result.canonical[result.canonical["channel"].eq("微信市场部")]
+            self.assertEqual(len(social_rows), 3)
+            self.assertEqual(set(social_rows["platform"]), {"微信", "腾讯", "视频号"})
+            self.assertEqual(set(social_rows["platform_group"]), {"微信"})
 
     def test_raw_extra_columns_export_with_chinese_display_names(self):
         with TemporaryDirectory() as tmp:
@@ -1145,7 +1234,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(bilibili["人工内容类别"], "")
             self.assertEqual(bilibili["AI生成内容类别"], "B站全部")
             self.assertEqual(bilibili["最终内容类别"], "B站全部")
-            self.assertEqual(bilibili["二级栏目"], "B站全部")
+            self.assertEqual(bilibili["栏目"], "B站全部")
             self.assertEqual(bilibili["三级题材"], "实盘大赛冠军孙辉--370万到2000万的传奇交易之路")
             self.assertEqual(bilibili["内容类别来源"], "渠道固定规则")
             self.assertNotIn("一级内容分类", exported.columns)

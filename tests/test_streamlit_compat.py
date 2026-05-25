@@ -133,7 +133,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn('return "overview-delta-red" if is_cost else "overview-delta-green"', growth_class_source)
         self.assertNotIn("improved =", growth_class_source)
 
-    def test_overview_uses_review_level_cards_and_metric_buttons(self):
+    def test_overview_uses_review_level_cards_and_client_side_metric_switcher(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         overview_source = app_source[app_source.index("def _page_overview") : app_source.index("def _page_generate")]
 
@@ -141,9 +141,11 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("_render_review_level_cards", app_source)
         self.assertIn("PERIOD_LEVEL_WEEK", app_source)
         self.assertIn("st.columns(4)", app_source)
-        self.assertIn("st.columns(6)", app_source)
-        self.assertIn("overview_metric_button_", app_source)
-        self.assertIn('type="primary" if selected_metric_name == metric_name else "secondary"', app_source)
+        self.assertIn("_render_platform_chart(platform_summary)", overview_source)
+        self.assertIn("CHART_METRICS.items()", app_source)
+        self.assertIn("updatemenus=[", app_source)
+        self.assertIn('"method": "update"', app_source)
+        self.assertNotIn("overview_metric_button_", app_source)
         self.assertNotIn('"选择复盘层级"', overview_source)
         self.assertNotIn('"选择图表指标"', overview_source)
 
@@ -152,7 +154,9 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         overview_source = app_source[app_source.index("def _page_overview") : app_source.index("def _page_generate")]
 
         self.assertIn('_get_overview_period_selector("overview")', overview_source)
-        self.assertIn("build_period_comparison_for_batch(APP_DB, selected_batch_id)", overview_source)
+        self.assertIn("_load_overview_data(APP_DB, selected_batch_id)", overview_source)
+        self.assertIn("load_channel_comparison_for_batch", app_source)
+        self.assertIn("build_period_comparison_for_batch(db_path, batch_id)", app_source)
         self.assertIn("build_overview_table_rows(summary, platform_summary, channel_comparison)", app_source)
         self.assertIn("global_batch_id", app_source)
         self.assertNotIn("_get_comparison_period_selector", overview_source)
@@ -160,6 +164,18 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertNotIn("st.dataframe", overview_source)
         self.assertNotIn("渠道栏目分析", overview_source)
         self.assertNotIn("overview_drill_channel", overview_source)
+
+    def test_overview_data_is_cached_and_chart_switcher_does_not_force_rerun(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        platform_chart_source = app_source[
+            app_source.index("def _build_platform_chart_figure") : app_source.index("def _content_filter_panel")
+        ]
+
+        self.assertIn("@st.cache_data", app_source)
+        self.assertIn("def _load_overview_data", app_source)
+        self.assertIn("_db_file_signature(APP_DB)", app_source)
+        self.assertNotIn("st.button(", platform_chart_source)
+        self.assertNotIn("st.rerun()", platform_chart_source)
 
     def test_app_has_chinese_upload_prompt_and_content_analysis_page(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -172,9 +188,10 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("_render_channel_page", app_source)
         self.assertIn("_make_channel_page", app_source)
         self.assertIn("_build_navigation_pages", app_source)
-        self.assertIn("topic_labels_channel_", app_source)
+        self.assertNotIn("topic_labels_channel_", app_source)
+        self.assertIn("load_topic_labels_for_batch", app_source)
+        self.assertIn("summarize_persisted_topic_labels", app_source)
         self.assertIn("summarize_channel_categories", app_source)
-        self.assertIn("summarize_channel_top_topics", app_source)
         self.assertIn("build_channel_top_topic_insights", app_source)
         self.assertIn("文件备份", app_source)
         self.assertNotIn("渠道下钻分析", app_source)
@@ -194,10 +211,24 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertNotIn("number_input", channel_source)
         self.assertIn("_selected_or_latest_batch_id()", channel_source)
         self.assertNotIn("_get_common_period_selector", channel_source)
-        self.assertIn("Top 20", channel_source)
-        self.assertIn("Top 20 题材分析结论", channel_source)
+        self.assertIn("重点题材分析", channel_source)
+        self.assertIn("重点题材分析结论", channel_source)
         self.assertIn("st.markdown(topic_insights", channel_source)
-        self.assertIn("本地关键词/栏目规则兜底", channel_source)
+        self.assertIn("页面只读取入库题材", channel_source)
+        self.assertNotIn("group_topic_labels", channel_source)
+        self.assertIn('st.subheader("栏目汇总")', channel_source)
+        self.assertNotIn('st.subheader("二级栏目汇总")', channel_source)
+
+    def test_channel_category_summary_is_single_table_with_category_first(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        channel_source = app_source[app_source.index("def _render_channel_page") : app_source.index("def _render_channel_summary_metrics")]
+        category_display_source = app_source[
+            app_source.index("def _category_table_display") : app_source.index("def _topic_table_display")
+        ]
+
+        self.assertIn("localize_columns(_category_table_display(category_summary))", channel_source)
+        self.assertNotIn("_render_short_table_blocks(_category_table_display(category_summary)", channel_source)
+        self.assertLess(category_display_source.index('"category_name"'), category_display_source.index('"item_count"'))
 
     def test_navigation_uses_dynamic_channel_page_factory(self):
         app_source = Path("app.py").read_text(encoding="utf-8")

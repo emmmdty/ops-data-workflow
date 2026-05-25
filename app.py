@@ -8,10 +8,11 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-from ops_data_workflow.ai import group_topic_labels, resolve_deepseek_settings
+from ops_data_workflow.ai import resolve_deepseek_settings
 from ops_data_workflow.dashboard import (
     DashboardFilters,
     aggregate_dashboard,
@@ -25,6 +26,7 @@ from ops_data_workflow.dashboard import (
     filter_dashboard_items,
     format_beijing_datetime,
     load_all_dashboard_items,
+    load_channel_comparison_for_batch,
     load_data_quality_for_batch,
     load_dashboard_items_for_batch,
     load_latest_data_quality,
@@ -34,13 +36,12 @@ from ops_data_workflow.dashboard import (
     list_successful_dashboard_batches,
     metric_sort_ascending,
     summarize_channel_categories,
-    summarize_channel_top_topics,
     summarize_topics_for_selection,
     summarize_content_type_trends,
     summarize_content_types,
     summarize_unique_content,
 )
-from ops_data_workflow.reporting import localize_columns, localize_and_sort_columns
+from ops_data_workflow.reporting import format_display_number, localize_columns, localize_and_sort_columns
 from ops_data_workflow.reference_tables import load_reference_tables
 from ops_data_workflow.raw_sync import sync_raw_periods
 from ops_data_workflow.periods import PERIOD_LEVEL_LABELS, PERIOD_LEVELS, PERIOD_LEVEL_WEEK, SOURCE_TYPE_UPLOAD, review_period_from_dates
@@ -57,11 +58,13 @@ from ops_data_workflow.storage import (
     delete_batch_permanently,
     list_file_backups,
     list_recent_batches,
+    load_topic_labels_for_batch,
     move_batch_to_file_backup,
     read_batch_record,
     restore_file_backup,
     upsert_category_mappings,
 )
+from ops_data_workflow.topic_analysis import channel_topic_limit, summarize_persisted_topic_labels
 from ops_data_workflow.upload_input import infer_period_from_upload_names, materialize_uploaded_files
 from ops_data_workflow.workflow import run_archived_workflow, run_rollup_workflow
 
@@ -89,6 +92,7 @@ GENERATION_PROGRESS_STEPS = (
     "正在归档原始文件",
     "正在读取渠道数据并标准化",
     "正在校验数据质量与题材分类",
+    "正在固化重点题材",
     "正在写入历史库并生成下载文件",
     "报告生成完成",
 )
@@ -98,6 +102,7 @@ GENERATION_PROGRESS_VALUES = {
     "正在归档原始文件": 25,
     "正在读取渠道数据并标准化": 45,
     "正在校验数据质量与题材分类": 70,
+    "正在固化重点题材": 82,
     "正在写入历史库并生成下载文件": 90,
     "报告生成完成": 95,
 }
@@ -904,6 +909,50 @@ def _update_bucket_manifest(bucket, period) -> None:
         pass
 
 
+def _db_file_signature(db_path: Path) -> tuple[int, int]:
+    path = Path(db_path)
+    if not path.exists():
+        return (0, 0)
+    stat = path.stat()
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _load_overview_data(db_path: Path, batch_id: str) -> dict[str, object]:
+    if Path(db_path) == APP_DB:
+        db_signature = _db_file_signature(APP_DB)
+    else:
+        db_signature = _db_file_signature(db_path)
+    return _load_cached_overview_data(str(db_path), batch_id, db_signature)
+
+
+@st.cache_data(show_spinner=False)
+def _load_cached_overview_data(
+    db_path_text: str,
+    batch_id: str,
+    db_signature: tuple[int, int],
+) -> dict[str, object]:
+    del db_signature
+    db_path = Path(db_path_text)
+    items = load_dashboard_items_for_batch(db_path, batch_id)
+    summary = build_dashboard_summary(items)
+    platform_summary = aggregate_dashboard(items, ["channel"])
+    channel_comparison = load_channel_comparison_for_batch(db_path, batch_id)
+    if channel_comparison.empty:
+        channel_comparison = build_period_comparison_for_batch(db_path, batch_id)
+    content_type_summary = summarize_content_types(items)
+    recommendations = _compact_recommendations(
+        build_content_recommendations(summary, platform_summary, content_type_summary)
+    )
+    return {
+        "items": items,
+        "summary": summary,
+        "platform_summary": platform_summary,
+        "channel_comparison": channel_comparison,
+        "content_type_summary": content_type_summary,
+        "recommendations": recommendations,
+    }
+
+
 def _page_overview() -> None:
     st.title("总览")
     notice = st.session_state.pop("raw_sync_notice", "")
@@ -916,6 +965,7 @@ def _page_overview() -> None:
         return
 
     if st.button("刷新报告和数据", width="stretch"):
+        _load_cached_overview_data.clear()
         results = _run_raw_sync()
         if any(item.status == "generated" for item in results):
             st.rerun()
@@ -924,18 +974,16 @@ def _page_overview() -> None:
         else:
             st.success("已检查 raw 目录，当前没有需要生成的新内容。")
 
-    items = load_dashboard_items_for_batch(APP_DB, selected_batch_id)
+    overview_data = _load_overview_data(APP_DB, selected_batch_id)
+    items = overview_data["items"]
     if items.empty:
         st.info("当前周期没有可展示的数据。")
         return
 
-    summary = build_dashboard_summary(items)
-    platform_summary = aggregate_dashboard(items, ["channel"])
-    channel_comparison = build_period_comparison_for_batch(APP_DB, selected_batch_id)
-    content_type_summary = summarize_content_types(items)
-    recommendations = _compact_recommendations(
-        build_content_recommendations(summary, platform_summary, content_type_summary)
-    )
+    summary = overview_data["summary"]
+    platform_summary = overview_data["platform_summary"]
+    channel_comparison = overview_data["channel_comparison"]
+    recommendations = overview_data["recommendations"]
 
     st.subheader("本周期数据总览")
     _render_kpis(summary)
@@ -947,9 +995,7 @@ def _page_overview() -> None:
     st.markdown(recommendations)
 
     st.subheader("分渠道图")
-    selected_metric_name = _render_overview_metric_buttons()
-    y_metric, color_metric, y_label, color_label = CHART_METRICS[selected_metric_name]
-    _render_platform_chart(platform_summary, y_metric, color_metric, y_label, color_label)
+    _render_platform_chart(platform_summary)
 
 
 def _render_overview_summary_table(
@@ -1008,14 +1054,15 @@ def _fmt_overview_value(value: object, digits: int) -> str:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric):
         return "-"
-    return f"{float(numeric):.{digits}f}"
+    return format_display_number(numeric, max_decimals=max(digits, 0))
 
 
 def _fmt_overview_growth(value: object) -> str:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric):
         return "（-）"
-    return f"（{float(numeric):+.0%}）"
+    sign = "+" if float(numeric) > 0 else ""
+    return f"（{sign}{format_display_number(float(numeric) * 100, max_decimals=1)}%）"
 
 
 def _overview_growth_class(value: object, is_cost: bool) -> str:
@@ -1038,26 +1085,6 @@ def _compact_recommendations(markdown: str, max_items: int = 4) -> str:
         if len(bullets) >= max_items:
             break
     return "\n".join(bullets) if bullets else str(markdown or "").strip()
-
-
-def _render_overview_metric_buttons() -> str:
-    metric_names = list(CHART_METRICS.keys())
-    selected_metric_name = st.session_state.get("overview_chart_metric", metric_names[0])
-    if selected_metric_name not in metric_names:
-        selected_metric_name = metric_names[0]
-        st.session_state["overview_chart_metric"] = selected_metric_name
-
-    cols = st.columns(6)
-    for col, metric_name in zip(cols, metric_names):
-        if col.button(
-            metric_name,
-            key=f"overview_metric_button_{metric_name}",
-            type="primary" if selected_metric_name == metric_name else "secondary",
-            width="stretch",
-        ):
-            st.session_state["overview_chart_metric"] = metric_name
-            st.rerun()
-    return selected_metric_name
 
 
 def _page_generate() -> None:
@@ -1176,6 +1203,7 @@ def _run_with_generation_progress(uploaded, period_start: date, period_end: date
                     uploaded,
                     APP_RAW / period_dir,
                     strip_common_period_root=True,
+                    replace_same_channel=True,
                 )
                 result = run_archived_workflow(
                     materialized.raw_dir,
@@ -1701,9 +1729,9 @@ def _page_category_review() -> None:
         current_l2 = str(current.get("category_l2", "") or "")
         current_l3 = str(current.get("category_l3", "") or "")
         review_key_prefix = f"review_item_{index}"
-        category_l2 = st.text_input("二级栏目", value=current_l2, key=f"{review_key_prefix}_category_l2")
+        category_l2 = st.text_input("栏目", value=current_l2, key=f"{review_key_prefix}_category_l2")
         category_l3 = st.text_input("三级题材", value=current_l3, key=f"{review_key_prefix}_category_l3")
-        st.caption("只需要确认这条内容最终应归到哪个二级栏目、三级题材。")
+        st.caption("只需要确认这条内容最终应归到哪个栏目、三级题材。")
 
         if st.button("确认并保存当前审核", type="primary", width="stretch"):
             payload = pd.DataFrame(
@@ -1722,7 +1750,7 @@ def _page_category_review() -> None:
             )
             saved = upsert_category_mappings(APP_DB, payload)
             if saved == 0:
-                st.error("请先填写二级栏目，再保存当前审核。")
+                st.error("请先填写栏目，再保存当前审核。")
             else:
                 st.success("当前条目已保存到历史映射。重新上传或重新生成后会自动复用。")
 
@@ -1852,7 +1880,9 @@ def _page_file_backup() -> None:
 
 
 def _render_channel_page(channel_name: str) -> None:
-    _render_section_shell("", channel_name, "按当前总览周期展示该渠道全部栏目数据和消耗 Top 20 题材。")
+    topic_limit = channel_topic_limit(channel_name)
+    topic_scope = f"消耗 Top {topic_limit} 重点题材" if topic_limit else "达人数据暂不做题材分析"
+    _render_section_shell("", channel_name, f"按当前总览周期展示该渠道全部栏目数据和{topic_scope}。")
     st.title(channel_name)
 
     selected_batch_id, batches = _selected_or_latest_batch_id()
@@ -1880,49 +1910,40 @@ def _render_channel_page(channel_name: str) -> None:
         _render_channel_summary_metrics(channel_summary)
 
     category_summary = summarize_channel_categories(items, channel_name)
-    st.subheader("二级栏目汇总")
+    st.subheader("栏目汇总")
     if category_summary.empty:
-        st.info("当前渠道没有可展示的二级栏目数据。")
+        st.info("当前渠道没有可展示的栏目数据。")
     else:
         _render_vertical_bar_chart(
             category_summary,
             "category_name",
             "spend",
-            "二级栏目",
+            "栏目",
             "消耗",
-            f"{channel_name} 二级栏目消耗",
+            f"{channel_name} 栏目消耗",
             "activations",
             "激活数",
         )
-        _render_short_table_blocks(_category_table_display(category_summary), "二级栏目汇总")
-
-    st.subheader("Top 20 题材分析")
-    topic_candidates = _channel_top_topic_candidates(items, channel_name)
-    if topic_candidates.empty:
-        st.info("当前渠道没有可归纳的题材数据。")
-    else:
-        topic_cache_key = f"topic_labels_channel_{selected_batch_id}_{channel_name}_top20_spend"
-        if topic_cache_key not in st.session_state:
-            st.session_state[topic_cache_key] = group_topic_labels(topic_candidates, env_path=ENV_PATH)
-        topic_labels = st.session_state.get(topic_cache_key, {})
-        if topic_labels:
-            st.caption("题材分组：DeepSeek 归纳消耗 Top 20 素材。")
-        else:
-            st.caption("题材分组：DeepSeek 未返回结果，使用本地关键词/栏目规则兜底。")
-
-        topic_summary = summarize_channel_top_topics(
-            items,
-            channel_name,
-            top_n=20,
-            metric="spend",
-            topic_labels=topic_labels,
+        st.dataframe(
+            localize_columns(_category_table_display(category_summary)),
+            width="stretch",
+            hide_index=True,
         )
+
+    st.subheader("重点题材分析")
+    if topic_limit <= 0:
+        st.info("达人数据暂不做题材分析，后台明细仍会保留。")
+    else:
+        topic_labels = load_topic_labels_for_batch(APP_DB, selected_batch_id)
+        channel_topic_labels = topic_labels[topic_labels["channel"].astype(str).eq(str(channel_name))].copy() if not topic_labels.empty else pd.DataFrame()
+        topic_summary = summarize_persisted_topic_labels(topic_labels, channel_name)
         if topic_summary.empty:
-            st.warning("当前数据没有可归纳的题材信息。")
+            st.warning("当前批次还没有固化的重点题材。请重新生成该周期，系统会在生成报告时完成 AI 题材固化。")
         else:
+            st.caption(f"展示范围：{channel_name} 消耗 Top {topic_limit} 内容；AI 结果已随批次固化，页面只读取入库题材。")
             topic_insights = build_channel_top_topic_insights(topic_summary)
-            if "Top 20 题材分析结论" not in topic_insights:
-                topic_insights = f"#### Top 20 题材分析结论\n{topic_insights}"
+            if "重点题材分析结论" not in topic_insights:
+                topic_insights = f"#### 重点题材分析结论\n{topic_insights}"
             st.markdown(topic_insights)
             _render_vertical_bar_chart(
                 topic_summary,
@@ -1930,11 +1951,17 @@ def _render_channel_page(channel_name: str) -> None:
                 "spend",
                 "题材",
                 "消耗",
-                f"{channel_name} Top 20 题材消耗",
+                f"{channel_name} 重点题材消耗",
                 "activations",
                 "激活数",
             )
-            _render_short_table_blocks(_topic_table_display(topic_summary), "Top 20 题材明细")
+            _render_short_table_blocks(_topic_table_display(topic_summary), "重点题材明细")
+            with st.expander("查看题材对应素材", expanded=False):
+                st.dataframe(
+                    localize_and_sort_columns(_topic_material_detail(channel_topic_labels)),
+                    width="stretch",
+                    hide_index=True,
+                )
 
     st.subheader("异常数据检测")
     _detect_and_display_anomalies(channel_items, pd.DataFrame(), "activation_cost", 20)
@@ -1978,8 +2005,8 @@ def _detect_and_display_anomalies(
     with col2:
         _render_anomaly_block(
             anomalies.get("missing_category_l2", pd.DataFrame()),
-            f"二级栏目缺失但{metric_label}较高",
-            "未发现二级栏目缺失但数据高的记录",
+            f"栏目缺失但{metric_label}较高",
+            "未发现栏目缺失但数据高的记录",
         )
     with col3:
         _render_anomaly_block(
@@ -2069,9 +2096,11 @@ def _category_table_display(category_summary: pd.DataFrame) -> pd.DataFrame:
 
 def _topic_table_display(topic_summary: pd.DataFrame) -> pd.DataFrame:
     columns = [
-        "category_name",
         "topic_name",
+        "content_types",
         "item_count",
+        "material_count",
+        "spend_share",
         "spend",
         "impressions",
         "clicks",
@@ -2083,7 +2112,28 @@ def _topic_table_display(topic_summary: pd.DataFrame) -> pd.DataFrame:
         "first_pay_rate",
     ]
     display = topic_summary[[column for column in columns if column in topic_summary.columns]].copy()
-    return display.rename(columns={"category_name": "category_l2", "topic_name": "category_l3"})
+    return display
+
+
+def _topic_material_detail(topic_labels: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "rank_position",
+        "topic_name",
+        "content_type",
+        "title",
+        "content_id",
+        "material_id",
+        "spend",
+        "activations",
+        "activation_cost",
+        "first_pay_count",
+        "first_pay_cost",
+        "first_pay_rate",
+        "source",
+    ]
+    if topic_labels.empty:
+        return pd.DataFrame(columns=columns)
+    return topic_labels[[column for column in columns if column in topic_labels.columns]].copy()
 
 
 def _render_short_table_blocks(frame: pd.DataFrame, label: str, rows_per_block: int = 8) -> None:
@@ -2141,12 +2191,12 @@ def _display_generation_results() -> None:
 
 def _render_kpis(summary) -> None:
     metrics = [
-        ("总消耗", f"{summary.total_spend:,.0f}"),
-        ("激活数", f"{summary.activations:,.0f}"),
-        ("激活成本", f"{summary.activation_cost:,.1f}"),
-        ("付费数", f"{summary.first_pay_count:,.0f}"),
-        ("付费成本", f"{summary.first_pay_cost:,.1f}"),
-        ("付费率", f"{summary.first_pay_rate:.1%}"),
+        ("总消耗", format_display_number(summary.total_spend, 0)),
+        ("激活数", format_display_number(summary.activations, 0)),
+        ("激活成本", format_display_number(summary.activation_cost, 1)),
+        ("付费数", format_display_number(summary.first_pay_count, 0)),
+        ("付费成本", format_display_number(summary.first_pay_cost, 1)),
+        ("付费率", f"{format_display_number(summary.first_pay_rate * 100, 1)}%"),
     ]
     _render_metric_grid(metrics, columns=3)
 
@@ -2280,21 +2330,22 @@ def _fmt_metric_number(value: object, digits: int) -> str:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric):
         return "-"
-    return f"{float(numeric):,.{digits}f}"
+    return format_display_number(numeric, max_decimals=max(digits, 0))
 
 
 def _fmt_percent(value: object) -> str:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric):
         return "-"
-    return f"{float(numeric):.1%}"
+    return f"{format_display_number(float(numeric) * 100, max_decimals=1)}%"
 
 
 def _fmt_growth_delta(value: object) -> str | None:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric):
         return None
-    return f"{float(numeric):+.1%}"
+    sign = "+" if float(numeric) > 0 else ""
+    return f"{sign}{format_display_number(float(numeric) * 100, max_decimals=1)}%"
 
 
 def _render_vertical_bar_chart(
@@ -2318,6 +2369,7 @@ def _render_vertical_bar_chart(
     if chart.empty:
         return
 
+    chart["__bar_text"] = chart[y_column].map(lambda value: _format_chart_value(value, y_column))
     chart["__axis_label"] = chart[x_column].map(_compact_axis_label)
     usable_color_column = _usable_color_column(chart, color_column)
     color_target = usable_color_column or "__axis_label"
@@ -2337,19 +2389,19 @@ def _render_vertical_bar_chart(
         x="__axis_label",
         y=y_column,
         color=color_target,
-        text=y_column,
+        text="__bar_text",
         labels=labels,
         title=title,
-        custom_data=[x_column],
+        custom_data=[x_column, "__bar_text"],
         **color_kwargs,
     )
     fig.update_traces(
-        texttemplate=_bar_text_template(y_column),
+        texttemplate="%{text}",
         textposition="outside",
         cliponaxis=False,
         marker_line_width=0.8,
         marker_line_color="rgba(255,255,255,0.72)",
-        hovertemplate=f"{x_label}：%{{customdata[0]}}<br>{y_label}：%{{y}}<extra></extra>",
+        hovertemplate=f"{x_label}：%{{customdata[0]}}<br>{y_label}：%{{customdata[1]}}<extra></extra>",
     )
     fig.update_layout(
         template="plotly_white",
@@ -2384,6 +2436,15 @@ def _usable_color_column(frame: pd.DataFrame, color_column: str | None) -> str:
     return ""
 
 
+def _format_chart_value(value: object, metric: str) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return ""
+    if metric in RATE_METRIC_COLUMNS:
+        return f"{format_display_number(float(numeric) * 100, 1)}%"
+    return format_display_number(numeric, 1 if metric in {"activation_cost", "first_pay_cost"} else 0)
+
+
 def _bar_text_template(metric: str) -> str:
     if metric in RATE_METRIC_COLUMNS:
         return "%{text:.1%}"
@@ -2402,27 +2463,133 @@ def _axis_tick_format(metric: str) -> str:
 
 def _render_platform_chart(
     platform_summary: pd.DataFrame,
-    y_metric: str = "activations",
-    color_metric: str = "activation_cost",
-    y_label: str = "激活数",
-    color_label: str = "激活成本",
 ) -> None:
-    if platform_summary.empty:
+    fig = _build_platform_chart_figure(platform_summary)
+    if fig is None:
         return
-    chart = platform_summary.sort_values(
-        y_metric,
-        ascending=metric_sort_ascending(y_metric) if y_metric in platform_summary.columns else False,
+    st.plotly_chart(
+        fig,
+        config={"displayModeBar": False},
     )
-    _render_vertical_bar_chart(
-        chart,
-        "channel",
-        y_metric,
-        "渠道",
-        y_label,
-        f"分渠道{y_label}",
-        color_metric,
-        color_label,
+
+
+def _build_platform_chart_figure(platform_summary: pd.DataFrame) -> go.Figure | None:
+    if platform_summary.empty:
+        return None
+
+    fig = go.Figure()
+    trace_meta: list[dict[str, object]] = []
+    for metric_name, (y_metric, color_metric, y_label, color_label) in CHART_METRICS.items():
+        if "channel" not in platform_summary.columns or y_metric not in platform_summary.columns:
+            continue
+        chart = platform_summary.copy()
+        chart["channel"] = chart["channel"].fillna("").astype(str).str.strip()
+        chart = chart[chart["channel"].ne("")]
+        chart[y_metric] = pd.to_numeric(chart[y_metric], errors="coerce")
+        chart = chart.dropna(subset=[y_metric])
+        if chart.empty:
+            continue
+        chart = chart.sort_values(
+            y_metric,
+            ascending=metric_sort_ascending(y_metric),
+        )
+        chart["__bar_text"] = chart[y_metric].map(lambda value: _format_chart_value(value, y_metric))
+        chart["__axis_label"] = chart["channel"].map(_compact_axis_label)
+        marker = {
+            "line": {"width": 0.8, "color": "rgba(255,255,255,0.72)"},
+        }
+        usable_color_column = _usable_color_column(chart, color_metric)
+        if usable_color_column:
+            color_values = pd.to_numeric(chart[usable_color_column], errors="coerce")
+            marker.update(
+                {
+                    "color": [None if pd.isna(value) else float(value) for value in color_values],
+                    "colorscale": BAR_CONTINUOUS_SCALE,
+                    "colorbar": {"title": color_label},
+                }
+            )
+        else:
+            marker["color"] = [BAR_COLOR_SEQUENCE[index % len(BAR_COLOR_SEQUENCE)] for index in range(len(chart))]
+
+        trace_index = len(trace_meta)
+        fig.add_trace(
+            go.Bar(
+                x=chart["__axis_label"],
+                y=chart[y_metric],
+                text=chart["__bar_text"],
+                customdata=chart[["channel", "__bar_text"]].to_numpy(),
+                marker=marker,
+                name=metric_name,
+                visible=trace_index == 0,
+                texttemplate="%{text}",
+                textposition="outside",
+                cliponaxis=False,
+                hovertemplate=f"渠道：%{{customdata[0]}}<br>{y_label}：%{{customdata[1]}}<extra></extra>",
+            )
+        )
+        trace_meta.append(
+            {
+                "metric_name": metric_name,
+                "y_metric": y_metric,
+                "y_label": y_label,
+                "title": f"分渠道{y_label}",
+                "height": max(360, min(680, 300 + len(chart) * 22)),
+            }
+        )
+
+    if not trace_meta:
+        return None
+
+    buttons = []
+    for button_index, meta in enumerate(trace_meta):
+        buttons.append(
+            {
+                "label": str(meta["metric_name"]),
+                "method": "update",
+                "args": [
+                    {"visible": [index == button_index for index in range(len(trace_meta))]},
+                    {
+                        "title.text": str(meta["title"]),
+                        "yaxis.title.text": str(meta["y_label"]),
+                        "yaxis.tickformat": _axis_tick_format(str(meta["y_metric"])),
+                        "height": int(meta["height"]),
+                    },
+                ],
+            }
+        )
+
+    initial = trace_meta[0]
+    fig.update_layout(
+        template="plotly_white",
+        height=int(initial["height"]),
+        margin=dict(l=20, r=20, t=104, b=92),
+        bargap=0.28,
+        showlegend=False,
+        plot_bgcolor="rgba(255,255,255,0.96)",
+        paper_bgcolor="rgba(255,255,255,0)",
+        font=dict(color="#10233f"),
+        title=dict(text=str(initial["title"]), font=dict(size=18, color="#10233f")),
+        updatemenus=[
+            {
+                "type": "buttons",
+                "direction": "right",
+                "active": 0,
+                "x": 0,
+                "y": 1.2,
+                "xanchor": "left",
+                "yanchor": "top",
+                "pad": {"r": 8, "t": 0},
+                "buttons": buttons,
+            }
+        ],
     )
+    fig.update_xaxes(title="渠道", tickangle=-25, automargin=True)
+    fig.update_yaxes(
+        title=str(initial["y_label"]),
+        tickformat=_axis_tick_format(str(initial["y_metric"])),
+        gridcolor="rgba(95,115,148,0.16)",
+    )
+    return fig
 
 
 def _content_filter_panel(items: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
@@ -2430,7 +2597,7 @@ def _content_filter_panel(items: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
         c1, c2, c3 = st.columns(3)
         platforms = c1.multiselect("渠道", _dashboard_options(items, "channel"), key=f"{key_prefix}_platforms")
         content_categories = c2.multiselect(
-            "二级栏目",
+            "栏目",
             _dashboard_options(items, "category_l2"),
             key=f"{key_prefix}_content_categories",
         )

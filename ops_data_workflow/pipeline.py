@@ -15,6 +15,8 @@ from .reference_tables import (
     account_mapping_lookup,
     load_reference_tables,
 )
+from .title_matching import normalized_title_key
+from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, social_platform_from_name
 
 
 TABULAR_SUFFIXES = {".csv", ".xls", ".xlsx"}
@@ -72,6 +74,18 @@ STANDARD_COLUMNS = [
 
 INTERNAL_COMPAT_COLUMNS = {"platform", "platform_group"}
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
+COUNT_METRIC_COLUMNS = {"activations", "first_pay_count"}
+COUNT_METRIC_EXCLUDE_KEYWORDS = (
+    "成本",
+    "率",
+    "单价",
+    "均价",
+    "cost",
+    "rate",
+    "cpa",
+    "ctr",
+    "cvr",
+)
 
 
 @dataclass(frozen=True)
@@ -143,6 +157,7 @@ def analyze_input_dir(
     canonical = pd.concat(frames, ignore_index=True)
     canonical["period_start"] = period_start
     canonical["period_end"] = period_end
+    canonical = _normalize_social_dimensions(canonical)
     canonical = _apply_account_mappings(canonical, references)
     preprocessing = _preprocess_canonical(canonical)
     canonical = preprocessing["canonical"]
@@ -206,8 +221,12 @@ def analyze_canonical_frame(
     for column in STANDARD_COLUMNS:
         if column not in prepared.columns:
             prepared[column] = ""
+    prepared = _backfill_count_metric_aliases(prepared)
+    for column in NUMERIC_COLUMNS:
+        prepared[column] = prepared[column].map(parse_number)
     prepared["period_start"] = period_start
     prepared["period_end"] = period_end
+    prepared = _normalize_social_dimensions(prepared)
     prepared = _apply_account_mappings(prepared, references)
     preprocessing = _preprocess_canonical(prepared)
     prepared = preprocessing["canonical"]
@@ -266,6 +285,7 @@ def _read_available_sources(input_dir: Path, references: ReferenceTables) -> Lis
         (["抖音", "市场部"], _read_douyin_market),
         (["微信", "市场部"], _read_social_market),
         (["腾讯", "市场部"], _read_social_market),
+        (["视频号"], _read_social_market),
     ]
     for tokens, reader in reader_specs:
         try:
@@ -299,7 +319,7 @@ def _read_optional_source(path: Path, references: ReferenceTables) -> Optional[p
         return _read_xiaohongshu(path)
     if "B站" in name:
         return _read_bilibili(path)
-    if "微信" in name or "腾讯" in name:
+    if "微信" in name or "腾讯" in name or "视频号" in name:
         return _read_social_market(path)
     columns = _read_first_available_columns(path)
     if {"视频BVID", "花费", "展示量"}.issubset(columns) or {"视频AVID", "应用激活数"}.issubset(columns):
@@ -336,9 +356,9 @@ def _read_bilibili(path: Path) -> pd.DataFrame:
         channel="B站",
         source_file=path.name,
         fields={
-            "content_id": ["视频BVID", "视频bvid", "视频AVID", "视频avid"],
-            "material_id": ["素材中心id", "素材中心ID", "视频BVID", "视频bvid"],
-            "title": ["视频标题"],
+            "content_id": ["视频BVID", "视频bvid", "视频AVID", "视频avid", "单元名称"],
+            "material_id": ["素材中心id", "素材中心ID", "视频BVID", "视频bvid", "单元名称"],
+            "title": ["视频标题", "单元名称"],
             "account_id": ["Up主mid", "UID", "uid", "mid"],
             "account": ["Up主名称", "UP主名称", "UP主昵称", "账号名称"],
             "cover_url": ["素材url"],
@@ -445,7 +465,7 @@ def _read_douyin_generic(path: Path) -> pd.DataFrame:
     if "市场部" in stem:
         channel = "抖音市场部"
     elif "达人" in stem:
-        channel = "抖音达人内容"
+        channel = "达人数据"
     elif "商业化" in stem:
         channel = "抖音商业化"
     elif "期货" in stem:
@@ -458,10 +478,11 @@ def _read_douyin_generic(path: Path) -> pd.DataFrame:
 def _read_social_market(path: Path) -> pd.DataFrame:
     raw = _read_first_non_empty_sheet(path)
     channel = _social_market_channel(path.stem)
+    platform = _social_market_platform(path.stem)
     return _standardize(
         raw,
-        platform=channel,
-        platform_group=channel.replace("市场部", ""),
+        platform=platform or channel,
+        platform_group=SOCIAL_PLATFORM_GROUP if platform else channel.replace("市场部", ""),
         channel=channel,
         source_file=path.name,
         fields={
@@ -599,12 +620,11 @@ def _standardize_douyin(raw: pd.DataFrame, source_file: str, channel: str) -> pd
 
 
 def _social_market_channel(stem: str) -> str:
-    name = re.sub(r"[（）()\s_-]+", "", str(stem or ""))
-    if "腾讯" in name:
-        return "腾讯市场部"
-    if "微信" in name:
-        return "微信市场部"
-    return stem
+    return normalize_channel_name(stem)
+
+
+def _social_market_platform(stem: str) -> str:
+    return social_platform_from_name(stem)
 
 
 def _standardize(
@@ -623,7 +643,8 @@ def _standardize(
     normalized["period_end"] = ""
     normalized["source_file"] = source_file
 
-    for output, candidates in fields.items():
+    expanded_fields = _expanded_field_candidates(raw, fields)
+    for output, candidates in expanded_fields.items():
         normalized[output] = _first_non_blank(raw, candidates)
 
     if "manual_category" not in normalized.columns and "content_category" in normalized.columns:
@@ -649,10 +670,83 @@ def _standardize(
     normalized["author"] = normalized["author"].map(lambda value: "" if _is_blank(value) else str(value))
     normalized["author"] = normalized["author"].where(~normalized["author"].map(_is_blank), normalized["account"])
     normalized = normalized[normalized[["title", "content_id", "material_id"]].ne("").any(axis=1)]
-    raw_extra = _raw_extra_columns(raw, fields, source_file)
+    raw_extra = _raw_extra_columns(raw, expanded_fields, source_file)
     if not raw_extra.empty:
         normalized = pd.concat([normalized.reset_index(drop=True), raw_extra.loc[normalized.index].reset_index(drop=True)], axis=1)
     return _ordered_columns(normalized)
+
+
+def _expanded_field_candidates(raw: pd.DataFrame, fields: Mapping[str, List[str]]) -> dict[str, list[str]]:
+    expanded: dict[str, list[str]] = {}
+    for output, candidates in fields.items():
+        field_candidates = list(candidates)
+        if output in COUNT_METRIC_COLUMNS:
+            for column in raw.columns:
+                if column in field_candidates:
+                    continue
+                if _matches_count_metric_alias(output, column):
+                    field_candidates.append(column)
+        expanded[output] = field_candidates
+    return expanded
+
+
+def _backfill_count_metric_aliases(frame: pd.DataFrame) -> pd.DataFrame:
+    backfilled = frame.copy()
+    for output in COUNT_METRIC_COLUMNS:
+        if output not in backfilled.columns:
+            backfilled[output] = pd.NA
+        backfilled[output] = backfilled[output].astype("object")
+        aliases = [
+            column
+            for column in backfilled.columns
+            if column != output and _matches_count_metric_alias(output, column)
+        ]
+        if not aliases:
+            continue
+        alias_values = _first_non_blank(backfilled, aliases)
+        mask = backfilled[output].map(_is_blank) & ~alias_values.map(_is_blank)
+        backfilled.loc[mask, output] = alias_values.loc[mask]
+    return backfilled
+
+
+def _matches_count_metric_alias(output: str, column: object) -> bool:
+    name = _compact_metric_column_name(column)
+    if not name or any(keyword in name for keyword in COUNT_METRIC_EXCLUDE_KEYWORDS):
+        return False
+    if output == "activations":
+        return "激活" in name or "activation" in name
+    if output == "first_pay_count":
+        return (
+            "首次付费" in name
+            or "应用内付费" in name
+            or "付费次数" in name
+            or "付费数" in name
+            or "firstpay" in name
+        )
+    return False
+
+
+def _compact_metric_column_name(column: object) -> str:
+    return re.sub(r"[\s_（）()\-\[\]【】:：/\\]+", "", str(column or "").strip().lower())
+
+
+def _normalize_social_dimensions(canonical: pd.DataFrame) -> pd.DataFrame:
+    normalized = canonical.copy()
+    for column in ["platform", "platform_group", "channel"]:
+        if column not in normalized.columns:
+            normalized[column] = ""
+        normalized[column] = normalized[column].fillna("").astype(str)
+
+    platform_from_platform = normalized["platform"].map(social_platform_from_name)
+    platform_from_channel = normalized["channel"].map(social_platform_from_name)
+    social_platform = platform_from_platform.where(platform_from_platform.ne(""), platform_from_channel)
+    social_mask = social_platform.ne("")
+    if social_mask.any():
+        normalized.loc[social_mask, "platform"] = social_platform[social_mask]
+        normalized.loc[social_mask, "platform_group"] = SOCIAL_PLATFORM_GROUP
+        channel_source = normalized["channel"].where(normalized["channel"].str.strip().ne(""), normalized["platform"])
+        normalized.loc[social_mask, "channel"] = channel_source.loc[social_mask].map(normalize_channel_name)
+    return normalized
 
 
 def _raw_extra_columns(raw: pd.DataFrame, fields: Mapping[str, List[str]], source_file: str) -> pd.DataFrame:
@@ -680,6 +774,7 @@ def _apply_account_mappings(canonical: pd.DataFrame, references: ReferenceTables
     for column in ["account_raw", "account_mapping_source", "account_id", "account", "author"]:
         if column not in canonical.columns:
             canonical[column] = ""
+        canonical[column] = canonical[column].astype(object)
 
     for index, row in canonical.iterrows():
         account = "" if _is_blank(row.get("account")) else str(row.get("account")).strip()
@@ -983,6 +1078,23 @@ def _complete_categories(
     category_mappings: Optional[CategoryMappings] = None,
 ) -> pd.DataFrame:
     canonical = canonical.copy()
+    for column in [
+        "category_l1",
+        "category_l2",
+        "category_l3",
+        "category_source",
+        "review_status",
+        "primary_category",
+        "manual_category",
+        "ai_category",
+        "content_category",
+        "category_status",
+        "category_l2_source",
+        "review_reasons",
+    ]:
+        if column not in canonical.columns:
+            canonical[column] = ""
+        canonical[column] = canonical[column].astype(object)
     raw_category = canonical["manual_category"].where(~canonical["manual_category"].map(_is_blank), "")
     canonical["primary_category"] = ""
     canonical["category_confidence"] = 0.0
@@ -998,9 +1110,6 @@ def _complete_categories(
     canonical.loc[writable_manual, "content_category"] = raw_category.loc[writable_manual].astype(str).str.strip()
     canonical.loc[writable_manual, "category_status"] = "人工标记"
     canonical.loc[writable_manual, "category_confidence"] = 1.0
-
-    if category_mappings:
-        _apply_category_mappings(canonical, category_mappings)
 
     _apply_account_content_type_mappings(canonical, references.account_content_type)
 
@@ -1044,6 +1153,9 @@ def _complete_categories(
 
     _fill_missing_secondary_categories(canonical)
 
+    if category_mappings:
+        _apply_category_mappings(canonical, category_mappings)
+
     still_missing = canonical["content_category"].map(_is_blank)
     canonical.loc[still_missing, "category_status"] = "未匹配"
     canonical.loc[~still_missing & canonical["category_status"].map(_is_blank), "category_status"] = "人工标记"
@@ -1052,7 +1164,8 @@ def _complete_categories(
     canonical["category_l1"] = ""
     canonical["category_l2"] = canonical["content_category"].fillna("").astype(str)
     canonical["category_l3"] = canonical["category_l3"].where(~canonical["category_l3"].map(_is_blank), canonical["title"])
-    canonical["category_source"] = canonical["category_status"].fillna("").astype(str)
+    canonical["category_status"] = canonical["category_status"].fillna("").astype(str).astype(object)
+    canonical["category_source"] = canonical["category_status"].fillna("").astype(str).astype(object)
     missing_l2_source = canonical["category_l2_source"].map(_is_blank)
     canonical.loc[missing_l2_source, "category_l2_source"] = canonical.loc[missing_l2_source, "category_status"]
     canonical["review_status"] = canonical.apply(_review_status, axis=1)
@@ -1225,8 +1338,6 @@ def _mark_category_review_reasons(canonical: pd.DataFrame) -> pd.DataFrame:
 
 def _apply_category_mappings(canonical: pd.DataFrame, category_mappings: CategoryMappings) -> None:
     for index, row in canonical.iterrows():
-        if not _is_blank(row.get("content_category")):
-            continue
         mapping = _lookup_category_mapping(row, category_mappings)
         if not mapping:
             continue
@@ -1236,6 +1347,7 @@ def _apply_category_mappings(canonical: pd.DataFrame, category_mappings: Categor
             canonical.at[index, "manual_category"] = l2
             canonical.at[index, "content_category"] = l2
             canonical.at[index, "category_status"] = "历史审核映射"
+            canonical.at[index, "category_l2_source"] = "历史审核映射"
             canonical.at[index, "category_confidence"] = 1.0
         if l3:
             canonical.at[index, "category_l3"] = l3
@@ -1258,6 +1370,9 @@ def _category_mapping_keys(row: pd.Series) -> list[str]:
         value = "" if pd.isna(row.get(column, "")) else str(row.get(column, "")).strip()
         if value:
             keys.append(f"{column}:{value}")
+    title_key = normalized_title_key(row.get("title", ""))
+    if title_key:
+        keys.append(f"title_key:{title_key}")
     return keys
 
 
