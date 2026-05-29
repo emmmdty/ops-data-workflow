@@ -11,6 +11,7 @@ from typing import Optional
 import pandas as pd
 import plotly.express as px
 
+from .recap import build_recap_summary
 from .reference_tables import to_display_reference_columns
 
 
@@ -29,8 +30,8 @@ COLUMN_LABELS = {
     "channel": "渠道",
     "period_start": "周期开始",
     "period_end": "周期结束",
-    "batch_period_start": "批次周期开始",
-    "batch_period_end": "批次周期结束",
+    "batch_period_start": "周期开始",
+    "batch_period_end": "周期结束",
     "content_id": "视频/笔记id",
     "material_id": "素材ID",
     "title": "标题",
@@ -38,6 +39,9 @@ COLUMN_LABELS = {
     "account_id": "账号ID",
     "account": "实际账号",
     "account_mapping_source": "账号映射来源",
+    "account_normalized": "归一账号",
+    "account_filter_status": "账号过滤状态",
+    "account_filter_reason": "账号过滤原因",
     "author": "作者",
     "cover_url": "封面/素材链接",
     "content_url": "内容链接",
@@ -48,6 +52,7 @@ COLUMN_LABELS = {
     "category_confidence": "分类置信度",
     "review_status": "审核状态",
     "manual_category": "人工内容类别",
+    "manual_category_source": "人工内容类别来源",
     "ai_category": "AI生成内容类别",
     "content_category": "最终内容类别",
     "category_display": "内容分类",
@@ -68,6 +73,16 @@ COLUMN_LABELS = {
     "conflict_details": "冲突详情",
     "needs_manual_review": "需要人工审核",
     "review_reasons": "审核原因",
+    "ledger_match_source": "投稿台账匹配来源",
+    "ledger_match_key": "投稿台账匹配键",
+    "ledger_content_type": "投稿台账内容类型",
+    "ledger_content_type_review": "投稿台账类型审核",
+    "ledger_filter_status": "投稿台账筛选状态",
+    "ledger_source_file": "投稿台账来源文件",
+    "ledger_source_sheet": "投稿台账来源Sheet",
+    "ledger_source_row": "投稿台账来源行",
+    "match_risk_level": "匹配风险等级",
+    "match_risk_reason": "匹配风险原因",
     "source_file": "来源文件",
     "source_sheet": "来源Sheet",
     "source_row": "来源行",
@@ -87,10 +102,21 @@ COLUMN_LABELS = {
     "observed_count": "素材数",
     "matched_account": "实际账号",
     "status": "状态",
+    "rule_type": "规则类型",
+    "source_account": "来源账号",
+    "normalized_account": "归一账号",
+    "included": "是否统计",
+    "filter_enabled": "是否启用过滤",
+    "config_source": "配置来源",
+    "config_path": "配置文件",
+    "filter_reason": "过滤原因",
     "performance_flag": "表现标签",
     "spend_current": "本期消耗",
     "spend_previous": "对比期消耗",
     "spend_change_rate": "消耗环比",
+    "impressions_current": "本期曝光",
+    "impressions_previous": "对比期曝光",
+    "impressions_change_rate": "曝光环比",
     "activations_current": "本期激活",
     "activations_previous": "对比期激活",
     "activations_change_rate": "激活环比",
@@ -369,16 +395,23 @@ def write_outputs(
     channel_comparison: Optional[pd.DataFrame] = None,
     comparison_note: str = "",
     ai_summary: str = "",
+    account_filter_rules: Optional[pd.DataFrame] = None,
+    account_filter_details: Optional[pd.DataFrame] = None,
 ) -> tuple[Path, Path, Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     report_html = output_dir / "report.html"
     analysis_xlsx = output_dir / "analysis.xlsx"
     canonical_csv = output_dir / "canonical.csv"
     total_summary_xlsx = output_dir / "total_summary.xlsx"
+    recap_summary = build_recap_summary(
+        canonical,
+        period_level=_recap_period_level(period_start, period_end),
+    )
 
     _localized(_export_canonical(canonical)).to_csv(canonical_csv, index=False, encoding="utf-8-sig")
     _write_excel(
         analysis_xlsx,
+        recap_summary,
         canonical,
         category_summary,
         channel_summary,
@@ -396,12 +429,15 @@ def write_outputs(
         _frame_or_empty(duplicate_merge_details),
         _frame_or_empty(conflict_retention_details),
         _frame_or_empty(missing_value_details),
+        _frame_or_empty(account_filter_rules),
+        _frame_or_empty(account_filter_details),
         reference_tables or {},
         _frame_or_empty(channel_comparison),
         ai_summary,
     )
     _write_total_summary(
         total_summary_xlsx,
+        recap_summary,
         canonical,
         total_summary,
         platform_summary,
@@ -434,6 +470,7 @@ def write_outputs(
 
 def _write_excel(
     path: Path,
+    recap_summary: pd.DataFrame,
     canonical: pd.DataFrame,
     category_summary: pd.DataFrame,
     channel_summary: pd.DataFrame,
@@ -451,12 +488,15 @@ def _write_excel(
     duplicate_merge_details: pd.DataFrame,
     conflict_retention_details: pd.DataFrame,
     missing_value_details: pd.DataFrame,
+    account_filter_rules: pd.DataFrame,
+    account_filter_details: pd.DataFrame,
     reference_tables: dict[str, pd.DataFrame],
     channel_comparison: pd.DataFrame,
     ai_summary: str,
 ) -> None:
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
         _localized(_export_canonical(canonical)).to_excel(writer, sheet_name="总表", index=False)
+        recap_summary.to_excel(writer, sheet_name="复盘统一字段", index=False)
         _localized(platform_summary).to_excel(writer, sheet_name="分渠道总数据", index=False)
         _localized(platform_category_summary).to_excel(writer, sheet_name="分渠道栏目题材排名", index=False)
         _localized(category_summary).to_excel(writer, sheet_name="内容类型分级表", index=False)
@@ -464,6 +504,8 @@ def _write_excel(
         _localized(_reference_frame(reference_tables, "字段映射表")).to_excel(writer, sheet_name="字段映射表", index=False)
         _localized(_reference_frame(reference_tables, "账号映射表")).to_excel(writer, sheet_name="账号映射表", index=False)
         _localized(_reference_frame(reference_tables, "账号内容类型对照表")).to_excel(writer, sheet_name="账号内容类型对照表", index=False)
+        _localized(account_filter_rules).to_excel(writer, sheet_name="账号过滤规则", index=False)
+        _localized(account_filter_details).to_excel(writer, sheet_name="账号过滤明细", index=False)
         _localized(raw_category_stats).to_excel(writer, sheet_name="原始分类统计", index=False)
         _localized(review_queue).to_excel(writer, sheet_name="人工审核表", index=False)
         _localized(account_audit).to_excel(writer, sheet_name="账号覆盖校验", index=False)
@@ -483,6 +525,7 @@ def _write_excel(
 
 def _write_total_summary(
     path: Path,
+    recap_summary: pd.DataFrame,
     canonical: pd.DataFrame,
     total_summary: pd.DataFrame,
     platform_summary: pd.DataFrame,
@@ -493,6 +536,7 @@ def _write_total_summary(
 ) -> None:
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
         _localized(_export_canonical(canonical)).to_excel(writer, sheet_name="总表", index=False)
+        recap_summary.to_excel(writer, sheet_name="复盘统一字段", index=False)
         _localized(platform_summary).to_excel(writer, sheet_name="分渠道总数据", index=False)
         _localized(platform_category_summary).to_excel(writer, sheet_name="分渠道栏目题材排名", index=False)
         _localized(_reference_frame(reference_tables, "内容类型分级表")).to_excel(writer, sheet_name="内容类型分级表", index=False)
@@ -721,6 +765,14 @@ def localize_columns(frame: pd.DataFrame) -> pd.DataFrame:
         if column in DISPLAY_NUMERIC_COLUMNS:
             display[column] = display[column].map(format_display_number)
     return display.rename(columns={column: _localized_column_name(column) for column in display.columns})
+
+
+def _recap_period_level(period_start: str, period_end: str) -> str:
+    start = pd.to_datetime(period_start, errors="coerce")
+    end = pd.to_datetime(period_end, errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        return "week"
+    return "month" if (end - start).days + 1 >= 21 else "week"
 
 
 # 重要字段优先顺序定义

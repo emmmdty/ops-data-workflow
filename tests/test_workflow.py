@@ -6,7 +6,7 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from ops_data_workflow.workflow import run_workflow
-from ops_data_workflow.pipeline import analyze_input_dir
+from ops_data_workflow.pipeline import analyze_canonical_frame, analyze_input_dir
 from ops_data_workflow.reference_tables import account_mapping_lookup, load_reference_tables, parse_period_from_raw_dir
 
 
@@ -50,7 +50,7 @@ def _write_raw_fixture(raw_dir: Path) -> None:
                     "时间": "2026-04-01~2026-04-27",
                     "标题": "给短线交易者的完美范例 #股友说",
                     "笔记ID": "note-2",
-                    "发布作者": "同花顺研习社",
+                    "发布作者": "同顺股民社区",
                     "类型": "视频",
                     "内容分类": "",
                     "消费": 40.0,
@@ -64,7 +64,7 @@ def _write_raw_fixture(raw_dir: Path) -> None:
         ).to_excel(writer, sheet_name="kos账户投放数据", index=False)
         pd.DataFrame(
             [
-                {"笔记ID": "note-1", "账号": "投资号", "内容类型": "资讯"},
+                {"笔记ID": "note-1", "账号": "同花顺投资", "内容类型": "资讯"},
             ]
         ).to_excel(writer, sheet_name="内容表格", index=False, startrow=1)
 
@@ -75,6 +75,7 @@ def _write_raw_fixture(raw_dir: Path) -> None:
                     "视频标题": "什么样的人能成为交易高手？ #股友说 #股民",
                     "视频id": "dy-1",
                     "素材ID": "mat-1",
+                    "账号": "同花顺投资",
                     "消耗": 200.0,
                     "展示数": 20000,
                     "点击数": 800,
@@ -86,6 +87,7 @@ def _write_raw_fixture(raw_dir: Path) -> None:
                     "视频标题": "股市是仅次于高考最公平的竞争",
                     "视频id": "dy-2",
                     "素材ID": "mat-2",
+                    "账号": "同花顺投资",
                     "消耗": 100.0,
                     "展示数": 10000,
                     "点击数": 400,
@@ -104,6 +106,7 @@ def _write_raw_fixture(raw_dir: Path) -> None:
                     "素材ID": "mat-3",
                     "视频标题": "是天才就来同花顺证明给我看 #同花顺进行曲",
                     "视频id": "dy-m-1",
+                    "账号": "同花顺投资",
                     "消耗": 120.0,
                     "展示数": 12000,
                     "激活数": 24,
@@ -135,6 +138,101 @@ def _looks_like_english_field_name(value: object) -> bool:
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_workflow_writes_channel_clean_workbooks_with_required_columns(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            output_dir = Path(tmp) / "out"
+            raw_dir.mkdir()
+            _write_raw_fixture(raw_dir)
+            _remove_total_fixture(raw_dir)
+
+            result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
+
+            self.assertTrue((raw_dir / "cleaned.xlsx").exists())
+            self.assertTrue((raw_dir / "period_manifest.json").exists())
+            import_log = pd.read_excel(raw_dir / "cleaned.xlsx", sheet_name="导入日志")
+            self.assertIn("B站.xlsx", set(import_log["source_file"]))
+            clean_dir = output_dir / "channel_clean"
+            xhs_clean = clean_dir / "小红书商业化_clean.xlsx"
+            self.assertIn(xhs_clean, result.channel_clean_workbooks)
+            self.assertTrue(xhs_clean.exists())
+
+            workbook = load_workbook(xhs_clean, read_only=True)
+            self.assertEqual(workbook.sheetnames, ["清理后明细"])
+            workbook.close()
+
+            cleaned = pd.read_excel(xhs_clean, sheet_name="清理后明细")
+            self.assertEqual(
+                list(cleaned.columns),
+                [
+                    "周期",
+                    "渠道",
+                    "账号",
+                    "内容类型",
+                    "内容分类",
+                    "标题",
+                    "id/BV或者唯一标识",
+                    "内容链接",
+                    "消耗",
+                    "曝光量",
+                    "激活数",
+                    "激活成本",
+                    "付费",
+                    "付费成本",
+                    "匹配来源",
+                    "复核原因",
+                ],
+            )
+            row = cleaned[cleaned["id/BV或者唯一标识"].eq("note-1")].iloc[0]
+            self.assertEqual(row["周期"], "2026-04-01 至 2026-04-27")
+            self.assertEqual(row["渠道"], "小红书商业化")
+            self.assertEqual(row["账号"], "同花顺理财")
+            self.assertEqual(row["内容分类"], "热点行情")
+            self.assertEqual(row["标题"], "存储芯片板块再度爆发")
+            self.assertEqual(row["内容类型"], "热点行情")
+            self.assertEqual(float(row["消耗"]), 60.0)
+            self.assertEqual(float(row["曝光量"]), 6000.0)
+            self.assertEqual(float(row["激活数"]), 12.0)
+            self.assertEqual(float(row["激活成本"]), 5.0)
+            self.assertEqual(float(row["付费"]), 2.0)
+            self.assertEqual(float(row["付费成本"]), 30.0)
+
+            workbook = load_workbook(result.analysis_xlsx, read_only=True)
+            self.assertIn("账号过滤规则", workbook.sheetnames)
+            self.assertIn("账号过滤明细", workbook.sheetnames)
+            workbook.close()
+
+    def test_channel_clean_uses_tagless_title_for_douyin_missing_id(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            output_dir = Path(tmp) / "out"
+            raw_dir.mkdir()
+            with pd.ExcelWriter(raw_dir / "抖音商业化.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "视频标题": "人和人的缘分就像炒股 #同花顺股友说 #投资",
+                            "账号": "同花顺投资",
+                            "消耗": 90,
+                            "展示数": 9000,
+                            "激活数": 9,
+                            "付费次数": 3,
+                            "内容类型": "股友说",
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="Sheet2", index=False)
+
+            result = run_workflow(raw_dir, "2026-05-19", "2026-05-25", output_dir)
+
+            dy_clean = output_dir / "channel_clean" / "抖音商业化_clean.xlsx"
+            self.assertIn(dy_clean, result.channel_clean_workbooks)
+            cleaned = pd.read_excel(dy_clean, sheet_name="清理后明细")
+            row = cleaned.iloc[0]
+            self.assertEqual(row["标题"], "人和人的缘分就像炒股 #同花顺股友说 #投资")
+            self.assertEqual(row["id/BV或者唯一标识"], "人和人的缘分就像炒股")
+            self.assertEqual(row["内容分类"], "股友说")
+            self.assertEqual(row["内容类型"], "股友说")
+
     def test_workflow_reads_csv_sources_and_builds_platform_summaries(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -142,11 +240,12 @@ class WorkflowTests(unittest.TestCase):
             raw_dir.mkdir()
             pd.DataFrame(
                 [
-                    {
-                        "视频AVID": "av-csv",
-                        "视频BVID": "bv-csv",
-                        "视频标题": "B站财经内容",
-                        "花费": 80,
+                        {
+                            "视频AVID": "av-csv",
+                            "视频BVID": "bv-csv",
+                            "视频标题": "B站财经内容",
+                            "Up主mid": "1622777305",
+                            "花费": 80,
                         "展示量": 8000,
                         "点击量": 400,
                         "应用激活数": 16,
@@ -157,11 +256,12 @@ class WorkflowTests(unittest.TestCase):
             ).to_csv(raw_dir / "B站.csv", index=False, encoding="utf-8-sig")
             pd.DataFrame(
                 [
-                    {
-                        "视频标题": "抖音投流内容",
-                        "视频id": "dy-csv",
-                        "素材ID": "mat-dy",
-                        "消耗": 120,
+                        {
+                            "视频标题": "抖音投流内容",
+                            "视频id": "dy-csv",
+                            "素材ID": "mat-dy",
+                            "账号": "同花顺投资",
+                            "消耗": 120,
                         "展示数": 10000,
                         "点击数": 500,
                         "激活数": 30,
@@ -190,6 +290,7 @@ class WorkflowTests(unittest.TestCase):
                     [
                         {
                             "视频bvid": "BV14Vo5BFE1w",
+                            "Up主mid": "1622777305",
                             "求和项:总花费": 589.62,
                             "求和项:展示量": 33224,
                             "求和项:点击量": 187,
@@ -198,6 +299,7 @@ class WorkflowTests(unittest.TestCase):
                         },
                         {
                             "视频bvid": "BV17EoKB9E7e",
+                            "Up主mid": "1622777305",
                             "求和项:总花费": 147.84,
                             "求和项:展示量": 9547,
                             "求和项:点击量": 299,
@@ -243,6 +345,45 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(first["content_category"], "B站全部")
             self.assertEqual(first["category_l2"], "B站全部")
             self.assertEqual(first["category_l3"], "")
+
+    def test_bilibili_impression_aliases_are_ingested_by_keyword(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            raw_dir.mkdir()
+            with pd.ExcelWriter(raw_dir / "B站.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "视频AVID": "av-alias",
+                            "视频BVID": "BVImpressionAlias",
+                            "视频标题": "B站展示量别名内容",
+                            "Up主mid": "1622777305",
+                            "花费": 100.0,
+                            "视频展示量": 4321,
+                            "曝光转化率": 0.12,
+                            "千次展示费用": 23.5,
+                            "点击量": 321,
+                            "应用激活数": 12,
+                            "激活成本": 8.3,
+                            "应用内首次付费次数": 4,
+                            "付费成本": 25.0,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="Sheet1", index=False)
+
+            result = analyze_input_dir(
+                raw_dir,
+                "2026-05-15",
+                "2026-05-21",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            row = result.canonical.iloc[0]
+            self.assertEqual(row["channel"], "B站")
+            self.assertAlmostEqual(row["impressions"], 4321.0)
+            self.assertAlmostEqual(row["clicks"], 321.0)
+            self.assertAlmostEqual(row["activations"], 12.0)
+            self.assertAlmostEqual(row["first_pay_count"], 4.0)
 
     def test_xiaohongshu_commercial_metric_count_aliases_are_ingested(self):
         with TemporaryDirectory() as tmp:
@@ -316,6 +457,243 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(pd.isna(row["activations"]))
             self.assertTrue(pd.isna(row["first_pay_count"]))
 
+    def test_xiaohongshu_account_filter_applies_to_raw_excel_input(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            config_path = tmp_path / "config" / "account_filters.yml"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                """
+xiaohongshu:
+  include_accounts:
+    - 股民社区
+    - 研习社
+  aliases:
+    同顺股民社区: 股民社区
+    同花顺研习社: 研习社
+  exclude_blank: true
+""".strip(),
+                encoding="utf-8",
+            )
+            with pd.ExcelWriter(raw_dir / "小红书商业化.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "时间": "2026-05-15~2026-05-21",
+                            "标题": "股民社区内容",
+                            "笔记ID": "note-included-1",
+                            "发布作者": "同顺股民社区",
+                            "内容分类": "投教",
+                            "消费": 10.0,
+                            "激活数": 1,
+                            "首次付费次数": 1,
+                        },
+                        {
+                            "时间": "2026-05-15~2026-05-21",
+                            "标题": "研习社内容",
+                            "笔记ID": "note-included-2",
+                            "发布作者": "同花顺研习社",
+                            "内容分类": "投教",
+                            "消费": 20.0,
+                            "激活数": 2,
+                            "首次付费次数": 1,
+                        },
+                        {
+                            "时间": "2026-05-15~2026-05-21",
+                            "标题": "APP内容",
+                            "笔记ID": "note-excluded-app",
+                            "发布作者": "同花顺APP",
+                            "内容分类": "产品",
+                            "消费": 999.0,
+                            "激活数": 99,
+                            "首次付费次数": 9,
+                        },
+                        {
+                            "时间": "2026-05-15~2026-05-21",
+                            "标题": "空账号内容",
+                            "笔记ID": "note-included-blank",
+                            "发布作者": "",
+                            "内容分类": "产品",
+                            "消费": 888.0,
+                            "激活数": 88,
+                            "首次付费次数": 8,
+                        },
+                    ]
+                ).to_excel(writer, sheet_name="kos账号笔记投放数据", index=False)
+
+            result = analyze_input_dir(
+                raw_dir,
+                "2026-05-15",
+                "2026-05-21",
+                account_filters_path=config_path,
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            self.assertEqual(
+                set(result.canonical["content_id"]),
+                {"note-included-1", "note-included-2", "note-included-blank"},
+            )
+            self.assertEqual(set(result.canonical["account"].fillna("")), {"", "股民社区", "研习社"})
+            self.assertAlmostEqual(result.canonical["spend"].sum(), 918.0)
+            channel_summary = result.channel_summary.set_index("channel")
+            self.assertAlmostEqual(channel_summary.loc["小红书商业化", "spend"], 918.0)
+            self.assertEqual(len(result.account_filter_details), 1)
+            self.assertEqual(set(result.account_filter_details["filter_reason"]), {"不在小红书账号白名单"})
+            filter_note = result.preprocessing_report.set_index("metric").loc["小红书账号过滤排除行数", "note"]
+            self.assertIn("空账号行默认记录", filter_note)
+            self.assertNotIn("空账号小红书行不进入汇总", filter_note)
+
+    def test_xiaohongshu_account_filter_applies_to_cleaned_replay_frame(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "account_filters.yml"
+            config_path.write_text(
+                """
+xiaohongshu:
+  include_accounts:
+    - 股民社区
+    - 研习社
+  aliases:
+    同顺股民社区: 股民社区
+    同花顺研习社: 研习社
+  exclude_blank: true
+""".strip(),
+                encoding="utf-8",
+            )
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "channel": "小红书商业化",
+                        "content_id": "note-included-1",
+                        "title": "股民社区内容",
+                        "account": "同顺股民社区",
+                        "manual_category": "投教",
+                        "spend": 10.0,
+                        "activations": 1,
+                        "first_pay_count": 1,
+                    },
+                    {
+                        "channel": "小红书商业化",
+                        "content_id": "note-included-2",
+                        "title": "研习社内容",
+                        "account": "同花顺研习社",
+                        "manual_category": "投教",
+                        "spend": 20.0,
+                        "activations": 2,
+                        "first_pay_count": 1,
+                    },
+                    {
+                        "channel": "小红书商业化",
+                        "content_id": "note-excluded-etf",
+                        "title": "ETF内容",
+                        "account": "同花顺ETF",
+                        "manual_category": "产品",
+                        "spend": 999.0,
+                        "activations": 99,
+                        "first_pay_count": 9,
+                    },
+                    {
+                        "channel": "小红书商业化",
+                        "content_id": "note-included-blank",
+                        "title": "空账号内容",
+                        "account": "",
+                        "manual_category": "产品",
+                        "spend": 888.0,
+                        "activations": 88,
+                        "first_pay_count": 8,
+                    },
+                    {
+                        "channel": "抖音商业化",
+                        "content_id": "dy-kept",
+                        "title": "抖音内容",
+                        "account": "",
+                        "manual_category": "投教",
+                        "spend": 50.0,
+                        "activations": 5,
+                        "first_pay_count": 1,
+                    },
+                ]
+            )
+
+            result = analyze_canonical_frame(
+                canonical,
+                "2026-05-15",
+                "2026-05-21",
+                account_filters_path=config_path,
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            self.assertEqual(
+                set(result.canonical["content_id"]),
+                {"note-included-1", "note-included-2", "note-included-blank", "dy-kept"},
+            )
+            self.assertEqual(
+                set(result.canonical[result.canonical["channel"].eq("小红书商业化")]["account"].fillna("")),
+                {"", "股民社区", "研习社"},
+            )
+            self.assertEqual(len(result.account_filter_details), 1)
+            self.assertAlmostEqual(result.channel_summary.set_index("channel").loc["小红书商业化", "spend"], 918.0)
+
+    def test_xiaohongshu_market_reads_all_metric_sheets(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            raw_dir.mkdir()
+            with pd.ExcelWriter(raw_dir / "小红书市场部.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "笔记/素材ID": "note-new",
+                            "标题": "新户内容",
+                            "账号": "问财",
+                            "消费": 10.0,
+                            "展现量": 100,
+                            "点击量": 10,
+                            "激活数": 2,
+                            "首次付费次数": 1,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="新户", index=False)
+                pd.DataFrame(
+                    [
+                        {
+                            "笔记/素材ID": "note-old-1",
+                            "标题": "老户内容1",
+                            "账号": "投资号",
+                            "消费": 20.0,
+                            "展现量": 200,
+                            "点击量": 20,
+                            "激活数": 4,
+                            "首次付费次数": 2,
+                        },
+                        {
+                            "笔记/素材ID": "note-old-2",
+                            "标题": "老户内容2",
+                            "账号": "财经号",
+                            "消费": 30.0,
+                            "展现量": 300,
+                            "点击量": 30,
+                            "激活数": 6,
+                            "首次付费次数": 3,
+                        },
+                    ]
+                ).to_excel(writer, sheet_name="老户", index=False)
+
+            result = analyze_input_dir(
+                raw_dir,
+                "2026-05-01",
+                "2026-05-31",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            xhs = result.canonical[result.canonical["channel"].eq("小红书市场部")]
+            self.assertEqual(len(xhs), 3)
+            self.assertEqual(set(xhs["source_sheet"]), {"新户", "老户"})
+            self.assertAlmostEqual(xhs["spend"].sum(), 60.0)
+            self.assertAlmostEqual(xhs["activations"].sum(), 12.0)
+            self.assertAlmostEqual(xhs["first_pay_count"].sum(), 6.0)
+
     def test_missing_manual_category_is_completed_by_injected_ai_matcher(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -326,6 +704,7 @@ class WorkflowTests(unittest.TestCase):
                         "视频标题": "一个暂时无法从标题判断的内容",
                         "视频id": "dy-unknown",
                         "素材ID": "mat-unknown",
+                        "账号": "同花顺投资",
                         "消耗": 100.0,
                         "展示数": 1000,
                         "点击数": 100,
@@ -341,6 +720,8 @@ class WorkflowTests(unittest.TestCase):
                         "视频标题": "人工标记内容",
                         "视频id": "dy-manual",
                         "素材ID": "mat-manual",
+                        "账号": "同花顺投资",
+                        "账号": "同花顺投资",
                         "消耗": 120,
                         "展示数": 10000,
                         "点击数": 500,
@@ -384,6 +765,7 @@ class WorkflowTests(unittest.TestCase):
                         "视频标题": "短线交易高手如何控制回撤",
                         "视频id": "dy-keyword",
                         "素材ID": "mat-keyword",
+                        "账号": "同花顺投资",
                         "消耗": 100.0,
                         "展示数": 1000,
                         "点击数": 100,
@@ -467,6 +849,7 @@ class WorkflowTests(unittest.TestCase):
                         "视频标题": "短线交易高手聊板块轮动",
                         "视频id": "dy-manual",
                         "素材ID": "mat-manual",
+                        "账号": "同花顺投资",
                         "消耗": 120,
                         "展示数": 10000,
                         "点击数": 500,
@@ -500,6 +883,7 @@ class WorkflowTests(unittest.TestCase):
                         "视频标题": "一个暂时无法从标题判断的内容",
                         "视频id": "dy-unknown",
                         "素材ID": "mat-unknown",
+                        "账号": "同花顺投资",
                         "消耗": 100.0,
                         "展示数": 1000,
                         "点击数": 100,
@@ -515,6 +899,7 @@ class WorkflowTests(unittest.TestCase):
                         "视频标题": "人工标记内容",
                         "视频id": "dy-manual",
                         "素材ID": "mat-manual",
+                        "账号": "同花顺投资",
                         "消耗": 120,
                         "展示数": 10000,
                         "点击数": 500,
@@ -686,14 +1071,14 @@ class WorkflowTests(unittest.TestCase):
 
             bilibili = canonical[canonical["content_id"].eq("bv1")].iloc[0]
             xhs = canonical[canonical["content_id"].eq("note-1")].iloc[0]
-            douyin_without_account = canonical[canonical["content_id"].eq("dy-m-1")].iloc[0]
+            douyin_market = canonical[canonical["content_id"].eq("dy-m-1")].iloc[0]
 
             self.assertEqual(bilibili["account_id"], "1622777305")
             self.assertEqual(bilibili["account"], "同花顺投资")
             self.assertEqual(bilibili["author"], "同花顺投资")
             self.assertEqual(xhs["account"], "同花顺理财")
             self.assertEqual(xhs["author"], "同花顺理财")
-            self.assertEqual(douyin_without_account["account"], "")
+            self.assertEqual(douyin_market["account"], "同花顺投资")
 
     def test_reference_tables_initialize_account_mapping_and_period_from_raw_dir(self):
         with TemporaryDirectory() as tmp:
@@ -757,12 +1142,13 @@ class WorkflowTests(unittest.TestCase):
                 category_matcher=lambda items, category_library, env_path: {},
             )
 
+            self.assertEqual(len(result.canonical), 1)
             row = result.canonical.iloc[0]
             self.assertEqual(row["account_id"], "999999")
             self.assertEqual(row["account"], "")
-            self.assertEqual(row["account_mapping_source"], "未匹配")
-            self.assertTrue(row["needs_manual_review"])
+            self.assertEqual(row["account_filter_status"], "")
             self.assertIn("账号映射缺失", row["review_reasons"])
+            self.assertTrue(result.account_filter_details.empty)
 
     def test_channel_dedupe_sums_large_numeric_conflicts_and_marks_review(self):
         with TemporaryDirectory() as tmp:
@@ -875,6 +1261,7 @@ class WorkflowTests(unittest.TestCase):
                         {
                             "笔记/素材ID": "xhs-market-1",
                             "笔记/素材链接": "https://xhs.example/1",
+                            "账号": "问财",
                             "消费": 10,
                             "展现量": 100,
                             "点击量": 20,
@@ -927,6 +1314,7 @@ class WorkflowTests(unittest.TestCase):
                     [
                         {
                             "视频链接": "https://douyin.example/video/1",
+                            "账号": "同花顺投资",
                             "消耗": 40,
                             "展示数": 400,
                             "激活数": 6,
@@ -1025,6 +1413,7 @@ class WorkflowTests(unittest.TestCase):
                             "视频AVID": "av-unknown",
                             "视频BVID": "bv-unknown",
                             "视频标题": "一个暂时无法从标题判断的内容",
+                            "Up主mid": "1622777305",
                             "花费": 100.0,
                             "展示量": 0,
                             "点击量": 10,
@@ -1040,7 +1429,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("一级分类缺失率", quality.index)
             self.assertIn("二级分类缺失率", quality.index)
             self.assertEqual(quality.loc["展示为0但点击大于0", "count"], 1)
-            self.assertEqual(len(result.review_queue), 0)
+            self.assertEqual(len(result.review_queue), 1)
 
             workbook = load_workbook(result.analysis_xlsx, read_only=True)
             self.assertIn("数据质量报告", workbook.sheetnames)
@@ -1085,6 +1474,7 @@ class WorkflowTests(unittest.TestCase):
                 set(workbook.sheetnames),
                 {
                     "总表",
+                    "复盘统一字段",
                     "分渠道总数据",
                     "分渠道栏目题材排名",
                     "内容类型分级表",
@@ -1092,6 +1482,8 @@ class WorkflowTests(unittest.TestCase):
                     "字段映射表",
                     "账号映射表",
                     "账号内容类型对照表",
+                    "账号过滤规则",
+                    "账号过滤明细",
                     "原始分类统计",
                     "缺失分类清单",
                     "人工审核表",
@@ -1122,6 +1514,7 @@ class WorkflowTests(unittest.TestCase):
                             "视频标题": "有曝光但无消耗的内容",
                             "视频id": "dy-organic",
                             "视频链接": "https://douyin.example/organic",
+                            "账号": "同花顺投资",
                             "内容类型": "股友说",
                             "消耗": "",
                             "展示数": 5317,
@@ -1277,6 +1670,7 @@ class WorkflowTests(unittest.TestCase):
                 workbook.sheetnames,
                 [
                     "总表",
+                    "复盘统一字段",
                     "分渠道总数据",
                     "分渠道栏目题材排名",
                     "内容类型分级表",

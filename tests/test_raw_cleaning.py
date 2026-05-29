@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -27,7 +28,7 @@ def _bilibili_row(content_id: str, title: str, spend: float = 10.0) -> dict:
         "视频AVID": content_id.replace("BV", "av"),
         "视频BVID": content_id,
         "视频标题": title,
-        "Up主mid": "123456",
+        "Up主mid": "1622777305",
         "日期": "2026-04-10",
         "花费": spend,
         "展示量": 100,
@@ -110,8 +111,10 @@ class RawCleaningTests(unittest.TestCase):
             root = Path(tmp)
             source = root / "source"
             frame = pd.DataFrame([_bilibili_row("BV001", "重复文件内容")])
-            _write_xlsx(source / "0508-0514 数据" / "B站数据.xlsx", {"Sheet1": frame})
-            _write_xlsx(source / "0508-0514 数据" / "B站数据-副本.xlsx", {"Sheet1": frame})
+            original = source / "0508-0514 数据" / "B站数据.xlsx"
+            duplicate = source / "0508-0514 数据" / "B站数据-副本.xlsx"
+            _write_xlsx(original, {"Sheet1": frame})
+            shutil.copy2(original, duplicate)
 
             buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
 
@@ -227,6 +230,298 @@ class RawCleaningTests(unittest.TestCase):
             self.assertEqual(float(cleaned["spend"].sum()), 30.0)
             self.assertEqual(float(cleaned["activations"].sum()), 6.0)
             self.assertEqual(float(cleaned["first_pay_count"].sum()), 3.0)
+
+    def test_clean_source_directory_records_every_workbook_sheet_as_imported_or_ignored(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            _write_xlsx(
+                source / "0515-0521 数据" / "抖音商业化.xlsx",
+                {
+                    "Sheet1": pd.DataFrame([{"说明": "不是投放明细"}]),
+                    "Sheet2": pd.DataFrame(
+                        [
+                            {
+                                "视频标题": "有效投放内容",
+                                "视频id": "dy-1",
+                                "素材ID": "mat-1",
+                                "消耗": 10.0,
+                                "展示数": 100,
+                                "激活数": 2,
+                                "付费次数": 1,
+                            }
+                        ]
+                    ),
+                    "空白": pd.DataFrame(),
+                },
+            )
+
+            buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
+
+            workbook_path = source / "0515-0521 数据" / "抖音商业化.xlsx"
+            expected_sheets = set(pd.ExcelFile(workbook_path).sheet_names)
+            import_log = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="导入日志")
+            ignored = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="忽略sheet")
+            recorded_sheets = set(import_log["sheet_name"].dropna().astype(str)) | set(
+                ignored["sheet_name"].dropna().astype(str)
+            )
+
+            self.assertEqual(recorded_sheets, expected_sheets)
+
+    def test_clean_source_directory_fills_douyin_grouped_image_text_content_type(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            workbook_path = source / "0527-0602 数据" / "抖音市场部数据.xlsx"
+            _write_xlsx(
+                workbook_path,
+                {
+                    "Sheet2": pd.DataFrame(
+                        [
+                            {
+                                "创建时间": "图文",
+                                "时长": "",
+                                "视频标题": "存多少钱才能提前退休",
+                                "视频链接": "",
+                                "消耗": 93768.8,
+                                "展示数": 7736899,
+                                "激活数": 2706,
+                                "付费次数": 910,
+                            },
+                            {
+                                "创建时间": "",
+                                "时长": "",
+                                "视频标题": "如何字字不提股票，但一听就是炒股人",
+                                "视频链接": "",
+                                "消耗": 15095.017,
+                                "展示数": 1642653,
+                                "激活数": 403,
+                                "付费次数": 165,
+                            },
+                            {
+                                "创建时间": "",
+                                "时长": "",
+                                "视频标题": "全国在校大学生招募",
+                                "视频链接": "",
+                                "消耗": 12967.43,
+                                "展示数": 679457,
+                                "激活数": 335,
+                                "付费次数": 111,
+                            },
+                            {
+                                "创建时间": "2026-05-30 10:00:00",
+                                "时长": "00:15",
+                                "视频标题": "普通视频内容",
+                                "视频链接": "",
+                                "消耗": 10,
+                                "展示数": 100,
+                                "激活数": 1,
+                                "付费次数": 1,
+                            },
+                        ]
+                    )
+                },
+            )
+            workbook = load_workbook(workbook_path)
+            worksheet = workbook["Sheet2"]
+            worksheet.merge_cells("A2:B4")
+            workbook.save(workbook_path)
+            workbook.close()
+
+            buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
+
+            cleaned = load_cleaned_canonical(buckets[0].cleaned_workbook)
+            image_text = cleaned[cleaned["title"].isin(
+                [
+                    "存多少钱才能提前退休",
+                    "如何字字不提股票，但一听就是炒股人",
+                    "全国在校大学生招募",
+                ]
+            )]
+            self.assertEqual(len(image_text), 3)
+            self.assertEqual(set(image_text["manual_category"]), {"图文"})
+            self.assertAlmostEqual(float(image_text["spend"].sum()), 121831.247)
+            video = cleaned[cleaned["title"].eq("普通视频内容")].iloc[0]
+            self.assertTrue(pd.isna(video["manual_category"]) or video["manual_category"] == "")
+
+    def test_clean_source_directory_sums_xiaohongshu_and_bilibili_id_duplicates_without_conflicts(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            _write_xlsx(
+                source / "0508-0514 数据" / "小红书商业化.xlsx",
+                {
+                    "kos账号笔记投放数据": pd.DataFrame(
+                        [
+                            _xiaohongshu_row("note-dup", "5.7日段永平调仓买入泡泡玛特，头像也换了！", 10.0),
+                            _xiaohongshu_row(
+                                "note-dup",
+                                "5.7日段永平调仓买入泡泡玛特，头像也换了！ #同花顺APP #同花顺资讯",
+                                20.0,
+                            ),
+                        ]
+                    )
+                },
+            )
+            _write_xlsx(
+                source / "0508-0514 数据" / "B站数据.xlsx",
+                {
+                    "Sheet1": pd.DataFrame(
+                        [
+                            _bilibili_row("BV001", "同一条B站内容", 30.0),
+                            _bilibili_row("BV001", "同一条B站内容", 30.0),
+                        ]
+                    )
+                },
+            )
+
+            buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
+
+            cleaned = load_cleaned_canonical(buckets[0].cleaned_workbook)
+            self.assertEqual(len(cleaned), 2)
+            xhs = cleaned[cleaned["channel"].eq("小红书商业化")].iloc[0]
+            bilibili = cleaned[cleaned["channel"].eq("B站")].iloc[0]
+            self.assertEqual(xhs["title"], "5.7日段永平调仓买入泡泡玛特，头像也换了！ #同花顺APP #同花顺资讯")
+            self.assertEqual(float(xhs["spend"]), 30.0)
+            self.assertEqual(float(xhs["impressions"]), 200.0)
+            self.assertEqual(float(xhs["activations"]), 4.0)
+            self.assertEqual(float(bilibili["spend"]), 60.0)
+            self.assertEqual(float(bilibili["impressions"]), 200.0)
+            self.assertEqual(float(bilibili["activations"]), 4.0)
+
+            duplicate_content = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="重复内容")
+            self.assertEqual(len(duplicate_content), 2)
+            self.assertEqual(set(duplicate_content["merged_row_count"]), {2})
+            conflicts = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="冲突项")
+            self.assertTrue(conflicts.empty)
+
+    def test_clean_source_directory_sums_bilibili_impression_aliases(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            _write_xlsx(
+                source / "0508-0514 数据" / "B站数据.xlsx",
+                {
+                    "Sheet1": pd.DataFrame(
+                        [
+                            {
+                                "视频AVID": "av001",
+                                "视频BVID": "BV001",
+                                "视频标题": "B站展示量别名内容",
+                                "花费": 30.0,
+                                "视频展示量": 111,
+                                "曝光转化率": 0.12,
+                                "千次展示费用": 20.0,
+                                "点击量": 10,
+                                "应用激活数": 2,
+                                "应用内首次付费次数": 1,
+                            },
+                            {
+                                "视频AVID": "av001",
+                                "视频BVID": "BV001",
+                                "视频标题": "B站展示量别名内容",
+                                "花费": 40.0,
+                                "曝光量(次)": 222,
+                                "点击量": 20,
+                                "应用激活数": 3,
+                                "应用内首次付费次数": 2,
+                            },
+                        ]
+                    )
+                },
+            )
+
+            buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
+
+            cleaned = load_cleaned_canonical(buckets[0].cleaned_workbook)
+            bilibili = cleaned[cleaned["channel"].eq("B站")].iloc[0]
+            self.assertEqual(float(bilibili["impressions"]), 333.0)
+            self.assertEqual(float(bilibili["spend"]), 70.0)
+            self.assertEqual(float(bilibili["activations"]), 5.0)
+            self.assertEqual(float(bilibili["first_pay_count"]), 3.0)
+
+    def test_clean_source_directory_applies_ledger_and_writes_channel_clean_workbook(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            period_dir = source / "0508-0514 数据"
+            _write_xlsx(
+                period_dir / "原生内容投稿.xlsx",
+                {
+                    "抖音渠道": pd.DataFrame(
+                        [
+                            {
+                                "编号": 1,
+                                "投稿时间": "05 12",
+                                "内容链接": "1.28 tRk:/ 人和人的缘分就像炒股 # 同花顺股友说 # 投资 https://v.douyin.com/abc/ 复制此链接，打开抖音搜索，直接观看视频！",
+                                "账号": "投资号",
+                                "内容类型": "股友说",
+                            }
+                        ]
+                    )
+                },
+            )
+            _write_xlsx(
+                period_dir / "抖音商业化.xlsx",
+                {
+                    "Sheet2": pd.DataFrame(
+                        [
+                            {
+                                "视频标题": "人和人的缘分就像炒股 #投资",
+                                "消耗": 90,
+                                "展示数": 9000,
+                                "激活数": 9,
+                                "付费次数": 3,
+                            }
+                        ]
+                    )
+                },
+            )
+
+            buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
+
+            bucket = buckets[0]
+            cleaned = load_cleaned_canonical(bucket.cleaned_workbook)
+            row = cleaned.iloc[0]
+            self.assertEqual(row["account"], "投资号")
+            self.assertEqual(row["manual_category"], "股友说")
+            self.assertEqual(row["content_url"], "https://v.douyin.com/abc/")
+            self.assertEqual(row["ledger_match_source"], "唯一标题")
+            self.assertEqual(row["manual_category_source"], "投稿台账补全")
+
+            channel_clean = bucket.raw_dir / "channel_clean" / "抖音商业化_clean.xlsx"
+            self.assertTrue(channel_clean.exists())
+            display = pd.read_excel(channel_clean, sheet_name="清理后明细")
+            self.assertEqual(
+                list(display.columns),
+                [
+                    "周期",
+                    "渠道",
+                    "账号",
+                    "内容类型",
+                    "内容分类",
+                    "标题",
+                    "id/BV或者唯一标识",
+                    "内容链接",
+                    "消耗",
+                    "曝光量",
+                    "激活数",
+                    "激活成本",
+                    "付费",
+                    "付费成本",
+                    "匹配来源",
+                    "复核原因",
+                ],
+            )
+            display_row = display.iloc[0]
+            self.assertEqual(display_row["渠道"], "抖音商业化")
+            self.assertEqual(display_row["账号"], "投资号")
+            self.assertEqual(display_row["内容类型"], "股友说")
+            self.assertEqual(display_row["内容分类"], "股友说")
+            self.assertEqual(display_row["id/BV或者唯一标识"], "人和人的缘分就像炒股")
+            self.assertEqual(display_row["内容链接"], "https://v.douyin.com/abc/")
+            self.assertEqual(display_row["匹配来源"], "唯一标题")
+            self.assertTrue(pd.isna(display_row["复核原因"]) or display_row["复核原因"] == "")
 
     def test_clean_source_directory_generates_row_ids_for_identityless_social_details_and_excludes_total(self):
         with TemporaryDirectory() as tmp:
@@ -436,7 +731,7 @@ class RawCleaningTests(unittest.TestCase):
             self.assertEqual(list(result.canonical["content_id"]), ["BV001"])
             self.assertNotIn("噪声人工统计.xlsx", set(result.canonical["source_file"]))
 
-    def test_archived_workflow_backfills_metric_counts_from_cleaned_raw_columns(self):
+    def test_archived_workflow_backfills_core_metrics_from_cleaned_raw_columns(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             raw_dir = root / "data" / "raw" / "20260515-20260521"
@@ -447,23 +742,31 @@ class RawCleaningTests(unittest.TestCase):
                     "清洗后明细": pd.DataFrame(
                         [
                             {
-                                "platform": "小红书商业化",
-                                "platform_group": "小红书",
-                                "channel": "小红书商业化",
-                                "content_id": "note-cleaned",
-                                "material_id": "note-cleaned",
-                                "title": "清洗后小红书内容",
+                                "platform": "B站",
+                                "platform_group": "B站",
+                                "channel": "B站",
+                                "content_id": "BV-cleaned",
+                                "material_id": "BV-cleaned",
+                                "account_id": "1622777305",
+                                "title": "清洗后B站内容",
                                 "manual_category": "产品科普",
-                                "spend": 100.0,
-                                "impressions": 1000,
-                                "clicks": 100,
+                                "spend": pd.NA,
+                                "impressions": pd.NA,
+                                "clicks": pd.NA,
                                 "activations": pd.NA,
                                 "first_pay_count": pd.NA,
-                                "source_file": "小红书商业化.xlsx",
-                                "source_sheet": "kos账号笔记投放数据",
+                                "source_file": "B站.xlsx",
+                                "source_sheet": "Sheet1",
                                 "source_row": 2,
-                                "raw__小红书商业化__APP激活数": 11,
-                                "raw__小红书商业化__首次付费数": 4,
+                                "raw__B站__总花费": 100.0,
+                                "raw__B站__视频展示量": 4321,
+                                "raw__B站__曝光转化率": 0.12,
+                                "raw__B站__千次展示费用": 23.5,
+                                "raw__B站__点击量": 321,
+                                "raw__B站__APP激活数": 11,
+                                "raw__B站__激活成本": 9.1,
+                                "raw__B站__首次付费数": 4,
+                                "raw__B站__付费成本": 25.0,
                             }
                         ]
                     )
@@ -486,11 +789,16 @@ class RawCleaningTests(unittest.TestCase):
             )
 
             row = result.canonical.iloc[0]
+            self.assertAlmostEqual(row["spend"], 100.0)
+            self.assertAlmostEqual(row["impressions"], 4321.0)
+            self.assertAlmostEqual(row["clicks"], 321.0)
             self.assertAlmostEqual(row["activations"], 11.0)
             self.assertAlmostEqual(row["first_pay_count"], 4.0)
             channel_summary = result.channel_summary.set_index("channel")
-            self.assertAlmostEqual(channel_summary.loc["小红书商业化", "activations"], 11.0)
-            self.assertAlmostEqual(channel_summary.loc["小红书商业化", "first_pay_count"], 4.0)
+            self.assertAlmostEqual(channel_summary.loc["B站", "spend"], 100.0)
+            self.assertAlmostEqual(channel_summary.loc["B站", "impressions"], 4321.0)
+            self.assertAlmostEqual(channel_summary.loc["B站", "activations"], 11.0)
+            self.assertAlmostEqual(channel_summary.loc["B站", "first_pay_count"], 4.0)
 
     def test_reset_runtime_data_clears_generated_runtime_dirs_and_reinitializes_db(self):
         with TemporaryDirectory() as tmp:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 import re
+from tempfile import TemporaryDirectory
 from typing import Iterable, Protocol
 
 from .source_channels import infer_channel_from_path
@@ -25,6 +26,13 @@ class UploadedFileLike(Protocol):
 class MaterializedUploads:
     raw_dir: Path
     original_files: list[Path]
+
+
+@dataclass(frozen=True)
+class UploadChannelConflict:
+    channel: str
+    existing_files: list[Path]
+    incoming_files: list[str]
 
 
 def infer_period_from_upload_names(
@@ -50,41 +58,55 @@ def materialize_uploaded_files(
 ) -> MaterializedUploads:
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    originals_dir = target_dir.parent / "uploaded_originals"
-    originals_dir.mkdir(parents=True, exist_ok=True)
-    original_files: list[Path] = []
     normalized_uploads = [(upload, _normalize_upload_relative_path(upload.name)) for upload in uploads]
     period_root = _common_period_root(normalized_uploads) if strip_common_period_root else ""
+    incoming_channels = _incoming_channels(normalized_uploads, period_root)
+    conflicts = _channel_conflicts_for_channels(target_dir, incoming_channels)
+    if conflicts and not replace_same_channel:
+        channels = "、".join(conflict.channel for conflict in conflicts)
+        raise FileExistsError(f"本地已存在渠道：{channels}。如需替换，请确认覆盖已存在渠道。")
     if replace_same_channel:
-        incoming_channels = {
-            infer_channel_from_path(_strip_period_root(relative_path, period_root))
-            for _, relative_path in normalized_uploads
-            if relative_path.suffix.lower() != ".zip"
-        }
         _remove_channel_files(target_dir, incoming_channels)
+    if incoming_channels:
+        _invalidate_generated_period_artifacts(target_dir)
 
-    for upload, relative_path in normalized_uploads:
-        destination_relative_path = _strip_period_root(relative_path, period_root)
-        safe_name = relative_path.name
-        suffix = relative_path.suffix.lower()
-        if suffix not in SUPPORTED_UPLOAD_SUFFIXES:
-            supported = "、".join(sorted(SUPPORTED_UPLOAD_SUFFIXES))
-            raise ValueError(f"不支持的上传文件类型：{safe_name}。支持：{supported}")
+    materialized_files: list[Path] = []
+    with TemporaryDirectory() as tmp:
+        staging_dir = Path(tmp)
+        for upload, relative_path in normalized_uploads:
+            destination_relative_path = _strip_period_root(relative_path, period_root)
+            safe_name = relative_path.name
+            suffix = relative_path.suffix.lower()
+            if suffix not in SUPPORTED_UPLOAD_SUFFIXES:
+                supported = "、".join(sorted(SUPPORTED_UPLOAD_SUFFIXES))
+                raise ValueError(f"不支持的上传文件类型：{safe_name}。支持：{supported}")
+            if _is_generated_channel_clean_file(relative_path):
+                continue
 
-        original_path = originals_dir / relative_path
-        original_path.parent.mkdir(parents=True, exist_ok=True)
-        original_path.write_bytes(upload.getvalue())
-        original_files.append(original_path)
+            if suffix == ".zip":
+                staged_zip = staging_dir / relative_path.name
+                staged_zip.write_bytes(upload.getvalue())
+                extract_zip(staged_zip, target_dir)
+            else:
+                destination = target_dir / destination_relative_path
+                _validate_path_within_root(destination, target_dir, destination_relative_path.as_posix())
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(upload.getvalue())
+                materialized_files.append(destination)
 
-        if suffix == ".zip":
-            extract_zip(original_path, target_dir)
-        else:
-            destination = target_dir / destination_relative_path
-            _validate_path_within_root(destination, target_dir, destination_relative_path.as_posix())
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(original_path.read_bytes())
+    return MaterializedUploads(raw_dir=target_dir, original_files=materialized_files)
 
-    return MaterializedUploads(raw_dir=target_dir, original_files=original_files)
+
+def detect_upload_channel_conflicts(
+    uploads: Iterable[UploadedFileLike],
+    target_dir: Path,
+    *,
+    strip_common_period_root: bool = False,
+) -> list[UploadChannelConflict]:
+    normalized_uploads = [(upload, _normalize_upload_relative_path(upload.name)) for upload in uploads]
+    period_root = _common_period_root(normalized_uploads) if strip_common_period_root else ""
+    incoming_channels = _incoming_channels(normalized_uploads, period_root)
+    return _channel_conflicts_for_channels(Path(target_dir), incoming_channels, normalized_uploads, period_root)
 
 
 def _normalize_upload_relative_path(upload_name: str) -> Path:
@@ -123,6 +145,55 @@ def _strip_period_root(relative_path: Path, period_root: str) -> Path:
     return Path(*relative_path.parts[1:])
 
 
+def _incoming_channels(normalized_uploads: list[tuple[UploadedFileLike, Path]], period_root: str) -> set[str]:
+    return {
+        infer_channel_from_path(_strip_period_root(relative_path, period_root))
+        for _, relative_path in normalized_uploads
+        if relative_path.suffix.lower() != ".zip" and not _is_generated_channel_clean_file(relative_path)
+    }
+
+
+def _channel_conflicts_for_channels(
+    target_dir: Path,
+    channels: set[str],
+    normalized_uploads: list[tuple[UploadedFileLike, Path]] | None = None,
+    period_root: str = "",
+) -> list[UploadChannelConflict]:
+    if not channels or not Path(target_dir).exists():
+        return []
+    incoming_by_channel: dict[str, list[str]] = {channel: [] for channel in channels}
+    if normalized_uploads is not None:
+        for _, relative_path in normalized_uploads:
+            if relative_path.suffix.lower() == ".zip" or _is_generated_channel_clean_file(relative_path):
+                continue
+            channel = infer_channel_from_path(_strip_period_root(relative_path, period_root))
+            if channel in incoming_by_channel:
+                incoming_by_channel[channel].append(_strip_period_root(relative_path, period_root).as_posix())
+
+    existing_by_channel: dict[str, list[Path]] = {channel: [] for channel in channels}
+    for path in sorted(Path(target_dir).rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name.startswith("~$") or path.name == "period_manifest.json" or path.name == "cleaned.xlsx":
+            continue
+        if _is_generated_channel_clean_file(path):
+            continue
+        if path.suffix.lower() not in SUPPORTED_UPLOAD_SUFFIXES - {".zip"}:
+            continue
+        channel = infer_channel_from_path(path.relative_to(target_dir))
+        if channel in existing_by_channel:
+            existing_by_channel[channel].append(path)
+    return [
+        UploadChannelConflict(
+            channel=channel,
+            existing_files=files,
+            incoming_files=incoming_by_channel.get(channel, []),
+        )
+        for channel, files in sorted(existing_by_channel.items())
+        if files
+    ]
+
+
 def _remove_channel_files(target_dir: Path, channels: set[str]) -> None:
     if not channels:
         return
@@ -131,9 +202,21 @@ def _remove_channel_files(target_dir: Path, channels: set[str]) -> None:
             continue
         if path.name.startswith("~$") or path.name == "period_manifest.json":
             continue
+        if _is_generated_channel_clean_file(path):
+            continue
         if path.suffix.lower() not in SUPPORTED_UPLOAD_SUFFIXES - {".zip"}:
             continue
         if infer_channel_from_path(path.relative_to(target_dir)) in channels:
+            path.unlink()
+
+
+def _invalidate_generated_period_artifacts(target_dir: Path) -> None:
+    for name in ["cleaned.xlsx", "period_manifest.json"]:
+        path = Path(target_dir) / name
+        if path.exists():
+            path.unlink()
+    for path in sorted(Path(target_dir).rglob("*")):
+        if path.is_file() and _is_generated_channel_clean_file(path):
             path.unlink()
 
 
@@ -159,3 +242,7 @@ def _parse_folder_date(value: str) -> date | None:
         return date(int(value[0:4]), int(value[4:6]), int(value[6:8]))
     except ValueError:
         return None
+
+
+def _is_generated_channel_clean_file(path: Path) -> bool:
+    return Path(path).stem.lower().endswith("_clean")

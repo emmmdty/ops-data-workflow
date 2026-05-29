@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date
 from pathlib import Path
 import re
 from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 import pandas as pd
 
+from .account_filters import apply_account_filters, load_account_filter_config
 from .categories import category_from_tags, load_category_rules, suggest_category
+from .content_ledger import account_match_label, apply_content_ledger, load_content_ledger
 from .reference_tables import (
     ReferenceTables,
     account_mapping_lookup,
@@ -34,6 +37,9 @@ STANDARD_COLUMNS = [
     "account_id",
     "account",
     "account_mapping_source",
+    "account_normalized",
+    "account_filter_status",
+    "account_filter_reason",
     "author",
     "cover_url",
     "content_url",
@@ -74,18 +80,33 @@ STANDARD_COLUMNS = [
 
 INTERNAL_COMPAT_COLUMNS = {"platform", "platform_group"}
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
-COUNT_METRIC_COLUMNS = {"activations", "first_pay_count"}
-COUNT_METRIC_EXCLUDE_KEYWORDS = (
+CORE_METRIC_COLUMNS = set(NUMERIC_COLUMNS)
+CORE_METRIC_ALIAS_KEYWORDS = {
+    "spend": ("消耗", "消费", "花费", "spend"),
+    "impressions": ("展示", "曝光", "展现", "impression"),
+    "clicks": ("点击", "click"),
+    "activations": ("激活", "activation"),
+    "first_pay_count": ("首次付费", "应用内付费", "付费次数", "付费数", "注册次数", "firstpay"),
+}
+CORE_METRIC_EXCLUDE_KEYWORDS = (
     "成本",
     "率",
     "单价",
     "均价",
+    "千次",
     "cost",
     "rate",
     "cpa",
+    "cpm",
     "ctr",
     "cvr",
 )
+CORE_METRIC_SPECIFIC_EXCLUDE_KEYWORDS = {
+    "impressions": ("费用", "金额", "花费", "消耗", "消费"),
+    "clicks": ("费用", "金额", "花费", "消耗", "消费"),
+    "activations": ("费用", "金额", "花费", "消耗", "消费"),
+    "first_pay_count": ("费用", "金额", "花费", "消耗", "消费", "收入"),
+}
 
 
 @dataclass(frozen=True)
@@ -107,19 +128,13 @@ class AnalysisData:
     duplicate_merge_details: pd.DataFrame
     conflict_retention_details: pd.DataFrame
     missing_value_details: pd.DataFrame
+    account_filter_rules: pd.DataFrame
+    account_filter_details: pd.DataFrame
     reference_tables: ReferenceTables
 
 
 EXPECTED_ACCOUNTS: Dict[str, List[str]] = {
-    "小红书": [
-        "同花顺投资",
-        "同花顺股民社区",
-        "同花顺理财",
-        "同顺财经",
-        "问财",
-        "喵懂投资",
-        "同花顺新手福利官",
-    ],
+    "小红书": ["同花顺投资", "同顺股民社区", "同花顺理财", "同顺财经", "问财", "喵懂投资"],
     "抖音": [
         "同花顺投资",
         "同花顺股民社区",
@@ -146,62 +161,35 @@ def analyze_input_dir(
     category_matcher: Optional[CategoryMatcher] = None,
     category_mappings: Optional[CategoryMappings] = None,
     reference_tables_path: Optional[Path] = None,
+    account_filters_path: Optional[Path] = None,
+    douyin_id_bridge: Optional[pd.DataFrame] = None,
 ) -> AnalysisData:
     input_dir = Path(input_dir)
-    rules = load_category_rules(category_rules_path)
-    references = load_reference_tables(reference_tables_path or Path("config/reference_tables.xlsx"))
-    frames = _read_available_sources(input_dir, references)
-    if not frames:
-        raise FileNotFoundError("未找到可识别的渠道数据文件，请上传 Excel、CSV 或 zip。")
     raw_category_stats = collect_raw_category_stats(input_dir)
-    canonical = pd.concat(frames, ignore_index=True)
-    canonical["period_start"] = period_start
-    canonical["period_end"] = period_end
-    canonical = _normalize_social_dimensions(canonical)
-    canonical = _apply_account_mappings(canonical, references)
-    preprocessing = _preprocess_canonical(canonical)
-    canonical = preprocessing["canonical"]
-    canonical = _complete_categories(
-        canonical,
-        rules,
-        references=references,
+    from .periods import period_metadata_from_dates
+    from .raw_cleaning import clean_raw_period_dir, cleaned_workbook_in_dir, load_cleaned_canonical
+
+    cleaned_workbook = cleaned_workbook_in_dir(input_dir)
+    if cleaned_workbook is None:
+        period = period_metadata_from_dates(period_start, period_end)
+        clean_raw_period_dir(input_dir, period, default_year=_default_year_from_period(period_start, period_end))
+        cleaned_workbook = cleaned_workbook_in_dir(input_dir)
+    if cleaned_workbook is None:
+        raise FileNotFoundError("未找到可识别的渠道数据文件，请上传 Excel、CSV 或 zip。")
+
+    analysis = analyze_canonical_frame(
+        load_cleaned_canonical(cleaned_workbook),
+        period_start,
+        period_end,
+        category_rules_path,
         env_path=env_path,
         category_matcher=category_matcher,
         category_mappings=category_mappings or {},
+        reference_tables_path=reference_tables_path,
+        account_filters_path=account_filters_path,
+        douyin_id_bridge=douyin_id_bridge,
     )
-    canonical = _derive_metrics(canonical)
-    data_quality = _build_data_quality_report(canonical)
-    preprocessing_report = _build_preprocessing_report(canonical, preprocessing, data_quality)
-    review_queue = _build_review_queue(canonical)
-    channel_summary = _summarize_channels(canonical)
-    platform_summary = _summarize_platforms(canonical)
-    platform_category_summary = _summarize_platform_categories(canonical)
-    total_summary = _make_total_summary(canonical)
-    category_summary = _summarize_categories(canonical)
-    pending = canonical[canonical["content_category"].map(_is_blank)].copy()
-    account_audit = _build_account_audit(canonical)
-    top_content_items = _summarize_top_content(canonical)
-    cover_metrics = _summarize_cover_metrics(canonical)
-    return AnalysisData(
-        canonical=canonical,
-        category_summary=category_summary,
-        channel_summary=channel_summary,
-        platform_summary=platform_summary,
-        platform_category_summary=platform_category_summary,
-        total_summary=total_summary,
-        raw_category_stats=raw_category_stats,
-        pending_categories=pending,
-        account_audit=account_audit,
-        top_content_items=top_content_items,
-        cover_metrics=cover_metrics,
-        data_quality=data_quality,
-        review_queue=review_queue,
-        preprocessing_report=preprocessing_report,
-        duplicate_merge_details=preprocessing["duplicate_merge_details"],
-        conflict_retention_details=preprocessing["conflict_retention_details"],
-        missing_value_details=preprocessing["missing_value_details"],
-        reference_tables=references,
-    )
+    return replace(analysis, raw_category_stats=raw_category_stats)
 
 
 def analyze_canonical_frame(
@@ -214,20 +202,30 @@ def analyze_canonical_frame(
     category_matcher: Optional[CategoryMatcher] = None,
     category_mappings: Optional[CategoryMappings] = None,
     reference_tables_path: Optional[Path] = None,
+    account_filters_path: Optional[Path] = None,
+    douyin_id_bridge: Optional[pd.DataFrame] = None,
 ) -> AnalysisData:
     rules = load_category_rules(category_rules_path)
     references = load_reference_tables(reference_tables_path or Path("config/reference_tables.xlsx"))
+    account_filters = load_account_filter_config(account_filters_path or Path("config/account_filters.yml"))
     prepared = canonical.copy()
+    had_account_raw = "account_raw" in prepared.columns
     for column in STANDARD_COLUMNS:
         if column not in prepared.columns:
             prepared[column] = ""
-    prepared = _backfill_count_metric_aliases(prepared)
+    if not had_account_raw:
+        prepared["account_raw"] = prepared["account"]
+    prepared = _normalize_replayed_canonical_columns(prepared)
+    prepared = _backfill_core_metric_aliases(prepared)
     for column in NUMERIC_COLUMNS:
         prepared[column] = prepared[column].map(parse_number)
     prepared["period_start"] = period_start
     prepared["period_end"] = period_end
     prepared = _normalize_social_dimensions(prepared)
     prepared = _apply_account_mappings(prepared, references)
+    if douyin_id_bridge is not None and not douyin_id_bridge.empty:
+        prepared = apply_content_ledger(prepared, pd.DataFrame(), douyin_id_bridge=douyin_id_bridge)
+    prepared, account_filter_details = apply_account_filters(prepared, account_filters)
     preprocessing = _preprocess_canonical(prepared)
     prepared = preprocessing["canonical"]
     prepared = _complete_categories(
@@ -240,7 +238,7 @@ def analyze_canonical_frame(
     )
     prepared = _derive_metrics(prepared)
     data_quality = _build_data_quality_report(prepared)
-    preprocessing_report = _build_preprocessing_report(prepared, preprocessing, data_quality)
+    preprocessing_report = _build_preprocessing_report(prepared, preprocessing, data_quality, account_filter_details)
     review_queue = _build_review_queue(prepared)
     channel_summary = _summarize_channels(prepared)
     platform_summary = _summarize_platforms(prepared)
@@ -248,7 +246,7 @@ def analyze_canonical_frame(
     total_summary = _make_total_summary(prepared)
     category_summary = _summarize_categories(prepared)
     pending = prepared[prepared["content_category"].map(_is_blank)].copy()
-    account_audit = _build_account_audit(prepared)
+    account_audit = _build_account_audit(prepared, expected_accounts=account_filters.expected_accounts_by_platform())
     top_content_items = _summarize_top_content(prepared)
     cover_metrics = _summarize_cover_metrics(prepared)
     return AnalysisData(
@@ -269,70 +267,73 @@ def analyze_canonical_frame(
         duplicate_merge_details=preprocessing["duplicate_merge_details"],
         conflict_retention_details=preprocessing["conflict_retention_details"],
         missing_value_details=preprocessing["missing_value_details"],
+        account_filter_rules=account_filters.to_frame(),
+        account_filter_details=account_filter_details,
         reference_tables=references,
     )
 
 
-def _read_available_sources(input_dir: Path, references: ReferenceTables) -> List[pd.DataFrame]:
-    frames: List[pd.DataFrame] = []
-    used: set[Path] = set()
-    reader_specs = [
-        (["B站"], _read_bilibili),
-        (["小红书", "市场部"], _read_xiaohongshu_market),
-        (["小红书"], _read_xiaohongshu),
-        (["抖音", "达人"], _read_douyin_generic),
-        (["抖音", "商业化"], _read_douyin_commercial),
-        (["抖音", "市场部"], _read_douyin_market),
-        (["微信", "市场部"], _read_social_market),
-        (["腾讯", "市场部"], _read_social_market),
-        (["视频号"], _read_social_market),
+def _normalize_replayed_canonical_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy()
+    identifier_columns = {"content_id", "material_id", "account_id"}
+    text_columns = [
+        "platform",
+        "platform_group",
+        "channel",
+        "period_start",
+        "period_end",
+        "content_id",
+        "material_id",
+        "title",
+        "account_raw",
+        "account_id",
+        "account",
+        "account_mapping_source",
+        "account_normalized",
+        "account_filter_status",
+        "account_filter_reason",
+        "author",
+        "cover_url",
+        "content_url",
+        "category_l1",
+        "category_l2",
+        "category_l3",
+        "category_source",
+        "category_l2_source",
+        "review_status",
+        "primary_category",
+        "manual_category",
+        "ai_category",
+        "content_category",
+        "category_status",
+        "dedupe_key",
+        "conflict_details",
+        "review_reasons",
+        "source_file",
+        "source_sheet",
+        "source_file_hash",
+        "duplicate_group_id",
+        "review_action",
+        "ledger_match_source",
+        "ledger_match_key",
+        "ledger_content_type",
+        "ledger_content_type_review",
+        "ledger_filter_status",
+        "ledger_source_file",
+        "ledger_source_sheet",
+        "ledger_source_row",
+        "match_risk_level",
+        "match_risk_reason",
+        "manual_category_source",
     ]
-    for tokens, reader in reader_specs:
-        try:
-            path = _find_file(input_dir, tokens)
-        except FileNotFoundError:
+    for column in text_columns:
+        if column not in normalized.columns:
             continue
-        try:
-            frame = reader(path)
-        except Exception as exc:
-            raise ValueError(f"{path.name} 解析失败：{exc}") from exc
-        if not frame.empty:
-            frames.append(frame)
-            used.add(path.resolve())
-
-    for path in _iter_tabular_files(input_dir):
-        if path.resolve() in used or path.name.startswith("~$"):
-            continue
-        frame = _read_optional_source(path, references)
-        if frame is not None and not frame.empty:
-            frames.append(frame)
-    return frames
-
-
-def _read_optional_source(path: Path, references: ReferenceTables) -> Optional[pd.DataFrame]:
-    name = path.name
-    if "抖音" in name:
-        return _read_douyin_generic(path)
-    if "小红书" in name and "市场部" in name:
-        return _read_xiaohongshu_market(path)
-    if "小红书" in name:
-        return _read_xiaohongshu(path)
-    if "B站" in name:
-        return _read_bilibili(path)
-    if "微信" in name or "腾讯" in name or "视频号" in name:
-        return _read_social_market(path)
-    columns = _read_first_available_columns(path)
-    if {"视频BVID", "花费", "展示量"}.issubset(columns) or {"视频AVID", "应用激活数"}.issubset(columns):
-        return _read_bilibili(path)
-    if {"笔记ID", "消费", "展现量"}.issubset(columns):
-        return _read_xiaohongshu(path)
-    if {"视频标题", "消耗", "展示数"}.issubset(columns):
-        return _read_douyin_generic(path)
-    if {"创意名称", "花费"}.issubset(columns) or {"链接", "花费"}.issubset(columns):
-        return _read_social_market(path)
-    if path.suffix.lower() in {".xls", ".xlsx"}:
-        return _read_generic_channel(path, references)
-    return None
+        if column in identifier_columns:
+            normalized[column] = normalized[column].map(_clean_identifier)
+        else:
+            normalized[column] = normalized[column].map(lambda value: "" if _is_blank(value) else str(value).strip())
+    return normalized
 
 
 def _find_file(input_dir: Path, tokens: Iterable[str]) -> Path:
@@ -345,252 +346,6 @@ def _find_file(input_dir: Path, tokens: Iterable[str]) -> Path:
         joined = " / ".join(tokens)
         raise FileNotFoundError(f"未找到包含 {joined} 的平台数据文件")
     return sorted(candidates)[0]
-
-
-def _read_bilibili(path: Path) -> pd.DataFrame:
-    raw = _read_named_or_first_matching_sheet(path, "sheet1", ["视频BVID", "视频bvid", "花费", "求和项:总花费"])
-    return _standardize(
-        raw,
-        platform="B站",
-        platform_group="B站",
-        channel="B站",
-        source_file=path.name,
-        fields={
-            "content_id": ["视频BVID", "视频bvid", "视频AVID", "视频avid", "单元名称"],
-            "material_id": ["素材中心id", "素材中心ID", "视频BVID", "视频bvid", "单元名称"],
-            "title": ["视频标题", "单元名称"],
-            "account_id": ["Up主mid", "UID", "uid", "mid"],
-            "account": ["Up主名称", "UP主名称", "UP主昵称", "账号名称"],
-            "cover_url": ["素材url"],
-            "content_url": ["视频链接", "素材url"],
-            "primary_category": [],
-            "spend": ["花费", "总花费", "求和项:总花费"],
-            "impressions": ["展示量", "求和项:展示量"],
-            "clicks": ["点击量", "求和项:点击量"],
-            "activations": ["应用激活数", "求和项:应用激活数"],
-            "first_pay_count": ["应用内付费", "应用内首次付费次数", "求和项:应用内首次付费次数"],
-        },
-    )
-
-
-def _read_xiaohongshu(path: Path) -> pd.DataFrame:
-    raw = _read_named_or_first_matching_sheet(path, "kos账户投放数据", ["笔记ID", "消费"])
-    if _is_csv(path):
-        content_map = pd.DataFrame()
-    else:
-        try:
-            content_map = _read_table(path, sheet_name="内容表格", header=1)
-        except Exception:
-            content_map = pd.DataFrame()
-    if {"笔记ID", "内容类型"}.issubset(content_map.columns):
-        mapping = (
-            content_map[["笔记ID", "内容类型"]]
-            .dropna(subset=["笔记ID"])
-            .drop_duplicates(subset=["笔记ID"], keep="first")
-            .rename(columns={"内容类型": "内容类型_映射"})
-        )
-        raw = raw.merge(mapping, on="笔记ID", how="left")
-        raw["内容类别_解析"] = _first_non_blank(raw, ["内容分类", "内容类型", "内容类型_映射"])
-        raw["类别来源_解析"] = raw.apply(_xiaohongshu_category_status, axis=1)
-    else:
-        raw["内容类别_解析"] = _first_non_blank(raw, ["内容分类", "内容类型"])
-        raw["类别来源_解析"] = ""
-
-    return _standardize(
-        raw,
-        platform="小红书商业化",
-        platform_group="小红书",
-        channel="小红书商业化",
-        source_file=path.name,
-        fields={
-            "content_id": ["笔记ID"],
-            "material_id": ["笔记ID"],
-            "title": ["标题"],
-            "account_id": ["作者ID", "用户ID", "小红书号", "账号ID"],
-            "account": ["发布作者"],
-            "cover_url": ["封面", "封面图", "图片链接"],
-            "content_url": ["笔记链接"],
-            "primary_category": ["类型"],
-            "manual_category": ["内容类别_解析"],
-            "category_status": ["类别来源_解析"],
-            "spend": ["消费"],
-            "impressions": ["展现量"],
-            "clicks": ["点击量"],
-            "activations": ["激活数"],
-            "first_pay_count": ["首次付费次数"],
-        },
-    )
-
-
-def _read_xiaohongshu_market(path: Path) -> pd.DataFrame:
-    raw = _read_first_sheet_with_columns(path, ["消费"])
-    return _standardize(
-        raw,
-        platform="小红书市场部",
-        platform_group="小红书",
-        channel="小红书市场部",
-        source_file=path.name,
-        fields={
-            "content_id": ["笔记/素材ID", "笔记ID", "素材ID", "计划ID", "链接", "笔记/素材链接"],
-            "material_id": ["笔记/素材ID", "素材ID", "计划ID"],
-            "title": ["标题", "笔记标题", "创意名称", "计划名称", "笔记/素材链接"],
-            "account_id": ["作者ID", "用户ID", "账号ID"],
-            "account": ["发布作者", "账号", "账号名称"],
-            "cover_url": ["封面", "封面图", "图片链接"],
-            "content_url": ["笔记链接", "笔记/素材链接", "链接"],
-            "primary_category": ["类型", "营销诉求"],
-            "manual_category": ["内容分类", "内容类型"],
-            "spend": ["消费", "消耗", "花费"],
-            "impressions": ["展现量", "曝光次数", "展示数"],
-            "clicks": ["点击量", "点击次数", "点击数"],
-            "activations": ["激活数", "激活数(转化时间)", "APP激活次数"],
-            "first_pay_count": ["首次付费次数", "首次付费次数(转化时间)", "付费次数"],
-        },
-    )
-
-
-def _read_douyin_commercial(path: Path) -> pd.DataFrame:
-    raw = _read_named_or_first_matching_sheet(path, "Sheet2", ["视频标题", "消耗"])
-    return _standardize_douyin(raw, path.name, "抖音商业化")
-
-
-def _read_douyin_market(path: Path) -> pd.DataFrame:
-    raw = _read_named_or_first_matching_sheet(path, "Sheet2", ["视频标题", "消耗"])
-    return _standardize_douyin(raw, path.name, "抖音市场部")
-
-
-def _read_douyin_generic(path: Path) -> pd.DataFrame:
-    raw = _read_first_sheet_with_columns(path, ["视频标题", "消耗"])
-    stem = path.stem
-    if "市场部" in stem:
-        channel = "抖音市场部"
-    elif "达人" in stem:
-        channel = "达人数据"
-    elif "商业化" in stem:
-        channel = "抖音商业化"
-    elif "期货" in stem:
-        channel = "抖音期货通"
-    else:
-        channel = stem
-    return _standardize_douyin(raw, path.name, channel)
-
-
-def _read_social_market(path: Path) -> pd.DataFrame:
-    raw = _read_first_non_empty_sheet(path)
-    channel = _social_market_channel(path.stem)
-    platform = _social_market_platform(path.stem)
-    return _standardize(
-        raw,
-        platform=platform or channel,
-        platform_group=SOCIAL_PLATFORM_GROUP if platform else channel.replace("市场部", ""),
-        channel=channel,
-        source_file=path.name,
-        fields={
-            "content_id": ["内容ID", "创意ID", "计划ID", "链接", "落地页", "创意名称"],
-            "material_id": ["素材ID", "创意ID", "计划ID", "链接", "创意名称"],
-            "title": ["创意名称", "标题", "内容标题", "链接", "落地页"],
-            "account_id": ["账号ID", "账户ID"],
-            "account": ["账号", "账号名称", "账户名称"],
-            "cover_url": ["封面", "封面图", "图片链接"],
-            "content_url": ["链接", "落地页"],
-            "primary_category": ["营销诉求", "优化目标"],
-            "manual_category": ["内容分类", "内容类型"],
-            "spend": ["花费", "消费", "消耗"],
-            "impressions": ["曝光次数", "展现量", "展示数"],
-            "clicks": ["点击次数", "点击量", "点击数"],
-            "activations": ["APP激活次数", "激活数", "注册次数"],
-            "first_pay_count": ["注册次数", "注册次数（点击归因）", "付费次数", "首次付费次数"],
-        },
-    )
-
-
-def _read_generic_channel(path: Path, references: ReferenceTables) -> pd.DataFrame:
-    raw = _read_first_non_empty_sheet(path)
-    if raw.empty:
-        return pd.DataFrame()
-    channel = path.stem
-    fields = {
-        "content_id": ["内容ID", "内容id", "视频id", "视频ID", "笔记ID", "作品ID", "id", "ID"],
-        "material_id": ["素材ID", "素材id", "素材中心id", "内容ID", "视频id", "笔记ID", "链接", "创意名称"],
-        "title": ["标题", "视频标题", "内容标题", "笔记标题", "创意名称", "链接"],
-        "account_id": ["账号ID", "账号id", "作者ID", "用户ID", "uid", "UID", "mid"],
-        "account": ["账号", "账号名称", "发布账号", "达人名称", "作者", "发布作者"],
-        "cover_url": ["封面", "封面图", "图片链接", "视频封面图", "素材url"],
-        "content_url": ["链接", "内容链接", "视频链接", "笔记链接", "素材url"],
-        "primary_category": ["类型", "一级类型", "一级素材形式"],
-        "manual_category": ["内容类型", "内容分类", "二级栏目", "最终内容类别"],
-        "category_l3": ["三级题材", "题材"],
-        "spend": ["消耗", "消费", "花费", "spend"],
-        "impressions": ["展示数", "展示量", "展现量", "曝光量", "impressions"],
-        "clicks": ["点击数", "点击量", "clicks"],
-        "activations": ["激活数", "应用激活数", "APP激活次数", "activations"],
-        "first_pay_count": ["付费次数", "首次付费次数", "应用内付费", "注册次数", "注册次数（点击归因）"],
-    }
-    return _standardize(
-        raw,
-        platform=channel,
-        platform_group=channel,
-        channel=channel,
-        source_file=path.name,
-        fields=fields,
-    )
-
-
-def _read_first_sheet_with_columns(path: Path, required_columns: Iterable[str]) -> pd.DataFrame:
-    if _is_csv(path):
-        return _read_table(path)
-    required = set(required_columns)
-    last_frame = pd.DataFrame()
-    with pd.ExcelFile(path) as workbook:
-        for sheet_name in workbook.sheet_names:
-            frame = _read_table(path, sheet_name=sheet_name)
-            last_frame = frame
-            if required.issubset(set(frame.columns)):
-                return frame
-    return last_frame
-
-
-def _read_first_non_empty_sheet(path: Path) -> pd.DataFrame:
-    if _is_csv(path):
-        return _read_table(path)
-    last_frame = pd.DataFrame()
-    with pd.ExcelFile(path) as workbook:
-        for sheet_name in workbook.sheet_names:
-            frame = _read_table(path, sheet_name=sheet_name)
-            last_frame = frame
-            if not frame.dropna(how="all").empty:
-                return frame
-    return last_frame
-
-
-def _read_named_or_first_matching_sheet(
-    path: Path,
-    preferred_sheet: str,
-    required_columns: Iterable[str],
-) -> pd.DataFrame:
-    if _is_csv(path):
-        return _read_table(path)
-    try:
-        return _read_table(path, sheet_name=preferred_sheet)
-    except Exception:
-        return _read_first_sheet_with_columns(path, required_columns)
-
-
-def _read_first_available_columns(path: Path) -> set[str]:
-    try:
-        if _is_csv(path):
-            return set(_read_table(path, nrows=0).columns.astype(str))
-        with pd.ExcelFile(path) as workbook:
-            for sheet_name in workbook.sheet_names:
-                try:
-                    columns = set(_read_table(path, sheet_name=sheet_name, nrows=0).columns.astype(str))
-                except Exception:
-                    continue
-                if columns:
-                    return columns
-    except Exception:
-        return set()
-    return set()
 
 
 def _standardize_douyin(raw: pd.DataFrame, source_file: str, channel: str) -> pd.DataFrame:
@@ -680,26 +435,26 @@ def _expanded_field_candidates(raw: pd.DataFrame, fields: Mapping[str, List[str]
     expanded: dict[str, list[str]] = {}
     for output, candidates in fields.items():
         field_candidates = list(candidates)
-        if output in COUNT_METRIC_COLUMNS:
+        if output in CORE_METRIC_COLUMNS:
             for column in raw.columns:
                 if column in field_candidates:
                     continue
-                if _matches_count_metric_alias(output, column):
+                if _matches_core_metric_alias(output, column):
                     field_candidates.append(column)
         expanded[output] = field_candidates
     return expanded
 
 
-def _backfill_count_metric_aliases(frame: pd.DataFrame) -> pd.DataFrame:
+def _backfill_core_metric_aliases(frame: pd.DataFrame) -> pd.DataFrame:
     backfilled = frame.copy()
-    for output in COUNT_METRIC_COLUMNS:
+    for output in CORE_METRIC_COLUMNS:
         if output not in backfilled.columns:
             backfilled[output] = pd.NA
         backfilled[output] = backfilled[output].astype("object")
         aliases = [
             column
             for column in backfilled.columns
-            if column != output and _matches_count_metric_alias(output, column)
+            if column != output and _matches_core_metric_alias(output, column)
         ]
         if not aliases:
             continue
@@ -709,21 +464,16 @@ def _backfill_count_metric_aliases(frame: pd.DataFrame) -> pd.DataFrame:
     return backfilled
 
 
-def _matches_count_metric_alias(output: str, column: object) -> bool:
+def _matches_core_metric_alias(output: str, column: object) -> bool:
     name = _compact_metric_column_name(column)
-    if not name or any(keyword in name for keyword in COUNT_METRIC_EXCLUDE_KEYWORDS):
+    if not name or output not in CORE_METRIC_ALIAS_KEYWORDS:
         return False
-    if output == "activations":
-        return "激活" in name or "activation" in name
-    if output == "first_pay_count":
-        return (
-            "首次付费" in name
-            or "应用内付费" in name
-            or "付费次数" in name
-            or "付费数" in name
-            or "firstpay" in name
-        )
-    return False
+    if any(keyword in name for keyword in CORE_METRIC_EXCLUDE_KEYWORDS):
+        return False
+    specific_excludes = CORE_METRIC_SPECIFIC_EXCLUDE_KEYWORDS.get(output, ())
+    if any(keyword in name for keyword in specific_excludes):
+        return False
+    return any(keyword in name for keyword in CORE_METRIC_ALIAS_KEYWORDS[output])
 
 
 def _compact_metric_column_name(column: object) -> str:
@@ -856,26 +606,40 @@ def _dedupe_key(row: pd.Series) -> str:
     content_id = "" if _is_blank(row.get("content_id")) else str(row.get("content_id")).strip()
     if not channel:
         return ""
+    if _uses_content_id_only_dedupe(row):
+        return f"{channel}::id::{content_id}" if content_id else ""
+    account = account_match_label(channel, row.get("account", ""))
+    account_part = f"account::{account}::" if account else ""
     if content_id:
-        return f"{channel}::id::{content_id}"
-    title = "" if _is_blank(row.get("title")) else re.sub(r"\s+", "", str(row.get("title")).strip()).lower()
+        return f"{channel}::{account_part}id::{content_id}"
+    title = normalized_title_key(row.get("title", ""))
     if not title:
         return ""
-    return f"{channel}::title::{title}"
+    return f"{channel}::{account_part}title::{title}"
 
 
 def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[str, object]]]:
     merged = group.iloc[0].copy()
     conflicts: list[dict[str, object]] = []
-    merged["merged_row_count"] = int(len(group))
+    existing_count = pd.to_numeric(group.get("merged_row_count", pd.Series(dtype=float)), errors="coerce").max()
+    existing_count = 0 if pd.isna(existing_count) else int(existing_count)
+    merged["merged_row_count"] = max(int(len(group)), existing_count)
     if len(group) == 1:
         return merged, conflicts
 
-    conflict_columns: list[str] = []
+    content_id_only_dedupe = _uses_content_id_only_dedupe(merged)
+    exact_cross_sheet_duplicate = content_id_only_dedupe and _is_exact_cross_sheet_duplicate(group)
+    review_conflict_columns: list[str] = []
     for column in NUMERIC_COLUMNS:
         values = pd.to_numeric(group[column], errors="coerce").dropna()
         if values.empty:
             merged[column] = float("nan")
+            continue
+        if exact_cross_sheet_duplicate:
+            merged[column] = float(values.iloc[0])
+            continue
+        if content_id_only_dedupe:
+            merged[column] = float(values.sum())
             continue
         unique_values = list(dict.fromkeys(float(value) for value in values))
         if len(unique_values) <= 1:
@@ -888,7 +652,7 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
         else:
             merged[column] = unique_values[0]
             action = "first_non_blank"
-        conflict_columns.append(column)
+            review_conflict_columns.append(column)
         conflicts.append(
             {
                 "dedupe_key": merged.get("dedupe_key", ""),
@@ -906,6 +670,8 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
             continue
         if column == "dedupe_key":
             merged[column] = group[column].iloc[0]
+        elif column == "title" and content_id_only_dedupe:
+            merged[column] = _preferred_content_title(group[column])
         else:
             merged[column] = _first_non_blank_value(group[column])
     existing_reasons: list[str] = []
@@ -916,15 +682,79 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
         for value in group.get("conflict_details", pd.Series(dtype=object)).tolist()
         if not _is_blank(value)
     ]
-    if conflict_columns:
+    if content_id_only_dedupe and _has_different_base_titles(group.get("title", pd.Series(dtype=object))):
+        existing_reasons.append("同ID标题不一致")
+    if review_conflict_columns:
         existing_conflicts.extend(f"{item['column']}={item['values']}->{item['action']}" for item in conflicts)
         merged["needs_manual_review"] = True
+        existing_reasons.append("数值相近重复待审核")
         existing_reasons.append("数值冲突")
+    elif conflicts:
+        existing_conflicts.extend(f"{item['column']}={item['values']}->{item['action']}" for item in conflicts)
     elif bool(group.get("needs_manual_review", pd.Series(dtype=bool)).astype(bool).any()):
         merged["needs_manual_review"] = True
     merged["conflict_details"] = "; ".join(dict.fromkeys(existing_conflicts))
     merged["review_reasons"] = "；".join(dict.fromkeys(reason for reason in existing_reasons if reason))
     return merged, conflicts
+
+
+def _is_exact_cross_sheet_duplicate(group: pd.DataFrame) -> bool:
+    if len(group) < 2:
+        return False
+    source_files = _unique_nonblank_values(group.get("source_file", pd.Series(dtype=object)))
+    source_sheets = _unique_nonblank_values(group.get("source_sheet", pd.Series(dtype=object)))
+    if len(source_files) != 1 or len(source_sheets) <= 1:
+        return False
+    for column in NUMERIC_COLUMNS:
+        if column not in group.columns:
+            continue
+        values = pd.to_numeric(group[column], errors="coerce")
+        non_blank = values.dropna()
+        if non_blank.empty:
+            continue
+        if non_blank.nunique(dropna=True) > 1:
+            return False
+    return True
+
+
+def _unique_nonblank_values(series: pd.Series) -> list[str]:
+    values: list[str] = []
+    for value in series.tolist():
+        if _is_blank(value):
+            continue
+        text = str(value).strip()
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def _uses_content_id_only_dedupe(row: pd.Series) -> bool:
+    text = " ".join(
+        str(row.get(column, "") or "")
+        for column in ["platform_group", "platform", "channel"]
+    )
+    normalized = text.lower()
+    return "小红书" in text or "B站" in text or "bilibili" in normalized
+
+
+def _preferred_content_title(series: pd.Series) -> str:
+    values = [str(value).strip() for value in series.tolist() if not _is_blank(value)]
+    if not values:
+        return ""
+    return sorted(values, key=lambda value: (_has_tag(value), len(value)), reverse=True)[0]
+
+
+def _has_tag(value: object) -> bool:
+    return bool(re.search(r"[#＃]\S+", str(value or "")))
+
+
+def _has_different_base_titles(series: pd.Series) -> bool:
+    keys = [
+        normalized_title_key(value)
+        for value in series.tolist()
+        if not _is_blank(value) and normalized_title_key(value)
+    ]
+    return len(dict.fromkeys(keys)) > 1
 
 
 def _relative_difference(values: list[float]) -> float:
@@ -942,7 +772,8 @@ def _mark_manual_review_reasons(canonical: pd.DataFrame) -> pd.DataFrame:
             reasons.append("内容ID缺失")
         if _is_blank(row.get("account")) and str(row.get("channel", "")).strip() == "B站" and not _is_blank(row.get("account_id")):
             reasons.append("账号映射缺失")
-        if not _is_blank(row.get("conflict_details")):
+        if _has_manual_conflict(row.get("conflict_details")):
+            reasons.append("数值相近重复待审核")
             reasons.append("数值冲突")
         unique_reasons = []
         for reason in reasons:
@@ -951,6 +782,15 @@ def _mark_manual_review_reasons(canonical: pd.DataFrame) -> pd.DataFrame:
         canonical.at[index, "review_reasons"] = "；".join(unique_reasons)
         canonical.at[index, "needs_manual_review"] = bool(unique_reasons)
     return canonical
+
+
+def _has_manual_conflict(value: object) -> bool:
+    if _is_blank(value):
+        return False
+    details = str(value)
+    if "manual_review" in details or "first_non_blank" in details:
+        return True
+    return False
 
 
 def _split_reasons(value: object) -> list[str]:
@@ -994,10 +834,19 @@ def _build_preprocessing_report(
     canonical: pd.DataFrame,
     preprocessing: Mapping[str, pd.DataFrame],
     data_quality: pd.DataFrame,
+    account_filter_details: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     duplicate_details = preprocessing["duplicate_merge_details"]
     conflict_details = preprocessing["conflict_retention_details"]
     missing_details = preprocessing["missing_value_details"]
+    account_filter_details = account_filter_details if account_filter_details is not None else pd.DataFrame()
+    filtered_count = int(len(account_filter_details))
+    filtered_spend = (
+        pd.to_numeric(account_filter_details.get("spend", pd.Series(dtype=float)), errors="coerce")
+        .fillna(0.0)
+        .sum()
+    )
+    total_before_filter = int(len(canonical) + filtered_count)
     rows = [
         {
             "metric": "标准化后行数",
@@ -1030,6 +879,22 @@ def _build_preprocessing_report(
             "total": int(len(canonical)),
             "status": "需处理" if not missing_details.empty else "通过",
             "note": "关键字段缺失保留为空，并进入人工审核或质量扫描。",
+        },
+        {
+            "metric": "小红书账号过滤排除行数",
+            "value": filtered_count,
+            "count": filtered_count,
+            "total": total_before_filter,
+            "status": "需关注" if filtered_count else "通过",
+            "note": "只有存在账号或账号ID但未命中白名单的小红书行不进入汇总，空账号行默认记录。",
+        },
+        {
+            "metric": "小红书账号过滤排除消耗",
+            "value": float(filtered_spend),
+            "count": filtered_count,
+            "total": total_before_filter,
+            "status": "需关注" if filtered_count else "通过",
+            "note": "被过滤账号的消耗仅用于审计，不计入小红书汇总。",
         },
     ]
     if not data_quality.empty:
@@ -1108,7 +973,15 @@ def _complete_categories(
     writable_manual = has_category & canonical["content_category"].map(_is_blank)
     canonical.loc[writable_manual, "manual_category"] = raw_category.loc[writable_manual].astype(str).str.strip()
     canonical.loc[writable_manual, "content_category"] = raw_category.loc[writable_manual].astype(str).str.strip()
-    canonical.loc[writable_manual, "category_status"] = "人工标记"
+    manual_sources = (
+        canonical["manual_category_source"].fillna("").astype(str).str.strip()
+        if "manual_category_source" in canonical.columns
+        else pd.Series("", index=canonical.index)
+    )
+    canonical.loc[writable_manual, "category_status"] = manual_sources.loc[writable_manual].where(
+        manual_sources.loc[writable_manual].ne(""),
+        "人工标记",
+    )
     canonical.loc[writable_manual, "category_confidence"] = 1.0
 
     _apply_account_content_type_mappings(canonical, references.account_content_type)
@@ -1597,7 +1470,7 @@ def _total_row(
     first_pay = _sum_or_zero(group["first_pay_count"])
     impressions = _sum_or_zero(group["impressions"])
     clicks = _sum_or_zero(group["clicks"])
-    pending = group[group["content_category"].map(_is_blank)]
+    pending = group[group["content_category"].map(_is_blank).astype(bool)]
     pending_spend = _sum_or_zero(pending["spend"])
     return {
         "channel": channel,
@@ -1732,6 +1605,13 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
                 "category_l3",
                 "category_source",
                 "category_confidence",
+                "ledger_match_source",
+                "ledger_content_type",
+                "ledger_source_file",
+                "ledger_source_sheet",
+                "ledger_source_row",
+                "match_risk_level",
+                "match_risk_reason",
                 "spend",
                 "activations",
                 "activation_cost",
@@ -1762,6 +1642,13 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
         "category_l3",
         "category_source",
         "category_confidence",
+        "ledger_match_source",
+        "ledger_content_type",
+        "ledger_source_file",
+        "ledger_source_sheet",
+        "ledger_source_row",
+        "match_risk_level",
+        "match_risk_reason",
         "spend",
         "activations",
         "activation_cost",
@@ -1772,14 +1659,27 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
         "duplicate_group_id",
         "review_action",
     ]
+    for column in columns:
+        if column not in queue.columns:
+            queue[column] = ""
     return queue.sort_values(["spend", "activations"], ascending=[False, False])[columns].reset_index(drop=True)
 
 
-def _build_account_audit(canonical: pd.DataFrame) -> pd.DataFrame:
+def _build_account_audit(
+    canonical: pd.DataFrame,
+    *,
+    expected_accounts: Optional[Mapping[str, Iterable[str]]] = None,
+) -> pd.DataFrame:
     rows = []
     canonical = canonical.copy()
     canonical["account"] = canonical["account"].fillna("").astype(str).str.strip()
-    for platform, expected_accounts in EXPECTED_ACCOUNTS.items():
+    expected_by_platform = dict(EXPECTED_ACCOUNTS)
+    if expected_accounts is not None:
+        for platform, accounts in expected_accounts.items():
+            expected_by_platform[str(platform).strip()] = [
+                str(account).strip() for account in accounts if str(account).strip()
+            ]
+    for platform, expected_accounts in expected_by_platform.items():
         if platform == "抖音":
             platform_items = canonical[canonical["channel"].astype(str).str.contains("抖音", na=False)]
         elif platform == "小红书":
@@ -1996,12 +1896,34 @@ def _iter_tabular_files(input_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in Path(input_dir).rglob("*")
-        if path.is_file() and path.suffix.lower() in TABULAR_SUFFIXES and not path.name.startswith("~$")
+        if path.is_file()
+        and path.suffix.lower() in TABULAR_SUFFIXES
+        and not path.name.startswith("~$")
+        and not _is_generated_channel_clean_file(path)
+        and "channel_clean" not in path.parts
     )
 
 
 def _is_csv(path: Path) -> bool:
     return Path(path).suffix.lower() == ".csv"
+
+
+def _is_generated_channel_clean_file(path: Path) -> bool:
+    return Path(path).stem.lower().endswith("_clean")
+
+
+def _default_content_ledger_config() -> Path | None:
+    candidate = Path("config/feishu_sources.yml")
+    return candidate if candidate.exists() else None
+
+
+def _default_year_from_period(period_start: str, period_end: str) -> int:
+    for value in [period_start, period_end]:
+        try:
+            return date.fromisoformat(str(value)).year
+        except ValueError:
+            continue
+    return date.today().year
 
 
 def _read_table(

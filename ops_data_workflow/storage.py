@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from contextlib import closing
 from pathlib import Path
 import hashlib
+import re
 import shutil
 import sqlite3
 from typing import Iterable, Optional
@@ -18,6 +19,7 @@ from .periods import (
     PERIOD_LEVEL_MONTH,
     PERIOD_LEVEL_WEEK,
     SOURCE_TYPE_UPLOAD,
+    ReviewPeriod,
     period_metadata_from_dates,
 )
 
@@ -32,6 +34,7 @@ PERSISTED_RESULT_TABLES = [
     "uploaded_files",
     "ai_reports",
     "category_mappings",
+    "douyin_id_bridge",
     "period_file_states",
     "file_backups",
     "canonical_items",
@@ -124,6 +127,26 @@ def init_db(db_path: Path) -> None:
                 category_l1 text not null,
                 category_l2 text not null,
                 category_l3 text not null,
+                updated_at text not null
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists douyin_id_bridge (
+                bridge_key text not null,
+                id_type text not null,
+                id_value text not null,
+                account text not null default '',
+                content_type text not null default '',
+                content_url text not null default '',
+                title text not null default '',
+                title_key_no_tags text not null default '',
+                source_file text not null default '',
+                source_sheet text not null default '',
+                source_row text not null default '',
+                match_source text not null default '',
+                batch_id text not null default '',
                 updated_at text not null
             )
             """
@@ -528,7 +551,7 @@ def move_batch_to_file_backup(
     """Hide a batch's raw period files and mark the period as backed up."""
     record = read_batch_record(db_path, batch_id)
     if not record:
-        raise ValueError(f"未找到批次：{batch_id}")
+        raise ValueError(f"未找到周期：{batch_id}")
 
     period_start = record["period_start"]
     period_end = record["period_end"]
@@ -646,7 +669,7 @@ def delete_batch_permanently(
     """Delete one batch's persisted rows and artifacts while preserving reusable mappings."""
     record = read_batch_record(db_path, batch_id)
     if not record:
-        raise ValueError(f"未找到批次：{batch_id}")
+        raise ValueError(f"未找到周期：{batch_id}")
     period_start = record["period_start"]
     period_end = record["period_end"]
     period_dir_name = _period_dir_name(period_start, period_end)
@@ -716,6 +739,166 @@ def load_category_mappings(db_path: Path) -> dict[str, dict[str, str]]:
         for key in _mapping_keys(mapping):
             mappings[key] = mapping
     return mappings
+
+
+DOUYIN_ID_BRIDGE_COLUMNS = [
+    "bridge_key",
+    "id_type",
+    "id_value",
+    "account",
+    "content_type",
+    "content_url",
+    "title",
+    "title_key_no_tags",
+    "source_file",
+    "source_sheet",
+    "source_row",
+    "match_source",
+    "batch_id",
+    "updated_at",
+]
+
+
+def load_douyin_id_bridge(db_path: Path) -> pd.DataFrame:
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return pd.DataFrame(columns=DOUYIN_ID_BRIDGE_COLUMNS)
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        try:
+            return pd.read_sql_query(
+                "select * from douyin_id_bridge order by updated_at asc",
+                conn,
+            )
+        except Exception:
+            return pd.DataFrame(columns=DOUYIN_ID_BRIDGE_COLUMNS)
+
+
+def persist_douyin_id_bridge(db_path: Path, batch_id: str, canonical: pd.DataFrame) -> int:
+    if canonical.empty:
+        return 0
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    with closing(sqlite3.connect(db_path)) as conn:
+        for row in _douyin_bridge_rows(batch_id, canonical, now):
+            existing = conn.execute(
+                """
+                select rowid from douyin_id_bridge
+                where bridge_key = ?
+                    and account = ?
+                    and content_type = ?
+                    and content_url = ?
+                    and source_file = ?
+                    and source_sheet = ?
+                    and source_row = ?
+                limit 1
+                """,
+                (
+                    row["bridge_key"],
+                    row["account"],
+                    row["content_type"],
+                    row["content_url"],
+                    row["source_file"],
+                    row["source_sheet"],
+                    row["source_row"],
+                ),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    update douyin_id_bridge
+                    set title = ?, title_key_no_tags = ?, match_source = ?, batch_id = ?, updated_at = ?
+                    where rowid = ?
+                    """,
+                    (
+                        row["title"],
+                        row["title_key_no_tags"],
+                        row["match_source"],
+                        row["batch_id"],
+                        row["updated_at"],
+                        existing[0],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    insert into douyin_id_bridge (
+                        bridge_key, id_type, id_value, account, content_type, content_url,
+                        title, title_key_no_tags, source_file, source_sheet, source_row,
+                        match_source, batch_id, updated_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(row[column] for column in DOUYIN_ID_BRIDGE_COLUMNS),
+                )
+            written += 1
+        conn.commit()
+    return written
+
+
+def _douyin_bridge_rows(batch_id: str, canonical: pd.DataFrame, updated_at: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for _, item in canonical.iterrows():
+        if not _is_douyin_item(item) or not _is_safe_douyin_bridge_source(item):
+            continue
+        account = _clean_text(item.get("account", ""))
+        content_type = _clean_text(item.get("ledger_content_type", "")) or _clean_text(item.get("manual_category", ""))
+        if not account or not content_type:
+            continue
+        base = {
+            "account": account,
+            "content_type": content_type,
+            "content_url": _clean_text(item.get("content_url", "")),
+            "title": _clean_text(item.get("title", "")),
+            "title_key_no_tags": normalized_title_key(item.get("title", "")),
+            "source_file": _clean_text(item.get("ledger_source_file", "")) or _clean_text(item.get("source_file", "")),
+            "source_sheet": _clean_text(item.get("ledger_source_sheet", "")) or _clean_text(item.get("source_sheet", "")),
+            "source_row": _clean_text(item.get("ledger_source_row", "")) or _clean_text(item.get("source_row", "")),
+            "match_source": _clean_text(item.get("ledger_match_source", "")),
+            "batch_id": _clean_text(batch_id),
+            "updated_at": updated_at,
+        }
+        for id_type, id_value in _douyin_bridge_keys(item):
+            row = {
+                "bridge_key": f"{id_type}:{id_value}",
+                "id_type": id_type,
+                "id_value": id_value,
+                **base,
+            }
+            rows.append(row)
+    return rows
+
+
+def _is_douyin_item(row: pd.Series) -> bool:
+    text = " ".join(_clean_text(row.get(column, "")) for column in ["platform_group", "platform", "channel"])
+    return "抖音" in text
+
+
+def _is_safe_douyin_bridge_source(row: pd.Series) -> bool:
+    return _clean_text(row.get("ledger_match_source", "")) in {"id", "账号+标题", "唯一标题"}
+
+
+def _douyin_bridge_keys(row: pd.Series) -> list[tuple[str, str]]:
+    keys: list[tuple[str, str]] = []
+    for column in ["content_id", "material_id"]:
+        value = _clean_text(row.get(column, ""))
+        if value and not value.startswith("row:") and (column, value) not in keys:
+            keys.append((column, value))
+    url_key = _douyin_url_key(row.get("content_url", ""))
+    if url_key and ("content_url", url_key) not in keys:
+        keys.append(("content_url", url_key))
+    return keys
+
+
+def _douyin_url_key(value: object) -> str:
+    text = _clean_text(value)
+    if not text:
+        return ""
+    match = re.search(r"[?&]token=([^&#\s]+)", text)
+    if match:
+        return f"token:{match.group(1)}"
+    return text
 
 
 def upsert_category_mappings(db_path: Path, mappings: pd.DataFrame) -> int:
@@ -871,6 +1054,7 @@ def persist_workflow_result(
         source_type,
     )
     with closing(sqlite3.connect(db_path)) as conn:
+        _delete_period_scoped_rows(conn, period, include_batch_id=batch_id)
         conn.execute(
             """
             insert into upload_batches (
@@ -882,8 +1066,8 @@ def persist_workflow_result(
             """,
             (
                 batch_id,
-                period_start,
-                period_end,
+                period.period_start,
+                period.period_end,
                 created_at,
                 str(archive_dir),
                 str(output_dir),
@@ -899,7 +1083,7 @@ def persist_workflow_result(
         )
         conn.execute(
             "delete from period_file_states where period_key = ?",
-            (_period_key(period_start, period_end),),
+            (_period_key(period.period_start, period.period_end),),
         )
         for item in archived_files:
             conn.execute(
@@ -1057,6 +1241,47 @@ def _delete_batch_scoped_rows(conn: sqlite3.Connection, batch_id: str) -> None:
         if "batch_id" not in columns:
             continue
         conn.execute(f'delete from "{_sqlite_identifier(table_name)}" where batch_id = ?', (batch_id,))
+
+
+def _delete_period_scoped_rows(
+    conn: sqlite3.Connection,
+    period: ReviewPeriod,
+    *,
+    include_batch_id: str = "",
+) -> None:
+    existing_ids: set[str] = set()
+    if include_batch_id:
+        existing_ids.add(str(include_batch_id))
+    try:
+        rows = conn.execute(
+            """
+            select batch_id
+            from upload_batches
+            where period_level = ?
+              and period_key = ?
+              and source_type = ?
+            """,
+            (period.period_level, period.period_key, period.source_type),
+        ).fetchall()
+        existing_ids.update(str(row[0]) for row in rows if row and row[0])
+    except Exception:
+        pass
+    try:
+        rows = conn.execute(
+            """
+            select batch_id
+            from upload_batches
+            where period_start = ?
+              and period_end = ?
+              and coalesce(source_type, '') in (?, '')
+            """,
+            (period.period_start, period.period_end, period.source_type),
+        ).fetchall()
+        existing_ids.update(str(row[0]) for row in rows if row and row[0])
+    except Exception:
+        pass
+    for batch_id in sorted(existing_ids):
+        _delete_batch_scoped_rows(conn, batch_id)
 
 
 def _remove_path_if_exists(path: Path) -> None:

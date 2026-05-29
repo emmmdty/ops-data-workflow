@@ -70,7 +70,7 @@ def main() -> None:
             category_rules_path=Path(args.category_rules),
             env_path=Path(args.env),
         )
-        print(f"Batch archived as {result.batch_id}")
+        print(f"Period stored as {result.batch_id}")
         print(f"Archive written to {result.archive_dir}")
     print(f"Report written to {result.report_html}")
     print(f"Workbook written to {result.analysis_xlsx}")

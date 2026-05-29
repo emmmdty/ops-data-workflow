@@ -40,6 +40,16 @@ def load_data_review_items(db_path: Path, batch_id: str) -> pd.DataFrame:
                 "dedupe_key": row.get("dedupe_key", ""),
                 "duplicate_group_id": row.get("duplicate_group_id", ""),
                 "conflict_details": row.get("conflict_details", ""),
+                "ledger_match_source": row.get("ledger_match_source", ""),
+                "ledger_content_type": row.get("ledger_content_type", ""),
+                "ledger_source_file": row.get("ledger_source_file", ""),
+                "ledger_source_sheet": row.get("ledger_source_sheet", ""),
+                "ledger_source_row": row.get("ledger_source_row", ""),
+                "match_risk_level": row.get("match_risk_level", ""),
+                "match_risk_reason": row.get("match_risk_reason", ""),
+                "spend": row.get("spend", ""),
+                "activations": row.get("activations", ""),
+                "activation_cost": row.get("activation_cost", ""),
                 "source_file": row.get("source_file", ""),
                 "source_sheet": row.get("source_sheet", ""),
                 "field_name": "",
@@ -60,6 +70,16 @@ def load_data_review_items(db_path: Path, batch_id: str) -> pd.DataFrame:
                 "dedupe_key": row.get("dedupe_key", ""),
                 "duplicate_group_id": row.get("dedupe_key", ""),
                 "conflict_details": "",
+                "ledger_match_source": "",
+                "ledger_content_type": "",
+                "ledger_source_file": "",
+                "ledger_source_sheet": "",
+                "ledger_source_row": "",
+                "match_risk_level": "",
+                "match_risk_reason": "",
+                "spend": row.get("spend", ""),
+                "activations": row.get("activations", ""),
+                "activation_cost": row.get("activation_cost", ""),
                 "source_file": row.get("source_files", ""),
                 "source_sheet": "",
                 "field_name": "",
@@ -80,6 +100,16 @@ def load_data_review_items(db_path: Path, batch_id: str) -> pd.DataFrame:
                 "dedupe_key": row.get("dedupe_key", ""),
                 "duplicate_group_id": row.get("dedupe_key", ""),
                 "conflict_details": f"{row.get('column', '')}: {row.get('values', '')}",
+                "ledger_match_source": "",
+                "ledger_content_type": "",
+                "ledger_source_file": "",
+                "ledger_source_sheet": "",
+                "ledger_source_row": "",
+                "match_risk_level": "",
+                "match_risk_reason": "",
+                "spend": row.get("spend", ""),
+                "activations": row.get("activations", ""),
+                "activation_cost": row.get("activation_cost", ""),
                 "source_file": "",
                 "source_sheet": "",
                 "field_name": row.get("column", ""),
@@ -164,11 +194,11 @@ def apply_review_resolutions_and_regenerate(
     """Apply saved decisions to cleaned.xlsx, then regenerate the selected period."""
     record = read_batch_record(db_path, batch_id)
     if not record:
-        raise ValueError("未找到当前批次，无法同步审核结果。")
+        raise ValueError("未找到当前周期，无法同步审核结果。")
     raw_dir = Path(record["archive_dir"]) / "raw"
     cleaned_workbook = raw_dir / "cleaned.xlsx"
     if not cleaned_workbook.exists():
-        raise ValueError("当前批次不是由 cleaned.xlsx 生成，无法直接同步 Excel。")
+        raise ValueError("当前周期不是由 cleaned.xlsx 生成，无法直接同步 Excel。")
     resolutions = _load_saved_resolutions(db_path, batch_id)
     canonical = apply_resolutions_to_frame(load_cleaned_canonical(cleaned_workbook), resolutions)
     rewrite_cleaned_canonical(cleaned_workbook, canonical)
@@ -307,6 +337,16 @@ def _empty_review_items() -> pd.DataFrame:
             "dedupe_key",
             "duplicate_group_id",
             "conflict_details",
+            "ledger_match_source",
+            "ledger_content_type",
+            "ledger_source_file",
+            "ledger_source_sheet",
+            "ledger_source_row",
+            "match_risk_level",
+            "match_risk_reason",
+            "spend",
+            "activations",
+            "activation_cost",
             "source_file",
             "source_sheet",
             "field_name",

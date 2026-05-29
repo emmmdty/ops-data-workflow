@@ -12,7 +12,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 
 import pandas as pd
 
-from .comparison import build_channel_comparison
+from .comparison import COMPARISON_METRICS, build_channel_comparison
 from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, social_platform_from_name
 from .storage import init_db, normalize_batch_metadata, previous_batch_from_rows
 
@@ -35,6 +35,9 @@ CHANNEL_COMPARISON_COLUMNS = [
     "spend_current",
     "spend_previous",
     "spend_change_rate",
+    "impressions_current",
+    "impressions_previous",
+    "impressions_change_rate",
     "activations_current",
     "activations_previous",
     "activations_change_rate",
@@ -55,6 +58,8 @@ OVERVIEW_TABLE_COLUMNS = [
     "channel",
     "spend",
     "spend_change_rate",
+    "impressions",
+    "impressions_change_rate",
     "activations",
     "activations_change_rate",
     "activation_cost",
@@ -153,6 +158,7 @@ class DashboardFilters:
 @dataclass(frozen=True)
 class DashboardSummary:
     total_spend: float
+    total_impressions: float
     activations: float
     activation_cost: float
     first_pay_count: float
@@ -331,7 +337,12 @@ def load_channel_comparison_for_batch(db_path: Path, batch_id: str) -> pd.DataFr
             ).drop(columns=["batch_id"], errors="ignore")
         except Exception:
             return _empty_channel_comparison()
-    return _normalize_channel_comparison(comparison)
+    normalized = _normalize_channel_comparison(comparison)
+    if _has_missing_comparison_metric(normalized):
+        rebuilt = build_period_comparison_for_batch(db_path, batch_id)
+        if not rebuilt.empty and not _has_missing_comparison_metric(rebuilt):
+            return rebuilt
+    return normalized
 
 
 def build_period_comparison_for_batch(db_path: Path, batch_id: str) -> pd.DataFrame:
@@ -905,50 +916,155 @@ def build_content_recommendations(
     summary: DashboardSummary,
     platform_summary: pd.DataFrame,
     content_type_summary: pd.DataFrame,
+    channel_comparison: Optional[pd.DataFrame] = None,
+    external_context: Optional[object] = None,
 ) -> str:
-    """Create direct Markdown recommendations from current KPI tables."""
-    lines = ["## 内容题材推荐"]
-    if content_type_summary.empty:
-        return "## 内容题材推荐\n- 暂无可用于推荐的内容类型数据，先补齐本周期数据和内容分类。"
+    """Create direct Markdown recommendations from current KPI and context tables."""
+    overview_rows = build_overview_table_rows(summary, platform_summary, channel_comparison)
+    total_row = overview_rows[overview_rows["channel"].eq("汇总")].iloc[0] if not overview_rows.empty else pd.Series(dtype=object)
+    lines = ["## 内容题材推荐", "## 总体分析"]
+    lines.append(
+        "- 本周期总览："
+        f"总消耗 {_fmt_number(summary.total_spend, 0)}、总曝光 {_fmt_number(summary.total_impressions, 0)}、"
+        f"激活数 {_fmt_number(summary.activations, 0)}、激活成本 {_fmt_number(summary.activation_cost, 1)}、"
+        f"付费数 {_fmt_number(summary.first_pay_count, 0)}、付费成本 {_fmt_number(summary.first_pay_cost, 1)}。"
+    )
+    lines.append(
+        "- 环比趋势："
+        + "，".join(
+            [
+                _metric_change_clause("总消耗", total_row.get("spend_change_rate"), is_cost=False),
+                _metric_change_clause("总曝光", total_row.get("impressions_change_rate"), is_cost=False),
+                _metric_change_clause("激活数", total_row.get("activations_change_rate"), is_cost=False),
+                _metric_change_clause("激活成本", total_row.get("activation_cost_change_rate"), is_cost=True),
+                _metric_change_clause("付费数", total_row.get("first_pay_count_change_rate"), is_cost=False),
+                _metric_change_clause("付费成本", total_row.get("first_pay_cost_change_rate"), is_cost=True),
+            ]
+        )
+        + "。"
+    )
+    lines.append(f"- 原因判断：{_overall_reason(total_row)}")
+
+    external_summary = _external_context_summary(external_context)
+    lines.append(f"- 外部背景：{external_summary}")
 
     clean_types = content_type_summary.copy()
+    if "category_display" not in clean_types.columns:
+        clean_types["category_display"] = ""
     clean_types = clean_types[~clean_types["category_display"].eq("未匹配")]
-    if clean_types.empty:
-        return "## 内容题材推荐\n- 当前有效内容分类为空，先补齐标题/TAG或人工内容类型，再做投流判断。"
-
-    top_activation = clean_types.sort_values(["activations", "first_pay_count", "spend"], ascending=[False, False, False]).iloc[0]
-    efficient = clean_types[clean_types["activations"].gt(0)].sort_values(
-        ["activation_cost", "first_pay_rate"], ascending=[True, False]
-    )
-    efficient_row = efficient.iloc[0] if not efficient.empty else top_activation
-
-    lines.append(
-        f"- 继续放大 **{top_activation['category_display']}**：当前贡献激活 {_fmt_number(top_activation['activations'], 0)}，"
-        f"付费 {_fmt_number(top_activation['first_pay_count'], 0)}，适合作为主推题材。"
-    )
-    lines.append(
-        f"- 优先测试 **{efficient_row['category_display']}** 的相邻选题：激活成本 {_fmt_number(efficient_row['activation_cost'], 1)}，"
-        f"可用来做低成本扩量。"
-    )
-
-    if not platform_summary.empty:
-        platform = platform_summary.sort_values(["activations", "first_pay_count"], ascending=[False, False]).iloc[0]
-        label = platform.get("channel", platform.get("platform", ""))
-        lines.append(
-            f"- 渠道侧先看 **{label}**：激活 {_fmt_number(platform['activations'], 0)}，"
-            f"激活成本 {_fmt_number(platform['activation_cost'], 1)}，用于承接下一轮预算。"
+    if not clean_types.empty:
+        for column in ["spend", "activations", "activation_cost", "first_pay_count", "first_pay_rate"]:
+            if column not in clean_types.columns:
+                clean_types[column] = 0.0
+            clean_types[column] = pd.to_numeric(clean_types[column], errors="coerce")
+        top_activation = clean_types.sort_values(["activations", "first_pay_count", "spend"], ascending=[False, False, False]).iloc[0]
+        efficient = clean_types[clean_types["activations"].gt(0)].sort_values(
+            ["activation_cost", "first_pay_rate"], ascending=[True, False], na_position="last"
         )
+        efficient_row = efficient.iloc[0] if not efficient.empty else top_activation
+        lines.append(
+            f"- 题材侧：**{top_activation['category_display']}** 贡献激活 {_fmt_number(top_activation['activations'], 0)}、"
+            f"付费 {_fmt_number(top_activation['first_pay_count'], 0)}；**{efficient_row['category_display']}** "
+            f"激活成本 {_fmt_number(efficient_row['activation_cost'], 1)}，适合做低成本扩量测试。"
+        )
+    else:
+        lines.append("- 题材侧：当前有效内容分类不足，先补齐标题、TAG 或人工内容类型后再判断题材扩量。")
 
-    missing = content_type_summary[content_type_summary["category_display"].eq("未匹配")]
+    if "category_display" in content_type_summary.columns:
+        missing = content_type_summary[content_type_summary["category_display"].eq("未匹配")]
+    else:
+        missing = pd.DataFrame()
     if not missing.empty:
         missing_spend = _sum_or_zero(missing["spend"])
-        lines.append(f"- 先处理未匹配分类：仍有消耗 {_fmt_number(missing_spend, 0)} 无法归因，会影响题材判断。")
+        lines.append(f"- 数据侧：仍有消耗 {_fmt_number(missing_spend, 0)} 未匹配分类，会影响题材判断。")
 
-    lines.append(
-        f"- 当前总消耗 {_fmt_number(summary.total_spend, 0)}、激活成本 {_fmt_number(summary.activation_cost, 1)}，"
-        "下一轮复盘优先比较题材的激活成本和首次付费率。"
-    )
+    lines.append("## 分渠道分析")
+    channel_rows = overview_rows[~overview_rows["channel"].eq("汇总")].copy()
+    if channel_rows.empty:
+        lines.append("- 当前没有可用于分渠道分析的数据。")
+    else:
+        for _, row in channel_rows.iterrows():
+            lines.append(_channel_recommendation_line(row, clean_types))
     return "\n".join(lines)
+
+
+def _metric_change_clause(label: str, value: object, *, is_cost: bool) -> str:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(number):
+        return f"{label}暂无环比"
+    direction = "提升" if float(number) > 0 else "降低" if float(number) < 0 else "持平"
+    quality = ""
+    if float(number) != 0:
+        quality = "（成本承压）" if is_cost and float(number) > 0 else "（效率改善）" if is_cost else ""
+    return f"{label}{direction}{_fmt_percent_text(abs(float(number)))}{quality}"
+
+
+def _overall_reason(total_row: pd.Series) -> str:
+    spend = _numeric_change(total_row.get("spend_change_rate"))
+    impressions = _numeric_change(total_row.get("impressions_change_rate"))
+    activations = _numeric_change(total_row.get("activations_change_rate"))
+    activation_cost = _numeric_change(total_row.get("activation_cost_change_rate"))
+    first_pay = _numeric_change(total_row.get("first_pay_count_change_rate"))
+    first_pay_cost = _numeric_change(total_row.get("first_pay_cost_change_rate"))
+    if spend is None and impressions is None and activations is None:
+        return "缺少上一周期对比，先以本期各渠道绝对量和成本水平判断。"
+    reasons: list[str] = []
+    if spend is not None and impressions is not None:
+        if spend > 0 and impressions > 0:
+            reasons.append("投放规模和曝光同步放大")
+        elif spend > 0 and impressions <= 0:
+            reasons.append("预算增加但曝光没有同步增长，需检查流量价格或素材覆盖")
+        elif spend < 0:
+            reasons.append("预算收缩带动整体流量变化")
+    if activations is not None:
+        if activations > 0:
+            reasons.append("激活增长说明承接效率有改善")
+        elif activations < 0:
+            reasons.append("激活下滑说明素材或落地页转化偏弱")
+    if activation_cost is not None:
+        reasons.append("激活成本下降" if activation_cost < 0 else "激活成本上升需要控量提效" if activation_cost > 0 else "激活成本稳定")
+    if first_pay is not None and first_pay_cost is not None:
+        if first_pay > 0 and first_pay_cost <= 0:
+            reasons.append("付费数增长且付费成本受控")
+        elif first_pay <= 0 and first_pay_cost > 0:
+            reasons.append("付费转化不足推高付费成本")
+    return "；".join(reasons) + "。" if reasons else "本周期变化较平稳，建议继续观察渠道结构。"
+
+
+def _channel_recommendation_line(row: pd.Series, clean_types: pd.DataFrame) -> str:
+    channel = str(row.get("channel", "") or "").strip() or "未知渠道"
+    metric_text = "，".join(
+        [
+            _metric_change_clause("消耗", row.get("spend_change_rate"), is_cost=False),
+            _metric_change_clause("曝光", row.get("impressions_change_rate"), is_cost=False),
+            _metric_change_clause("激活", row.get("activations_change_rate"), is_cost=False),
+            _metric_change_clause("激活成本", row.get("activation_cost_change_rate"), is_cost=True),
+            _metric_change_clause("付费", row.get("first_pay_count_change_rate"), is_cost=False),
+            _metric_change_clause("付费成本", row.get("first_pay_cost_change_rate"), is_cost=True),
+        ]
+    )
+    action = "继续看激活成本和付费成本，优先保留低成本且能带来付费的题材。"
+    if not clean_types.empty:
+        top_topic = clean_types.sort_values(["activations", "spend"], ascending=[False, False]).iloc[0]
+        action = f"重点围绕 **{top_topic['category_display']}** 扩展相邻题材，同时压低高成本素材。"
+    return f"- **{channel}**：本期消耗 {_fmt_number(row.get('spend'), 0)}、曝光 {_fmt_number(row.get('impressions'), 0)}、激活 {_fmt_number(row.get('activations'), 0)}、付费 {_fmt_number(row.get('first_pay_count'), 0)}；{metric_text}。建议：{action}"
+
+
+def _external_context_summary(external_context: Optional[object]) -> str:
+    if external_context is None:
+        return "未取到外部背景，以下判断仅基于站内投放数据。"
+    if isinstance(external_context, Mapping):
+        summary = str(external_context.get("summary", "") or "").strip()
+    else:
+        summary = str(getattr(external_context, "summary", "") or "").strip()
+    return summary or "未取到外部背景，以下判断仅基于站内投放数据。"
+
+
+def _numeric_change(value: object) -> float | None:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(number):
+        return None
+    return float(number)
 
 
 def build_overview_table_rows(
@@ -963,6 +1079,7 @@ def build_overview_table_rows(
             "汇总",
             {
                 "spend": summary.total_spend,
+                "impressions": summary.total_impressions,
                 "activations": summary.activations,
                 "activation_cost": summary.activation_cost,
                 "first_pay_count": summary.first_pay_count,
@@ -988,6 +1105,7 @@ def build_overview_table_rows(
                     channel,
                     {
                         "spend": row.get("spend", pd.NA),
+                        "impressions": row.get("impressions", pd.NA),
                         "activations": row.get("activations", pd.NA),
                         "activation_cost": row.get("activation_cost", pd.NA),
                         "first_pay_count": row.get("first_pay_count", pd.NA),
@@ -1021,10 +1139,12 @@ def _overview_channel_priority(channel: object) -> int:
 def build_dashboard_summary(items: pd.DataFrame) -> DashboardSummary:
     items = _normalize_items(items)
     spend = _sum_or_zero(items.get("spend", pd.Series(dtype=float)))
+    impressions = _sum_or_zero(items.get("impressions", pd.Series(dtype=float)))
     activations = _sum_or_zero(items.get("activations", pd.Series(dtype=float)))
     first_pay_count = _sum_or_zero(items.get("first_pay_count", pd.Series(dtype=float)))
     return DashboardSummary(
         total_spend=spend,
+        total_impressions=impressions,
         activations=activations,
         activation_cost=_safe_ratio(spend, activations),
         first_pay_count=first_pay_count,
@@ -1094,6 +1214,20 @@ def _normalize_channel_comparison(comparison: pd.DataFrame) -> pd.DataFrame:
     return normalized[CHANNEL_COMPARISON_COLUMNS].reset_index(drop=True)
 
 
+def _has_missing_comparison_metric(comparison: pd.DataFrame) -> bool:
+    if comparison.empty:
+        return False
+    for metric in COMPARISON_METRICS:
+        metric_columns = [
+            f"{metric}_current",
+            f"{metric}_previous",
+            f"{metric}_change_rate",
+        ]
+        if all(pd.to_numeric(comparison.get(column), errors="coerce").isna().all() for column in metric_columns):
+            return True
+    return False
+
+
 def _overview_growth_by_channel(channel_comparison: Optional[pd.DataFrame]) -> dict[str, pd.Series]:
     if channel_comparison is None or channel_comparison.empty or "channel" not in channel_comparison.columns:
         return {}
@@ -1109,7 +1243,7 @@ def _overview_table_row(
     growth_row: Optional[pd.Series],
 ) -> dict[str, object]:
     row: dict[str, object] = {"channel": channel}
-    for metric in ["spend", "activations", "activation_cost", "first_pay_count", "first_pay_cost"]:
+    for metric in ["spend", "impressions", "activations", "activation_cost", "first_pay_count", "first_pay_cost"]:
         row[metric] = values.get(metric, pd.NA)
         rate_column = f"{metric}_change_rate"
         row[rate_column] = pd.NA if growth_row is None else growth_row.get(rate_column, pd.NA)

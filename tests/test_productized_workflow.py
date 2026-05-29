@@ -19,6 +19,7 @@ from ops_data_workflow.storage import (
     delete_batch_permanently,
     list_file_backups,
     load_category_mappings,
+    load_douyin_id_bridge,
     load_topic_labels_for_batch,
     move_batch_to_file_backup,
     purge_history_state,
@@ -26,7 +27,11 @@ from ops_data_workflow.storage import (
     restore_file_backup,
     upsert_category_mappings,
 )
-from ops_data_workflow.upload_input import infer_period_from_upload_names, materialize_uploaded_files
+from ops_data_workflow.upload_input import (
+    detect_upload_channel_conflicts,
+    infer_period_from_upload_names,
+    materialize_uploaded_files,
+)
 from ops_data_workflow.workflow import run_archived_workflow
 from tests.test_workflow import _write_raw_fixture
 
@@ -45,6 +50,13 @@ def _workbook_bytes(frame: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         frame.to_excel(writer, sheet_name="sheet1", index=False)
     return buffer.getvalue()
+
+
+def _write_xlsx(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for sheet_name, frame in sheets.items():
+            frame.to_excel(writer, sheet_name=sheet_name, index=False)
 
 
 class ProductizedWorkflowTests(unittest.TestCase):
@@ -89,7 +101,30 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertTrue((result.raw_dir / "B站.xlsx").exists())
             self.assertTrue((result.raw_dir / "小红书商业化.csv").exists())
             self.assertTrue((result.raw_dir / "抖音商业化.csv").exists())
-            self.assertEqual(len(result.original_files), 3)
+            self.assertFalse((tmp_path / "uploaded_originals").exists())
+            self.assertEqual(len(result.original_files), 2)
+
+    def test_materialize_uploaded_files_ignores_generated_channel_clean_workbooks(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = materialize_uploaded_files(
+                [
+                    FakeUpload(
+                        "小红书市场部_clean.xlsx",
+                        _workbook_bytes(pd.DataFrame([{"周期": "2026-05-19 至 2026-05-25"}])),
+                    ),
+                    FakeUpload(
+                        "小红书市场部.xlsx",
+                        _workbook_bytes(pd.DataFrame([{"笔记/素材ID": "note-1", "消费": 10, "激活数": 1}])),
+                    ),
+                ],
+                tmp_path / "raw",
+            )
+
+            self.assertFalse((result.raw_dir / "小红书市场部_clean.xlsx").exists())
+            self.assertFalse((result.raw_dir.parent / "uploaded_originals" / "小红书市场部_clean.xlsx").exists())
+            self.assertTrue((result.raw_dir / "小红书市场部.xlsx").exists())
+            self.assertEqual([path.name for path in result.original_files], ["小红书市场部.xlsx"])
 
     def test_materialize_uploaded_files_replaces_same_channel_and_keeps_other_channels(self):
         with TemporaryDirectory() as tmp:
@@ -121,6 +156,39 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertFalse((raw_dir / "抖音商业化旧文件.csv").exists())
             self.assertTrue((raw_dir / "抖音商业化新文件.csv").exists())
             self.assertTrue((raw_dir / "B站.csv").exists())
+
+    def test_materialize_uploaded_files_rejects_existing_channel_by_default(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw" / "20260401-20260407"
+            raw_dir.mkdir(parents=True)
+            existing = raw_dir / "抖音商业化旧文件.csv"
+            existing.write_text(
+                "视频标题,视频id,素材ID,消耗,展示数,点击数,激活数,付费次数,内容类型\n旧标题,old,old-mat,1,2,1,1,0,资讯\n",
+                encoding="utf-8-sig",
+            )
+            other_channel = raw_dir / "B站.csv"
+            other_channel.write_text(
+                "视频BVID,视频标题,花费,展示量,点击量,应用激活数,应用内付费\nBV1,B站标题,10,100,10,1,0\n",
+                encoding="utf-8-sig",
+            )
+            uploads = [
+                FakeUpload(
+                    "抖音商业化新文件.csv",
+                    "视频标题,视频id,素材ID,消耗,展示数,点击数,激活数,付费次数,内容类型\n新标题,new,new-mat,9,20,10,3,1,股友说\n".encode(
+                        "utf-8-sig"
+                    ),
+                )
+            ]
+
+            conflicts = detect_upload_channel_conflicts(uploads, raw_dir)
+            with self.assertRaisesRegex(FileExistsError, "本地已存在渠道"):
+                materialize_uploaded_files(uploads, raw_dir)
+
+            self.assertEqual([conflict.channel for conflict in conflicts], ["抖音商业化"])
+            self.assertTrue(existing.exists())
+            self.assertTrue(other_channel.exists())
+            self.assertFalse((raw_dir / "抖音商业化新文件.csv").exists())
 
     def test_social_uploads_replace_same_business_channel_across_wechat_tencent_video_account(self):
         with TemporaryDirectory() as tmp:
@@ -443,6 +511,117 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertEqual(item_count, len(result.canonical))
             self.assertEqual(ai_count, 1)
 
+    def test_archived_workflow_materializes_cleaned_workbook_before_analysis(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            _write_xlsx(
+                raw_dir / "B站.xlsx",
+                {
+                    "Sheet2": pd.DataFrame(
+                        [
+                            {
+                                "单元名称": "BV001",
+                                "Up主mid": "1622777305",
+                                "求和项:总花费": 10.0,
+                                "求和项:应用激活数": 2,
+                                "求和项:应用内首次付费次数": 1,
+                            }
+                        ]
+                    ),
+                    "Sheet1": pd.DataFrame(
+                        [
+                            {
+                                "单元名称": "BV001",
+                                "Up主mid": "1622777305",
+                                "总花费": 10.0,
+                                "应用激活数": 2,
+                                "应用内首次付费次数": 1,
+                            }
+                        ]
+                    ),
+                },
+            )
+
+            result = run_archived_workflow(
+                raw_dir,
+                "2026-05-15",
+                "2026-05-21",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=tmp_path / "workflow.sqlite3",
+                env_path=tmp_path / "missing.env",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            self.assertTrue((raw_dir / "cleaned.xlsx").exists())
+            self.assertTrue((raw_dir / "period_manifest.json").exists())
+            self.assertTrue((result.archive_dir / "raw" / "cleaned.xlsx").exists())
+            import_log = pd.read_excel(raw_dir / "cleaned.xlsx", sheet_name="导入日志")
+            self.assertEqual(set(import_log["sheet_name"]), {"Sheet1", "Sheet2"})
+            self.assertEqual(len(result.canonical), 1)
+            self.assertAlmostEqual(result.canonical["spend"].sum(), 10.0)
+            self.assertTrue(result.canonical["source_sheet"].replace("", pd.NA).notna().all())
+
+    def test_archived_workflow_replaces_same_period_rows_in_place(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            _write_raw_fixture(raw_dir)
+
+            first = run_archived_workflow(
+                raw_dir,
+                "2026-04-01",
+                "2026-04-30",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=db_path,
+                env_path=tmp_path / "missing.env",
+            )
+            _write_xlsx(
+                raw_dir / "小红书商业化.xlsx",
+                {
+                    "sheet1": pd.DataFrame(
+                        [
+                            {
+                                "标题": "第二次导入内容",
+                                "笔记ID": "note-second",
+                                "发布作者": "同花顺理财",
+                                "类型": "图文",
+                                "内容分类": "热点行情",
+                                "消费": 9,
+                                "展现量": 90,
+                                "点击量": 9,
+                                "激活数": 3,
+                                "首次付费次数": 1,
+                            }
+                        ]
+                    )
+                },
+            )
+
+            second = run_archived_workflow(
+                raw_dir,
+                "2026-04-01",
+                "2026-04-30",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=db_path,
+                env_path=tmp_path / "missing.env",
+            )
+
+            self.assertEqual(second.batch_id, first.batch_id)
+            with closing(sqlite3.connect(db_path)) as conn:
+                batch_count = conn.execute("select count(*) from upload_batches").fetchone()[0]
+                canonical_count = conn.execute("select count(*) from canonical_items").fetchone()[0]
+                ai_count = conn.execute("select count(*) from ai_reports").fetchone()[0]
+            self.assertEqual(batch_count, 1)
+            self.assertEqual(canonical_count, len(second.canonical))
+            self.assertEqual(ai_count, 1)
+
     def test_archived_workflow_emits_progress_messages(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -465,7 +644,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertIn("正在归档原始文件", messages)
             self.assertIn("正在读取渠道数据并标准化", messages)
             self.assertIn("正在校验数据质量与题材分类", messages)
-            self.assertIn("正在写入历史库并生成下载文件", messages)
+            self.assertIn("正在写入周期库并生成当前下载文件", messages)
             self.assertEqual(messages[-1], "报告生成完成")
 
     def test_archived_workflow_adds_new_columns_to_existing_sqlite_tables(self):
@@ -769,6 +948,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
                         "视频标题": "人工审核过的未知主题",
                         "视频id": "dy-map",
                         "素材ID": "mat-map",
+                        "账号": "同花顺投资",
                         "消耗": 100.0,
                         "展示数": 1000,
                         "点击数": 100,
@@ -817,6 +997,94 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertEqual(row["category_source"], "历史审核映射")
             self.assertEqual(row["review_status"], "已确认")
 
+    def test_archived_workflow_persists_and_reuses_douyin_id_bridge(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            first_raw = tmp_path / "first_raw"
+            second_raw = tmp_path / "second_raw"
+            first_raw.mkdir()
+            second_raw.mkdir()
+            _write_xlsx(
+                first_raw / "原生内容投稿.xlsx",
+                {
+                    "抖音渠道": pd.DataFrame(
+                        [
+                            {
+                                "编号": 1,
+                                "投稿时间": "05 20",
+                                "内容链接": "1.28 tRk:/ 人和人的缘分就像炒股 # 同花顺股友说 https://v.douyin.com/abc/ 复制此链接，打开抖音搜索，直接观看视频！",
+                                "账号": "投资号",
+                                "内容类型": "股友说",
+                            }
+                        ]
+                    )
+                },
+            )
+            pd.DataFrame(
+                [
+                    {
+                        "视频标题": "人和人的缘分就像炒股 #投资",
+                        "视频id": "v02033g10000bridge",
+                        "素材ID": "mat-bridge",
+                        "账号": "同花顺投资",
+                        "消耗": 100.0,
+                        "展示数": 1000,
+                        "点击数": 100,
+                        "激活数": 10,
+                        "付费次数": 2,
+                    }
+                ]
+            ).to_csv(first_raw / "抖音商业化.csv", index=False, encoding="utf-8-sig")
+
+            first = run_archived_workflow(
+                first_raw,
+                "2026-05-15",
+                "2026-05-21",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=db_path,
+                env_path=tmp_path / "missing.env",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+            bridge = load_douyin_id_bridge(db_path)
+            self.assertIn("v02033g10000bridge", set(bridge["id_value"]))
+            self.assertEqual(first.canonical.iloc[0]["ledger_match_source"], "账号+标题")
+
+            pd.DataFrame(
+                [
+                    {
+                        "视频标题": "第二次导出的投放标题已经完全改写",
+                        "视频id": "v02033g10000bridge",
+                        "素材ID": "mat-bridge",
+                        "账号": "同花顺投资",
+                        "消耗": 80.0,
+                        "展示数": 800,
+                        "点击数": 80,
+                        "激活数": 8,
+                        "付费次数": 1,
+                    }
+                ]
+            ).to_csv(second_raw / "抖音商业化.csv", index=False, encoding="utf-8-sig")
+
+            second = run_archived_workflow(
+                second_raw,
+                "2026-05-22",
+                "2026-05-28",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=db_path,
+                env_path=tmp_path / "missing.env",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            row = second.canonical.iloc[0]
+            self.assertEqual(row["account"], "同花顺投资")
+            self.assertEqual(row["manual_category"], "股友说")
+            self.assertEqual(row["content_url"], "https://v.douyin.com/abc/")
+            self.assertEqual(row["ledger_match_source"], "反馈ID桥表")
+            self.assertEqual(row["category_l2"], "股友说")
+
     def test_workflow_builds_account_audit_and_top_content_items(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -837,13 +1105,17 @@ class ProductizedWorkflowTests(unittest.TestCase):
             workbook = load_workbook(result.analysis_xlsx, read_only=True)
             self.assertIn("人工审核表", workbook.sheetnames)
             self.assertIn("账号映射表", workbook.sheetnames)
+            self.assertIn("账号过滤规则", workbook.sheetnames)
+            self.assertIn("账号过滤明细", workbook.sheetnames)
             self.assertIn("分渠道总数据", workbook.sheetnames)
             self.assertIn("分渠道栏目题材排名", workbook.sheetnames)
             workbook.close()
 
             account_audit = result.account_audit.set_index(["channel", "expected_account"])
             self.assertEqual(account_audit.loc[("小红书", "同花顺投资"), "status"], "缺失")
-            self.assertIn("同花顺新手福利官", set(result.account_audit["expected_account"]))
+            self.assertIn("同顺股民社区", set(result.account_audit["expected_account"]))
+            self.assertNotIn("研习社", set(result.account_audit["expected_account"]))
+            self.assertNotIn("同花顺新手福利官", set(result.account_audit["expected_account"]))
 
             self.assertGreater(len(result.top_content_items), 0)
             self.assertLessEqual(result.top_content_items.groupby("channel").size().max(), 15)

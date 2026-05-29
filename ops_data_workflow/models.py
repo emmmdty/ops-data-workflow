@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
@@ -37,3 +37,6 @@ class WorkflowResult:
     canonical_csv: Path
     total_summary_xlsx: Path
     archive_dir: Path
+    channel_clean_workbooks: list[Path] = field(default_factory=list)
+    account_filter_rules: pd.DataFrame = field(default_factory=pd.DataFrame)
+    account_filter_details: pd.DataFrame = field(default_factory=pd.DataFrame)

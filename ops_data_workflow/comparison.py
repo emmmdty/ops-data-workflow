@@ -7,6 +7,7 @@ import pandas as pd
 
 COMPARISON_METRICS = [
     "spend",
+    "impressions",
     "activations",
     "activation_cost",
     "first_pay_count",

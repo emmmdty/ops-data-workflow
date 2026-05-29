@@ -169,6 +169,10 @@ def period_raw_dir_name(period: ReviewPeriod) -> str:
     return f"{period.period_start.replace('-', '')}-{period.period_end.replace('-', '')}"
 
 
+def period_result_id(period: ReviewPeriod) -> str:
+    return f"{period.source_type}:{period.period_level}:{period.period_key}"
+
+
 def period_metadata_from_dates(
     period_start: str,
     period_end: str,

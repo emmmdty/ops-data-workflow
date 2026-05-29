@@ -49,10 +49,14 @@ def generate_ai_summary(
     env_path: Optional[Path] = None,
     platform_summary: Optional[pd.DataFrame] = None,
     platform_category_summary: Optional[pd.DataFrame] = None,
+    external_context: Optional[object] = None,
 ) -> str:
     settings = resolve_deepseek_settings(env_path)
     if not settings.configured:
-        return f"{settings.public_status}，已跳过 AI 结论生成。"
+        return (
+            f"{settings.public_status}，已使用本地规则生成数据摘要。\n\n"
+            + _build_local_summary(total_summary, platform_summary, channel_comparison, external_context)
+        )
 
     payload = _build_payload(
         total_summary,
@@ -63,11 +67,15 @@ def generate_ai_summary(
         comparison_note,
         platform_summary,
         platform_category_summary,
+        external_context,
     )
     prompt = (
         "你是原生内容投放数据分析助手。只能使用下面 JSON 中的数字和文本，"
-        "不要编造未提供的数据。主题是“不同渠道、不同栏目题材的转化率分析并针对渠道进行选题定点投流”。"
-        "请用中文输出四段：整体结论、渠道差异、栏目题材转化差异、定点投流建议。\n\n"
+        "不要编造未提供的数据。外部背景只能作为可能影响因素，不能写成确定因果。"
+        "主题是“不同渠道、不同栏目题材的转化率分析并针对渠道进行选题定点投流”。"
+        "请用中文输出：总体分析、分渠道分析、栏目题材转化差异、定点投流建议。"
+        "总体分析必须覆盖总消耗、总曝光、激活数、激活成本、付费数、付费成本的升降和可能原因。"
+        "分渠道分析必须逐个渠道覆盖这六项指标。\n\n"
         f"{json.dumps(payload, ensure_ascii=False)}"
     )
     try:
@@ -239,6 +247,7 @@ def _build_payload(
     comparison_note: str,
     platform_summary: Optional[pd.DataFrame] = None,
     platform_category_summary: Optional[pd.DataFrame] = None,
+    external_context: Optional[object] = None,
 ) -> dict[str, Any]:
     return {
         "total_summary": _records(total_summary),
@@ -251,7 +260,86 @@ def _build_payload(
         "account_audit": _records(account_audit),
         "channel_comparison": _records(channel_comparison),
         "comparison_note": comparison_note,
+        "external_context": _external_context_payload(external_context),
     }
+
+
+def _build_local_summary(
+    total_summary: pd.DataFrame,
+    platform_summary: Optional[pd.DataFrame],
+    channel_comparison: pd.DataFrame,
+    external_context: Optional[object],
+) -> str:
+    lines = ["## 总体分析"]
+    total = total_summary[total_summary["channel"].fillna("").astype(str).eq("总计")].head(1) if "channel" in total_summary.columns else total_summary.head(1)
+    total_row = total.iloc[0] if not total.empty else pd.Series(dtype=object)
+    lines.append(
+        "- 本周期："
+        f"总消耗 {_fmt_number(total_row.get('spend'), 0)}、总曝光 {_fmt_number(total_row.get('impressions'), 0)}、"
+        f"激活数 {_fmt_number(total_row.get('activations'), 0)}、激活成本 {_fmt_number(total_row.get('activation_cost'), 1)}、"
+        f"付费数 {_fmt_number(total_row.get('first_pay_count'), 0)}、付费成本 {_fmt_number(total_row.get('first_pay_cost'), 1)}。"
+    )
+    comparison = channel_comparison.copy() if channel_comparison is not None else pd.DataFrame()
+    if not comparison.empty and "channel" in comparison.columns:
+        total_change = comparison[comparison["channel"].fillna("").astype(str).eq("总计")].head(1)
+        if not total_change.empty:
+            change = total_change.iloc[0]
+            lines.append(
+                "- 环比："
+                f"消耗 {_fmt_change(change.get('spend_change_rate'))}、曝光 {_fmt_change(change.get('impressions_change_rate'))}、"
+                f"激活 {_fmt_change(change.get('activations_change_rate'))}、激活成本 {_fmt_change(change.get('activation_cost_change_rate'))}、"
+                f"付费 {_fmt_change(change.get('first_pay_count_change_rate'))}、付费成本 {_fmt_change(change.get('first_pay_cost_change_rate'))}。"
+            )
+    lines.append(f"- 外部背景：{_external_context_text(external_context)}")
+    lines.append("## 分渠道分析")
+    channels = platform_summary if platform_summary is not None else pd.DataFrame()
+    if channels.empty:
+        lines.append("- 暂无渠道明细。")
+    else:
+        for _, row in channels.head(20).iterrows():
+            channel = str(row.get("channel", row.get("platform", "")) or "").strip() or "未知渠道"
+            lines.append(
+                f"- **{channel}**：消耗 {_fmt_number(row.get('spend'), 0)}、曝光 {_fmt_number(row.get('impressions'), 0)}、"
+                f"激活 {_fmt_number(row.get('activations'), 0)}、激活成本 {_fmt_number(row.get('activation_cost'), 1)}、"
+                f"付费 {_fmt_number(row.get('first_pay_count'), 0)}、付费成本 {_fmt_number(row.get('first_pay_cost'), 1)}。"
+            )
+    return "\n".join(lines)
+
+
+def _external_context_payload(external_context: Optional[object]) -> dict[str, Any]:
+    if external_context is None:
+        return {"summary": "", "sources": []}
+    if isinstance(external_context, Mapping):
+        return {
+            "summary": str(external_context.get("summary", "") or ""),
+            "sources": list(external_context.get("sources", []) or []),
+        }
+    return {
+        "summary": str(getattr(external_context, "summary", "") or ""),
+        "sources": list(getattr(external_context, "sources", []) or []),
+    }
+
+
+def _external_context_text(external_context: Optional[object]) -> str:
+    payload = _external_context_payload(external_context)
+    return payload["summary"] or "未取到外部背景，以下判断仅基于站内投放数据。"
+
+
+def _fmt_number(value: object, decimals: int) -> str:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(number):
+        return "暂无"
+    if decimals <= 0:
+        return f"{float(number):,.0f}"
+    return f"{float(number):,.{decimals}f}".rstrip("0").rstrip(".")
+
+
+def _fmt_change(value: object) -> str:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(number):
+        return "暂无"
+    sign = "+" if float(number) > 0 else ""
+    return f"{sign}{float(number) * 100:.1f}%"
 
 
 def _records(frame: pd.DataFrame) -> list[dict[str, Any]]:

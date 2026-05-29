@@ -14,12 +14,15 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
+from .channel_clean import write_channel_clean_workbooks
+from .content_ledger import apply_content_ledger, load_content_ledger
 from .periods import ReviewPeriod, infer_review_period_from_text, period_raw_dir_name
 from .pipeline import (
     NUMERIC_COLUMNS,
     STANDARD_COLUMNS,
     TABULAR_SUFFIXES,
     _is_csv,
+    _matches_core_metric_alias,
     _preprocess_canonical,
     _read_table,
     _social_market_channel,
@@ -42,6 +45,8 @@ REVIEW_ACTION_KEEP = "保留"
 REVIEW_ACTION_PENDING = "待审核"
 SYNTHETIC_ROW_ID_COLUMN = "__清洗行ID"
 SYNTHETIC_ROW_TITLE_COLUMN = "__清洗行标题"
+GROUPED_CONTENT_TYPE_COLUMN = "__分组内容类型"
+GROUPED_CONTENT_TYPE_LABELS = {"图文", "视频", "直播", "短视频"}
 
 EXTRA_CANONICAL_COLUMNS = [
     "source_sheet",
@@ -195,12 +200,16 @@ def clean_source_directory(
     original_root = raw_root / "uploaded_originals" / import_id
     original_root.mkdir(parents=True, exist_ok=True)
     raw_root.mkdir(parents=True, exist_ok=True)
+    ledger = load_content_ledger(source_root, default_year=default_year, config_path=_default_content_ledger_config())
+    ledger_source_files = {Path(path).resolve() for path in ledger.attrs.get("source_files", set())}
 
     grouped: dict[tuple[str, str], list[tuple[ReviewPeriod, Path, str, str]]] = defaultdict(list)
     duplicate_files: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
     first_by_hash: dict[str, tuple[ReviewPeriod, Path, str]] = {}
 
     for path in _iter_tabular_files(source_root):
+        if path.resolve() in ledger_source_files:
+            continue
         relative = path.relative_to(source_root).as_posix()
         period = infer_review_period_from_text(relative, default_year)
         if period is None:
@@ -249,11 +258,19 @@ def clean_source_directory(
         canonical["period_start"] = period.period_start
         canonical["period_end"] = period.period_end
         canonical = _ensure_cleaning_columns(canonical)
+        canonical = apply_content_ledger(canonical, ledger)
         preprocessing = _preprocess_canonical(canonical)
         cleaned = _mark_title_conflicts(preprocessing["canonical"])
         cleaned = _ensure_cleaning_columns(cleaned)
         cleaned["review_action"] = cleaned["needs_manual_review"].map(
             lambda value: REVIEW_ACTION_PENDING if bool(value) else REVIEW_ACTION_KEEP
+        )
+        write_channel_clean_workbooks(
+            cleaned,
+            raw_dir,
+            period_label=period.period_label,
+            period_start=period.period_start,
+            period_end=period.period_end,
         )
         duplicate_content = _build_duplicate_content_sheet(
             preprocessing["duplicate_merge_details"],
@@ -305,10 +322,13 @@ def clean_source_directory(
 def clean_raw_period_dir(raw_dir: Path, period: ReviewPeriod, *, default_year: int) -> CleanedPeriodBucket:
     """Clean an already-materialized raw period directory in place."""
     raw_dir = Path(raw_dir)
+    ledger = load_content_ledger(raw_dir, default_year=default_year, config_path=_default_content_ledger_config())
+    ledger_source_files = {Path(path).resolve() for path in ledger.attrs.get("source_files", set())}
     source_paths = [
         path.relative_to(raw_dir).as_posix()
         for path in _iter_tabular_files(raw_dir)
         if path.name != CLEANED_WORKBOOK_NAME
+        and path.resolve() not in ledger_source_files
     ]
     frames: list[pd.DataFrame] = []
     ignored_rows: list[dict[str, object]] = []
@@ -316,7 +336,7 @@ def clean_raw_period_dir(raw_dir: Path, period: ReviewPeriod, *, default_year: i
     duplicate_files: list[dict[str, object]] = []
     first_by_hash: dict[str, str] = {}
     for path in _iter_tabular_files(raw_dir):
-        if path.name == CLEANED_WORKBOOK_NAME:
+        if path.name == CLEANED_WORKBOOK_NAME or path.resolve() in ledger_source_files:
             continue
         relative = path.relative_to(raw_dir).as_posix()
         digest = _sha256(path)
@@ -339,11 +359,20 @@ def clean_raw_period_dir(raw_dir: Path, period: ReviewPeriod, *, default_year: i
     canonical = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=STANDARD_COLUMNS)
     canonical["period_start"] = period.period_start
     canonical["period_end"] = period.period_end
-    preprocessing = _preprocess_canonical(_ensure_cleaning_columns(canonical))
+    canonical = _ensure_cleaning_columns(canonical)
+    canonical = apply_content_ledger(canonical, ledger)
+    preprocessing = _preprocess_canonical(canonical)
     cleaned = _mark_title_conflicts(preprocessing["canonical"])
     cleaned = _ensure_cleaning_columns(cleaned)
     cleaned["review_action"] = cleaned["needs_manual_review"].map(
         lambda value: REVIEW_ACTION_PENDING if bool(value) else REVIEW_ACTION_KEEP
+    )
+    write_channel_clean_workbooks(
+        cleaned,
+        raw_dir,
+        period_label=period.period_label,
+        period_start=period.period_start,
+        period_end=period.period_end,
     )
     duplicate_file_frame = pd.DataFrame(
         duplicate_files,
@@ -741,8 +770,9 @@ def _standardize_social(raw: pd.DataFrame, source_file: str, channel: str, *, pl
 
 
 def _standardize_douyin_cleaning(raw: pd.DataFrame, source_file: str, channel: str) -> pd.DataFrame:
+    prepared = _add_grouped_content_type(raw)
     return _standardize(
-        raw,
+        prepared,
         platform=channel,
         platform_group="抖音",
         channel=channel,
@@ -756,7 +786,7 @@ def _standardize_douyin_cleaning(raw: pd.DataFrame, source_file: str, channel: s
             "cover_url": ["视频封面图"],
             "content_url": ["视频链接"],
             "primary_category": [],
-            "manual_category": ["内容类型"],
+            "manual_category": ["内容类型", GROUPED_CONTENT_TYPE_COLUMN],
             "spend": ["消耗"],
             "impressions": ["展示数"],
             "clicks": ["点击数"],
@@ -764,6 +794,32 @@ def _standardize_douyin_cleaning(raw: pd.DataFrame, source_file: str, channel: s
             "first_pay_count": ["付费次数", "付费数"],
         },
     )
+
+
+def _add_grouped_content_type(raw: pd.DataFrame) -> pd.DataFrame:
+    prepared = raw.copy()
+    if GROUPED_CONTENT_TYPE_COLUMN in prepared.columns:
+        return prepared
+    if "创建时间" not in prepared.columns:
+        prepared[GROUPED_CONTENT_TYPE_COLUMN] = ""
+        return prepared
+
+    grouped_values: list[str] = []
+    current_group = ""
+    for _, row in prepared.iterrows():
+        label = _grouped_content_type_label(row.get("创建时间"))
+        if label:
+            current_group = label
+        elif not _blank(row.get("创建时间")):
+            current_group = ""
+        grouped_values.append(current_group)
+    prepared[GROUPED_CONTENT_TYPE_COLUMN] = grouped_values
+    return prepared
+
+
+def _grouped_content_type_label(value: object) -> str:
+    text = "" if _blank(value) else str(value).strip()
+    return text if text in GROUPED_CONTENT_TYPE_LABELS else ""
 
 
 def _standardize_generic(raw: pd.DataFrame, source_file: str, channel: str) -> pd.DataFrame:
@@ -815,6 +871,10 @@ def _source_kind(path: Path, columns: Iterable[object]) -> str:
     if "微信" in name or "腾讯" in name or "视频号" in name:
         return "social"
     return "generic"
+
+
+def _uses_content_id_only_cleaning_source(candidate: SheetCandidate, frame: pd.DataFrame) -> bool:
+    return _source_kind(candidate.source_path, frame.columns) in {"bilibili", "xhs_commercial", "xhs_market"}
 
 
 def _merge_xiaohongshu_content_map(raw: pd.DataFrame, content_map: pd.DataFrame) -> pd.DataFrame:
@@ -885,13 +945,17 @@ def _remove_statistical_rows(
     ignored: list[dict[str, object]] = []
     keep_mask = pd.Series(True, index=prepared.index)
     rows_to_ignore: dict[int, str] = {}
+    keep_identified_id_duplicates = _uses_content_id_only_cleaning_source(candidate, prepared)
 
     for index, row in prepared.iterrows():
         if not _row_has_metric(row, metric_columns):
             continue
         text = _row_text(row)
         is_text_summary = any(token in text for token in SUMMARY_TOKENS)
-        if _metrics_equal_previous_sum(prepared, index, metric_columns):
+        if (
+            _metrics_equal_previous_sum(prepared, index, metric_columns)
+            and not (keep_identified_id_duplicates and not _is_identity_blank(row, prepared) and not is_text_summary)
+        ):
             rows_to_ignore[int(index)] = "汇总行：指标等于前面明细合计，已记录但不进入统计。"
         elif is_text_summary and _identity_columns_present(prepared):
             rows_to_ignore[int(index)] = "汇总行：包含合计/汇总标识，已记录但不进入统计。"
@@ -1002,7 +1066,11 @@ def _additive_metric_columns(frame: pd.DataFrame) -> list[str]:
     columns: list[str] = []
     for column in frame.columns:
         text = str(column).strip()
-        if text in ADDITIVE_METRIC_TOKENS or text.startswith("求和项:"):
+        if (
+            text in ADDITIVE_METRIC_TOKENS
+            or text.startswith("求和项:")
+            or any(_matches_core_metric_alias(metric, column) for metric in NUMERIC_COLUMNS)
+        ):
             columns.append(column)
     return columns
 
@@ -1045,7 +1113,7 @@ def _metrics_equal_previous_sum(frame: pd.DataFrame, index: object, metric_colum
         checked += 1
         if _numbers_close(float(current), float(previous_sum)):
             matched += 1
-    return checked >= 2 and matched >= max(2, checked // 2)
+    return checked >= 2 and matched == checked
 
 
 def _matching_group_subtotal(
@@ -1073,7 +1141,7 @@ def _matching_group_subtotal(
                 checked += 1
                 if _numbers_close(float(current), float(group_sum)):
                     matched += 1
-            if checked >= 2 and matched >= max(2, checked // 2):
+            if checked >= 2 and matched == checked:
                 return str(column), str(group_value)
     return "", ""
 
@@ -1287,10 +1355,23 @@ def _iter_tabular_files(root: Path) -> list[Path]:
         (
             path
             for path in Path(root).rglob("*")
-            if path.is_file() and path.suffix.lower() in TABULAR_SUFFIXES and not path.name.startswith("~$")
+            if path.is_file()
+            and path.suffix.lower() in TABULAR_SUFFIXES
+            and not path.name.startswith("~$")
+            and not _is_generated_channel_clean_file(path)
+            and "channel_clean" not in path.parts
         ),
         key=lambda path: (_looks_like_duplicate_copy(path.name), path.as_posix()),
     )
+
+
+def _is_generated_channel_clean_file(path: Path) -> bool:
+    return Path(path).stem.lower().endswith("_clean")
+
+
+def _default_content_ledger_config() -> Path | None:
+    candidate = Path("config/feishu_sources.yml")
+    return candidate if candidate.exists() else None
 
 
 def _reset_period_raw_dir(raw_dir: Path) -> None:

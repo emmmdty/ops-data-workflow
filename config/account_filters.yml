@@ -1,0 +1,72 @@
+platforms:
+  xiaohongshu:
+    display_name: 小红书
+    match_channels:
+      - 小红书
+    filter_enabled: true
+    include_accounts:
+      - 同花顺投资
+      - 同顺股民社区
+      - 同花顺理财
+      - 同顺财经
+      - 问财
+      - 喵懂投资
+    aliases:
+      投资号: 同花顺投资
+      同花顺投资: 同花顺投资
+      股民社区: 同顺股民社区
+      同顺股民社区: 同顺股民社区
+      同花顺股民社区: 同顺股民社区
+      理财: 同花顺理财
+      同花顺理财: 同花顺理财
+      财经号: 同顺财经
+      同顺财经: 同顺财经
+      同花顺财经: 同顺财经
+      问财: 问财
+      喵懂投资: 喵懂投资
+    exclude_blank: true
+
+  douyin:
+    display_name: 抖音
+    match_channels:
+      - 抖音
+    filter_enabled: false
+    include_accounts:
+      - 同花顺投资
+      - 同花顺股民社区
+      - 同花顺财富
+      - 同花顺财经
+      - 同花顺问财
+      - 喵懂投资
+      - 同花顺期货通
+    aliases:
+      投资号: 同花顺投资
+      同花顺投资: 同花顺投资
+      股民社区: 同花顺股民社区
+      同顺股民社区: 同花顺股民社区
+      同花顺股民社区: 同花顺股民社区
+      财富: 同花顺财富
+      同花顺财富: 同花顺财富
+      财经号: 同花顺财经
+      财经: 同花顺财经
+      同花顺财经: 同花顺财经
+      问财: 同花顺问财
+      同花顺问财: 同花顺问财
+      喵懂投资: 喵懂投资
+      期货通: 同花顺期货通
+      同花顺期货通: 同花顺期货通
+    exclude_blank: false
+
+  bilibili:
+    display_name: B站
+    match_channels:
+      - B站
+    filter_enabled: false
+    include_accounts:
+      - 同花顺投资
+    aliases:
+      投资号: 同花顺投资
+      同花顺投资: 同花顺投资
+    id_aliases:
+      "1622777305": 同花顺投资
+    exclude_blank: false

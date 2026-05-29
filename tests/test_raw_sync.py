@@ -128,7 +128,7 @@ class RawSyncTests(unittest.TestCase):
             self.assertEqual([item.status for item in third], ["skipped", "generated"])
             self.assertTrue(first[0].batch_id)
             self.assertTrue(third[1].batch_id)
-            self.assertNotEqual(first[1].batch_id, third[1].batch_id)
+            self.assertEqual(first[1].batch_id, third[1].batch_id)
             with closing(sqlite3.connect(tmp_path / "workflow.sqlite3")) as conn:
                 periods = conn.execute(
                     """
@@ -150,10 +150,90 @@ class RawSyncTests(unittest.TestCase):
                 periods,
                 [
                     ("2026-05-01", "2026-05-07", "week", "upload", 1),
-                    ("2026-05-08", "2026-05-14", "week", "upload", 2),
+                    ("2026-05-08", "2026-05-14", "week", "upload", 1),
                 ],
             )
             self.assertEqual(latest_new_count, 1)
+
+    def test_sync_raw_periods_ignores_generated_clean_artifacts_in_signature(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_root = tmp_path / "data" / "raw"
+            period_dir = raw_root / "20260508-20260514"
+            _write_xiaohongshu_file(period_dir / "小红书账号投放数据.xlsx", "note-new", 10.0)
+
+            first = sync_raw_periods(
+                raw_root,
+                db_path=tmp_path / "workflow.sqlite3",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                env_path=tmp_path / "missing.env",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+            (period_dir / "channel_clean").mkdir(exist_ok=True)
+            _write_xiaohongshu_file(period_dir / "channel_clean" / "小红书账号投放数据_clean.xlsx", "note-clean", 999.0)
+            second = sync_raw_periods(
+                raw_root,
+                db_path=tmp_path / "workflow.sqlite3",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                env_path=tmp_path / "missing.env",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            self.assertEqual([item.status for item in first], ["generated"])
+            self.assertEqual([item.status for item in second], ["skipped"])
+
+    def test_sync_raw_periods_uses_one_canonical_dir_for_duplicate_logical_period(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_root = tmp_path / "data" / "raw"
+            duplicate_dir = raw_root / "20260401-20260427"
+            canonical_dir = raw_root / "20260401-20260430"
+            _write_xiaohongshu_file(duplicate_dir / "小红书账号投放数据.xlsx", "note-dup", 10.0)
+            _write_xiaohongshu_file(canonical_dir / "小红书账号投放数据.xlsx", "note-canonical", 20.0)
+            (canonical_dir / "period_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "period_level": "month",
+                        "period_key": "2026-04",
+                        "period_label": "月｜2026年04月（数据时间：2026-04-01 至 2026-04-27）",
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-30",
+                        "data_start": "2026-04-01",
+                        "data_end": "2026-04-27",
+                        "source_type": "upload",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            first = sync_raw_periods(
+                raw_root,
+                db_path=tmp_path / "workflow.sqlite3",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                env_path=tmp_path / "missing.env",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+            second = sync_raw_periods(
+                raw_root,
+                db_path=tmp_path / "workflow.sqlite3",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                env_path=tmp_path / "missing.env",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            self.assertEqual([item.period_name for item in first], ["20260401-20260430"])
+            self.assertEqual([item.status for item in first], ["generated"])
+            self.assertEqual([item.status for item in second], ["skipped"])
+            with closing(sqlite3.connect(tmp_path / "workflow.sqlite3")) as conn:
+                batch_count = conn.execute("select count(*) from upload_batches").fetchone()[0]
+                spend = conn.execute("select sum(spend) from canonical_items").fetchone()[0]
+            self.assertEqual(batch_count, 1)
+            self.assertEqual(spend, 20.0)
 
     def test_sync_raw_periods_skips_backed_up_periods(self):
         with TemporaryDirectory() as tmp:

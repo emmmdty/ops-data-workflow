@@ -30,7 +30,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
 
     def test_generate_page_uses_single_upload_control(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
-        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_historical_reports")]
+        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_rollup_generator")]
 
         self.assertNotIn("GENERATE_UPLOAD_MODES", app_source)
         self.assertNotIn("generate_upload_mode", generate_source)
@@ -42,7 +42,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
 
     def test_generate_page_exposes_review_period_normalization_ui(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
-        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_historical_reports")]
+        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_rollup_generator")]
 
         self.assertIn("normalize_uploaded_periods", app_source)
         self.assertIn("preview_uploaded_periods", app_source)
@@ -55,7 +55,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
 
     def test_generate_page_exposes_stepwise_progress_status(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
-        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_historical_reports")]
+        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_rollup_generator")]
 
         self.assertIn("st.status", generate_source)
         self.assertIn("_run_with_generation_progress", app_source)
@@ -64,7 +64,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("正在整理 raw 周期目录", app_source)
         self.assertIn("正在读取渠道数据并标准化", app_source)
         self.assertIn("正在校验数据质量与题材分类", app_source)
-        self.assertIn("正在写入历史库并生成下载文件", app_source)
+        self.assertIn("正在写入周期库并生成当前下载文件", app_source)
 
     def test_app_no_longer_hardcodes_legacy_generate_period_defaults(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -74,41 +74,50 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("timedelta(days=6)", app_source)
         self.assertIn("generate_period_end_touched", app_source)
 
-    def test_app_moves_generation_parameters_out_of_sidebar_and_syncs_raw(self):
+    def test_app_moves_generation_parameters_out_of_sidebar_without_startup_raw_sync(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
 
         self.assertNotIn("with st.sidebar:", app_source)
-        self.assertIn("@st.fragment", app_source)
-        self.assertIn("run_every=", app_source)
+        self.assertNotIn("@st.fragment(run_every=", app_source)
+        self.assertNotIn("_sync_raw_data_fragment()", app_source)
         self.assertIn("sync_raw_periods", app_source)
         self.assertIn("strip_common_period_root=True", app_source)
 
-    def test_generate_page_can_view_download_and_update_history_reports(self):
+    def test_generate_page_no_longer_exposes_history_reports(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _page_content_types")]
 
-        self.assertIn("_render_historical_reports()", generate_source)
-        self.assertIn("历史报告", app_source)
-        self.assertIn("查看历史报告", app_source)
-        self.assertIn("下载历史报告", app_source)
-        self.assertIn("更新所选报告", app_source)
-        self.assertIn("read_batch_record", app_source)
-        self.assertIn("report.html", app_source)
-        self.assertIn("components.html", app_source)
+        self.assertNotIn("_render_historical_reports()", generate_source)
+        self.assertNotIn("历史报告", app_source)
+        self.assertNotIn("查看历史报告", app_source)
+        self.assertNotIn("下载历史报告", app_source)
+        self.assertNotIn("更新所选报告", app_source)
 
-    def test_app_renders_navigation_before_background_raw_sync(self):
+    def test_generate_page_warns_before_overwriting_existing_channels(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _run_with_generation_progress")]
+
+        self.assertIn("detect_upload_channel_conflicts", app_source)
+        self.assertIn("本地已存在渠道", generate_source)
+        self.assertIn("覆盖已存在渠道", generate_source)
+        self.assertIn("overwrite_existing_channels", app_source)
+
+    def test_app_does_not_run_raw_sync_after_navigation_render(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
 
-        raw_sync_call = app_source.rindex("\n_sync_raw_data_fragment()")
-        self.assertLess(app_source.index("page.run()"), raw_sync_call)
+        navigation_tail = app_source[app_source.index("page.run()") :]
+        self.assertNotIn("_sync_raw_data_fragment", navigation_tail)
+        self.assertNotIn("_run_raw_sync()", navigation_tail)
 
     def test_app_renders_total_and_platform_metric_sections(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         overview_source = app_source[app_source.index("def _page_overview") : app_source.index("def _page_generate")]
 
         self.assertIn("本周期数据总览", overview_source)
-        self.assertIn("_render_kpis(summary)", overview_source)
-        self.assertIn("环比变化", overview_source)
+        self.assertIn("_render_overview_summary_table(summary, platform_summary, channel_comparison)", overview_source)
+        self.assertNotIn("_render_kpis(summary)", overview_source)
+        self.assertNotIn('st.subheader("复盘统一字段")', overview_source)
+        self.assertNotIn('st.subheader("环比变化")', overview_source)
         self.assertIn("_render_overview_summary_table(summary, platform_summary, channel_comparison)", overview_source)
         self.assertNotIn('st.subheader("总体核心指标")', overview_source)
         self.assertNotIn('st.subheader("分平台核心结果")', overview_source)
@@ -120,8 +129,16 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         overview_source = app_source[app_source.index("def _page_overview") : app_source.index("def _page_generate")]
 
         self.assertNotIn("暂无上一同等级周期可用于环比。", overview_source)
-        self.assertIn('st.subheader("环比变化")\n    _render_overview_summary_table(summary, platform_summary, channel_comparison)', overview_source)
+        self.assertIn("_render_overview_summary_table(summary, platform_summary, channel_comparison)", overview_source)
         self.assertIn('return "（-）"', app_source)
+
+    def test_overview_renders_unified_recap_fields(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        overview_source = app_source[app_source.index("def _page_overview") : app_source.index("def _page_generate")]
+
+        self.assertIn("build_recap_summary", app_source)
+        self.assertNotIn('st.subheader("复盘统一字段")', overview_source)
+        self.assertNotIn("st.table(recap_summary", overview_source)
 
     def test_overview_delta_colors_match_business_direction(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -141,7 +158,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("_render_review_level_cards", app_source)
         self.assertIn("PERIOD_LEVEL_WEEK", app_source)
         self.assertIn("st.columns(4)", app_source)
-        self.assertIn("_render_platform_chart(platform_summary)", overview_source)
+        self.assertIn("_render_platform_chart(platform_summary, channel_comparison)", overview_source)
         self.assertIn("CHART_METRICS.items()", app_source)
         self.assertIn("updatemenus=[", app_source)
         self.assertIn('"method": "update"', app_source)
@@ -176,6 +193,42 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("_db_file_signature(APP_DB)", app_source)
         self.assertNotIn("st.button(", platform_chart_source)
         self.assertNotIn("st.rerun()", platform_chart_source)
+
+    def test_overview_cache_version_invalidates_comparison_schema_changes(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        load_source = app_source[app_source.index("def _load_overview_data") : app_source.index("def _items_period_level")]
+
+        self.assertIn("OVERVIEW_CACHE_VERSION", app_source)
+        self.assertIn("OVERVIEW_CACHE_VERSION", load_source)
+        self.assertIn("cache_version", load_source)
+
+    def test_overview_platform_chart_uses_current_previous_bars_and_growth_axis(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        platform_chart_source = app_source[
+            app_source.index("def _build_platform_chart_figure") : app_source.index("def _content_filter_panel")
+        ]
+
+        self.assertIn("channel_comparison", platform_chart_source)
+        self.assertIn('"本期"', platform_chart_source)
+        self.assertIn('"上期"', platform_chart_source)
+        self.assertIn('"环比"', platform_chart_source)
+        self.assertIn("secondary_y=True", platform_chart_source)
+        self.assertIn("yaxis2", platform_chart_source)
+
+    def test_overview_platform_chart_normalizes_bars_for_growth_analysis(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        platform_chart_source = app_source[
+            app_source.index("def _build_platform_chart_figure") : app_source.index("def _content_filter_panel")
+        ]
+
+        self.assertIn("__bar_scale", platform_chart_source)
+        self.assertIn("__current_index", platform_chart_source)
+        self.assertIn("__previous_index", platform_chart_source)
+        self.assertIn("渠道内相对指数", platform_chart_source)
+        self.assertIn("sort_values(", platform_chart_source)
+        self.assertIn('["__growth_sort", y_metric]', platform_chart_source)
+        self.assertIn("本期实际", platform_chart_source)
+        self.assertIn("上期实际", platform_chart_source)
 
     def test_app_has_chinese_upload_prompt_and_content_analysis_page(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -229,6 +282,15 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("localize_columns(_category_table_display(category_summary))", channel_source)
         self.assertNotIn("_render_short_table_blocks(_category_table_display(category_summary)", channel_source)
         self.assertLess(category_display_source.index('"category_name"'), category_display_source.index('"item_count"'))
+
+    def test_data_review_prioritizes_conflict_summary_before_editor(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        review_source = app_source[app_source.index("def _page_data_review") : app_source.index("def _page_reference_tables")]
+
+        self.assertIn("_render_conflict_priority_review(review_items)", review_source)
+        self.assertIn('st.subheader("冲突优先审核")', app_source)
+        self.assertIn('"影响消耗"', app_source)
+        self.assertLess(review_source.index("_render_conflict_priority_review(review_items)"), review_source.index("st.data_editor("))
 
     def test_navigation_uses_dynamic_channel_page_factory(self):
         app_source = Path("app.py").read_text(encoding="utf-8")

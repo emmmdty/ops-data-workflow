@@ -22,6 +22,32 @@ class HistoricalContentTests(unittest.TestCase):
             normalized_title_key(" 你会是那百分之几的股民? "),
         )
 
+    def test_douyin_title_key_removes_share_prefixes_without_dropping_real_numbers(self):
+        self.assertEqual(
+            normalized_title_key("/05 J@i.pd 离大谱!炒股还能领亏损补贴???"),
+            normalized_title_key("离大谱!炒股还能领亏损补贴??? #投资"),
+        )
+        self.assertEqual(
+            normalized_title_key("@K.jc 离大谱!炒股还能领亏损补贴???"),
+            normalized_title_key("离大谱!炒股还能领亏损补贴???"),
+        )
+        self.assertEqual(
+            normalized_title_key("1.28 tRk:/ 离大谱!炒股还能领亏损补贴???"),
+            normalized_title_key("离大谱!炒股还能领亏损补贴???"),
+        )
+        self.assertEqual(
+            normalized_title_key("据说赚钱的股民都听这首歌？ 据说赚钱的股民都听这首歌？"),
+            normalized_title_key("据说赚钱的股民都听这首歌？"),
+        )
+        self.assertEqual(
+            normalized_title_key("40℃高温来袭，股市也热起来了"),
+            "40c高温来袭股市也热起来了",
+        )
+        self.assertEqual(
+            normalized_title_key("5.7日段永平调仓买入泡泡玛特，头像也换了！"),
+            "57日段永平调仓买入泡泡玛特头像也换了",
+        )
+
     def test_parse_historical_workbook_detects_real_headers(self):
         with TemporaryDirectory() as tmp:
             workbook = Path(tmp) / "原生内容投稿.xlsx"
@@ -69,6 +95,7 @@ class HistoricalContentTests(unittest.TestCase):
                         "激活数": 10,
                         "付费次数": 2,
                         "内容类型": "旧分类",
+                        "账号": "同花顺投资",
                     }
                 ]
             ).to_csv(raw_dir / "抖音商业化.csv", index=False, encoding="utf-8-sig")

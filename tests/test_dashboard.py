@@ -334,6 +334,79 @@ class DashboardTests(unittest.TestCase):
             total = comparison[comparison["channel"].eq("总计")].iloc[0]
             self.assertAlmostEqual(total["first_pay_count_change_rate"], 1.0)
 
+    def test_load_channel_comparison_for_batch_rebuilds_legacy_rows_without_impressions(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                _insert_period_batch(conn, "batch-old", "2026-05-08", "2026-05-14")
+                _insert_period_batch(conn, "batch-new", "2026-05-15", "2026-05-21", created_at="2026-05-21T00:00:00+00:00")
+                _append_frame(
+                    conn,
+                    "canonical_items",
+                    "batch-old",
+                    pd.DataFrame(
+                        [
+                            {
+                                "platform": "抖音",
+                                "channel": "抖音商业化",
+                                "period_start": "2026-05-08",
+                                "period_end": "2026-05-14",
+                                "content_id": "old",
+                                "spend": 100.0,
+                                "impressions": 1000.0,
+                                "activations": 10.0,
+                                "first_pay_count": 2.0,
+                            }
+                        ]
+                    ),
+                )
+                _append_frame(
+                    conn,
+                    "canonical_items",
+                    "batch-new",
+                    pd.DataFrame(
+                        [
+                            {
+                                "platform": "抖音",
+                                "channel": "抖音商业化",
+                                "period_start": "2026-05-15",
+                                "period_end": "2026-05-21",
+                                "content_id": "new",
+                                "spend": 200.0,
+                                "impressions": 2500.0,
+                                "activations": 20.0,
+                                "first_pay_count": 5.0,
+                            }
+                        ]
+                    ),
+                )
+                _append_frame(
+                    conn,
+                    "channel_comparison_items",
+                    "batch-new",
+                    pd.DataFrame(
+                        [
+                            {
+                                "channel": "总计",
+                                "spend_current": 200.0,
+                                "spend_previous": 100.0,
+                                "spend_change_rate": 1.0,
+                                "activations_current": 20.0,
+                                "activations_previous": 10.0,
+                                "activations_change_rate": 1.0,
+                            }
+                        ]
+                    ),
+                )
+                conn.commit()
+
+            comparison = load_channel_comparison_for_batch(db_path, "batch-new").set_index("channel")
+
+            self.assertAlmostEqual(comparison.loc["总计", "impressions_current"], 2500.0)
+            self.assertAlmostEqual(comparison.loc["总计", "impressions_previous"], 1000.0)
+            self.assertAlmostEqual(comparison.loc["总计", "impressions_change_rate"], 1.5)
+
     def test_build_period_comparison_for_batch_uses_period_order_not_created_at(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "workflow.sqlite3"
@@ -629,8 +702,8 @@ class DashboardTests(unittest.TestCase):
     def test_build_overview_table_rows_places_total_first_and_merges_growth(self):
         items = pd.DataFrame(
             [
-                {"channel": "抖音商业化", "spend": 200.0, "activations": 20.0, "first_pay_count": 5.0},
-                {"channel": "B站", "spend": 50.0, "activations": 5.0, "first_pay_count": 1.0},
+                {"channel": "抖音商业化", "spend": 200.0, "impressions": 2000.0, "activations": 20.0, "first_pay_count": 5.0},
+                {"channel": "B站", "spend": 50.0, "impressions": 500.0, "activations": 5.0, "first_pay_count": 1.0},
             ]
         )
         summary = build_dashboard_summary(items)
@@ -640,6 +713,7 @@ class DashboardTests(unittest.TestCase):
                 {
                     "channel": "总计",
                     "spend_change_rate": 0.5,
+                    "impressions_change_rate": 0.25,
                     "activations_change_rate": -0.2,
                     "activation_cost_change_rate": 0.1,
                     "first_pay_count_change_rate": 0.0,
@@ -648,6 +722,7 @@ class DashboardTests(unittest.TestCase):
                 {
                     "channel": "抖音商业化",
                     "spend_change_rate": 1.0,
+                    "impressions_change_rate": 0.4,
                     "activations_change_rate": 0.5,
                     "activation_cost_change_rate": -0.25,
                     "first_pay_count_change_rate": 0.25,
@@ -664,6 +739,8 @@ class DashboardTests(unittest.TestCase):
                 "channel",
                 "spend",
                 "spend_change_rate",
+                "impressions",
+                "impressions_change_rate",
                 "activations",
                 "activations_change_rate",
                 "activation_cost",
@@ -676,11 +753,16 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(rows["channel"].tolist(), ["汇总", "抖音商业化", "B站"])
         self.assertAlmostEqual(rows.iloc[0]["spend"], 250.0)
+        self.assertAlmostEqual(summary.total_impressions, 2500.0)
+        self.assertAlmostEqual(rows.iloc[0]["impressions"], 2500.0)
+        self.assertAlmostEqual(rows.iloc[0]["impressions_change_rate"], 0.25)
         self.assertAlmostEqual(rows.iloc[0]["activation_cost"], 10.0)
         self.assertAlmostEqual(rows.iloc[0]["first_pay_cost"], 250.0 / 6.0)
         self.assertAlmostEqual(rows.iloc[0]["spend_change_rate"], 0.5)
+        self.assertAlmostEqual(rows.iloc[1]["impressions_change_rate"], 0.4)
         self.assertAlmostEqual(rows.iloc[1]["activation_cost_change_rate"], -0.25)
         self.assertTrue(pd.isna(rows.iloc[2]["spend_change_rate"]))
+        self.assertTrue(pd.isna(rows.iloc[2]["impressions_change_rate"]))
         self.assertTrue(pd.isna(rows.iloc[2]["first_pay_cost_change_rate"]))
 
     def test_build_overview_table_rows_keeps_values_without_comparison(self):
@@ -1441,6 +1523,78 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("## 内容题材推荐", markdown)
         self.assertIn("股友说", markdown)
         self.assertIn("- ", markdown)
+
+    def test_build_content_recommendations_leads_with_overall_and_channel_analysis(self):
+        items = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "spend": 120.0,
+                    "impressions": 2400.0,
+                    "activations": 24.0,
+                    "first_pay_count": 6.0,
+                },
+                {
+                    "channel": "B站",
+                    "spend": 80.0,
+                    "impressions": 800.0,
+                    "activations": 8.0,
+                    "first_pay_count": 1.0,
+                },
+            ]
+        )
+        summary = build_dashboard_summary(items)
+        platform_summary = aggregate_dashboard(items, ["channel"])
+        content_type_summary = pd.DataFrame(
+            [
+                {
+                    "category_display": "股友说",
+                    "spend": 100.0,
+                    "activations": 20.0,
+                    "activation_cost": 5.0,
+                    "first_pay_count": 4.0,
+                    "first_pay_rate": 0.2,
+                },
+            ]
+        )
+        channel_comparison = pd.DataFrame(
+            [
+                {
+                    "channel": "总计",
+                    "spend_change_rate": 0.2,
+                    "impressions_change_rate": -0.1,
+                    "activations_change_rate": 0.5,
+                    "activation_cost_change_rate": -0.2,
+                    "first_pay_count_change_rate": 0.4,
+                    "first_pay_cost_change_rate": -0.15,
+                },
+                {
+                    "channel": "抖音商业化",
+                    "spend_change_rate": 0.1,
+                    "impressions_change_rate": 0.3,
+                    "activations_change_rate": 0.2,
+                    "activation_cost_change_rate": -0.08,
+                    "first_pay_count_change_rate": 0.5,
+                    "first_pay_cost_change_rate": -0.25,
+                },
+            ]
+        )
+
+        markdown = build_content_recommendations(
+            summary,
+            platform_summary,
+            content_type_summary,
+            channel_comparison=channel_comparison,
+            external_context={
+                "summary": "节假日：本周期含劳动节后恢复；行情：上证指数上涨1.2%；政策：证监会发布政策解读。"
+            },
+        )
+
+        self.assertLess(markdown.index("## 总体分析"), markdown.index("## 分渠道分析"))
+        self.assertIn("总曝光", markdown)
+        self.assertIn("抖音商业化", markdown)
+        self.assertIn("外部背景", markdown)
+        self.assertIn("上证指数上涨1.2%", markdown)
 
 
 if __name__ == "__main__":

@@ -89,7 +89,7 @@ def sync_raw_periods(
     category_matcher: Optional[Callable] = None,
 ) -> list[RawSyncResult]:
     results: list[RawSyncResult] = []
-    for period in discover_raw_periods(raw_root):
+    for period in _canonical_raw_periods(discover_raw_periods(raw_root)):
         try:
             if not is_period_active(db_path, period.period_start, period.period_end):
                 results.append(
@@ -104,21 +104,19 @@ def sync_raw_periods(
                 )
                 continue
             current_signature = _raw_signature(period.path)
-            latest_batch_id = _latest_successful_batch_for_period(db_path, period.period_start, period.period_end)
+            latest_batch_id = _latest_successful_batch_for_period(db_path, period)
             if latest_batch_id and current_signature == _stored_signature(db_path, latest_batch_id):
-                missing_channel = _missing_bilibili_channel(db_path, latest_batch_id, period.path)
-                if not missing_channel:
-                    results.append(
-                        RawSyncResult(
-                            period.name,
-                            period.period_start,
-                            period.period_end,
-                            "skipped",
-                            latest_batch_id,
-                            "raw 文件未变化",
-                        )
+                results.append(
+                    RawSyncResult(
+                        period.name,
+                        period.period_start,
+                        period.period_end,
+                        "skipped",
+                        latest_batch_id,
+                        "raw 文件未变化",
                     )
-                    continue
+                )
+                continue
 
             workflow_result = run_archived_workflow(
                 period.path,
@@ -144,7 +142,7 @@ def sync_raw_periods(
                     period.period_end,
                     "generated",
                     workflow_result.batch_id,
-                    "已根据 raw 文件生成最新批次",
+                    "已根据 raw 文件生成当前周期",
                 )
             )
         except Exception as exc:
@@ -165,8 +163,46 @@ def _raw_tabular_files(period_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in Path(period_dir).rglob("*")
-        if path.is_file() and path.suffix.lower() in TABULAR_SUFFIXES and not path.name.startswith("~$")
+        if path.is_file()
+        and path.suffix.lower() in TABULAR_SUFFIXES
+        and not path.name.startswith("~$")
+        and not _is_generated_raw_artifact(path, period_dir)
     )
+
+
+def _canonical_raw_periods(periods: list[RawPeriod]) -> list[RawPeriod]:
+    grouped: dict[tuple[str, str, str], list[RawPeriod]] = {}
+    for period in periods:
+        grouped.setdefault(_period_group_key(period), []).append(period)
+    return [
+        _canonical_period_for_group(group)
+        for _, group in sorted(
+            grouped.items(),
+            key=lambda item: (
+                item[1][0].period_end,
+                item[1][0].period_start,
+                item[1][0].period_level,
+                item[1][0].period_key,
+            ),
+        )
+    ]
+
+
+def _period_group_key(period: RawPeriod) -> tuple[str, str, str]:
+    return (period.source_type, period.period_level, period.period_key)
+
+
+def _canonical_period_for_group(periods: list[RawPeriod]) -> RawPeriod:
+    return sorted(
+        periods,
+        key=lambda period: (
+            (period.path / "period_manifest.json").exists(),
+            period.data_end,
+            period.period_end,
+            period.name,
+        ),
+        reverse=True,
+    )[0]
 
 
 def _period_metadata_for_raw_dir(period_dir: Path) -> ReviewPeriod:
@@ -217,15 +253,35 @@ def _stored_signature(db_path: Path, batch_id: str) -> list[FileSignature]:
     return sorted(
         (str(source_file), str(sha256), int(size_bytes))
         for source_file, sha256, size_bytes in rows
-        if Path(str(source_file)).suffix.lower() in TABULAR_SUFFIXES and not Path(str(source_file)).name.startswith("~$")
+        if Path(str(source_file)).suffix.lower() in TABULAR_SUFFIXES
+        and not Path(str(source_file)).name.startswith("~$")
+        and not _is_generated_raw_artifact(Path(str(source_file)))
     )
 
 
-def _latest_successful_batch_for_period(db_path: Path, period_start: str, period_end: str) -> str:
+def _latest_successful_batch_for_period(db_path: Path, period: RawPeriod) -> str:
     db_path = Path(db_path)
     if not db_path.exists():
         return ""
     with closing(sqlite3.connect(db_path)) as conn:
+        try:
+            row = conn.execute(
+                """
+                select batch_id
+                from upload_batches
+                where status = 'ok'
+                    and period_level = ?
+                    and period_key = ?
+                    and source_type = ?
+                order by created_at desc
+                limit 1
+                """,
+                (period.period_level, period.period_key, period.source_type),
+            ).fetchone()
+        except Exception:
+            row = None
+        if row:
+            return str(row[0])
         try:
             row = conn.execute(
                 """
@@ -237,35 +293,11 @@ def _latest_successful_batch_for_period(db_path: Path, period_start: str, period
                 order by created_at desc
                 limit 1
                 """,
-                (period_start, period_end),
+                (period.period_start, period.period_end),
             ).fetchone()
         except Exception:
             return ""
     return str(row[0]) if row else ""
-
-
-def _missing_bilibili_channel(db_path: Path, batch_id: str, period_dir: Path) -> bool:
-    has_bilibili_file = any("B站" in path.name for path in _raw_tabular_files(period_dir))
-    if not has_bilibili_file:
-        return False
-    db_path = Path(db_path)
-    if not db_path.exists():
-        return True
-    with closing(sqlite3.connect(db_path)) as conn:
-        try:
-            channel_count = pd.read_sql_query(
-                """
-                select count(*) as count
-                from canonical_items
-                where batch_id = ?
-                    and channel = 'B站'
-                """,
-                conn,
-                params=(batch_id,),
-            )["count"].iloc[0]
-        except Exception:
-            return True
-    return int(channel_count) == 0
 
 
 def _sha256(path: Path) -> str:
@@ -274,3 +306,18 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_generated_raw_artifact(path: Path, root: Path | None = None) -> bool:
+    item = Path(path)
+    relative = item
+    if root is not None:
+        try:
+            relative = item.relative_to(root)
+        except ValueError:
+            relative = item
+    if item.name == "cleaned.xlsx":
+        return True
+    if item.stem.lower().endswith("_clean"):
+        return True
+    return "channel_clean" in relative.parts
