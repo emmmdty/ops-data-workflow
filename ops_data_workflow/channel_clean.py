@@ -14,6 +14,7 @@ CHANNEL_CLEAN_COLUMNS = [
     "周期",
     "渠道",
     "账号",
+    "内容形式",
     "内容类型",
     "内容分类",
     "标题",
@@ -75,6 +76,7 @@ def _channel_clean_frame(
     result["周期"] = _period_value(frame, period_label, period_start, period_end)
     result["渠道"] = _text_series(frame, "channel")
     result["账号"] = _text_series(frame, "account")
+    result["内容形式"] = _text_series(frame, "content_form")
     result["内容类型"] = _first_text_series(frame, ["manual_category", "ledger_content_type"])
     result["内容分类"] = _first_text_series(
         frame,

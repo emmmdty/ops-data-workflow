@@ -1,7 +1,6 @@
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import json
 import unittest
 from zipfile import ZipFile
 
@@ -77,9 +76,10 @@ class PeriodInferenceTests(unittest.TestCase):
             archive.writestr("__MACOSX/4月单周数据/0417-0423数据/._B站.xlsx", b"ignored")
 
         with TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
             result = normalize_uploaded_periods(
                 [FakeUpload("4月单周数据.zip", zip_buffer.getvalue())],
-                Path(tmp) / "raw",
+                data_root,
                 default_year=2026,
             )
 
@@ -90,9 +90,11 @@ class PeriodInferenceTests(unittest.TestCase):
             ])
             self.assertTrue(all(bucket.review_period.period_level == PERIOD_LEVEL_WEEK for bucket in result))
             self.assertEqual([len(bucket.files) for bucket in result], [1, 1, 1])
-            manifest = json.loads(result[2].manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["file_count"], 1)
-            self.assertEqual(manifest["ignored_file_count"], 1)
+            self.assertEqual(result[0].raw_dir, data_root / "weeks" / "202604w1")
+            self.assertEqual(result[1].raw_dir, data_root / "weeks" / "202604w2")
+            self.assertEqual(result[2].raw_dir, data_root / "weeks" / "202604w3")
+            self.assertFalse((result[2].raw_dir / "period_manifest.json").exists())
+            self.assertEqual(result[2].ignored_file_count, 1)
 
     def test_normalize_uploaded_periods_keeps_same_name_files_without_overwrite(self):
         uploads = [
@@ -101,11 +103,12 @@ class PeriodInferenceTests(unittest.TestCase):
         ]
 
         with TemporaryDirectory() as tmp:
-            result = normalize_uploaded_periods(uploads, Path(tmp) / "raw", default_year=2026)
+            result = normalize_uploaded_periods(uploads, Path(tmp) / "data", default_year=2026)
 
             self.assertEqual(len(result), 1)
             bucket = result[0]
             self.assertEqual(bucket.review_period.period_key, "20260508-20260514")
+            self.assertEqual(bucket.raw_dir.parent.name, "weeks")
             names = sorted(path.name for path in bucket.files)
             self.assertEqual(len(names), 2)
             self.assertEqual(len(set(names)), 2)

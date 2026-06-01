@@ -24,9 +24,8 @@ class StreamlitCompatibilityTests(unittest.TestCase):
 
         self.assertIn('accept_multiple_files="directory"', app_source)
         self.assertIn("st.segmented_control", app_source)
-        self.assertIn("一周", app_source)
-        self.assertIn("两周", app_source)
-        self.assertIn("一个月", app_source)
+        self.assertIn("最近 8 周", app_source)
+        self.assertIn("最近 12 个月", app_source)
 
     def test_generate_page_uses_single_upload_control(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -51,7 +50,9 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("文件数", app_source)
         self.assertIn("来源路径", app_source)
         self.assertIn("来源类型", generate_source)
-        self.assertIn("period_manifest.json", app_source)
+        self.assertIn("data/months", app_source)
+        self.assertIn("data/weeks", app_source)
+        self.assertIn("processed", app_source)
 
     def test_generate_page_exposes_stepwise_progress_status(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -61,7 +62,8 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("_run_with_generation_progress", app_source)
         self.assertIn("progress_callback", app_source)
         self.assertIn("正在识别上传文件和复盘周期", app_source)
-        self.assertIn("正在整理 raw 周期目录", app_source)
+        self.assertIn("正在整理源文件周期目录", app_source)
+        self.assertIn("正在整理清洗产物", app_source)
         self.assertIn("正在读取渠道数据并标准化", app_source)
         self.assertIn("正在校验数据质量与题材分类", app_source)
         self.assertIn("正在写入周期库并生成当前下载文件", app_source)
@@ -82,6 +84,8 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertNotIn("_sync_raw_data_fragment()", app_source)
         self.assertIn("sync_raw_periods", app_source)
         self.assertIn("strip_common_period_root=True", app_source)
+        self.assertIn("手动同步源文件", app_source)
+        self.assertNotIn("已自动刷新", app_source)
 
     def test_generate_page_no_longer_exposes_history_reports(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -246,9 +250,9 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("summarize_persisted_topic_labels", app_source)
         self.assertIn("summarize_channel_categories", app_source)
         self.assertIn("build_channel_top_topic_insights", app_source)
-        self.assertIn("文件备份", app_source)
+        self.assertNotIn("文件备份", app_source)
         self.assertNotIn("渠道下钻分析", app_source)
-        self.assertIn("B站全部", app_source)
+        self.assertNotIn("B站全部", app_source)
         self.assertIn("选择对比周期", app_source)
         self.assertNotIn('orientation="h"', app_source)
 
@@ -282,6 +286,50 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("localize_columns(_category_table_display(category_summary))", channel_source)
         self.assertNotIn("_render_short_table_blocks(_category_table_display(category_summary)", channel_source)
         self.assertLess(category_display_source.index('"category_name"'), category_display_source.index('"item_count"'))
+
+    def test_channel_pages_use_previous_period_comparison_for_metrics_categories_and_topics(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        channel_source = app_source[app_source.index("def _render_channel_page") : app_source.index("def _render_channel_summary_metrics")]
+
+        self.assertIn("previous_batch_from_rows", app_source)
+        self.assertIn("previous_batch_id", channel_source)
+        self.assertIn("previous_items", channel_source)
+        self.assertIn("channel_comparison", channel_source)
+        self.assertIn("_render_channel_summary_metrics(channel_summary, channel_growth_row)", channel_source)
+        self.assertIn("summarize_channel_category_comparison", channel_source)
+        self.assertIn("_render_period_comparison_bar_chart(", channel_source)
+        self.assertIn("PERIOD_COMPARISON_CHART_HEIGHT", app_source)
+        self.assertIn('__current_index"] = 100.0', app_source)
+        self.assertIn('__previous_index"', app_source)
+        self.assertIn("周期对比指数（本期=100）", app_source)
+        self.assertIn("环比 ", app_source)
+        self.assertIn("uniformtext", app_source)
+        self.assertNotIn('"activations",\n            "激活数"', channel_source)
+        self.assertIn("compare_channel_topics", channel_source)
+
+    def test_channel_pages_show_top_content_links_only_for_supported_channels(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        dashboard_source = Path("ops_data_workflow/dashboard.py").read_text(encoding="utf-8")
+        channel_source = app_source[app_source.index("def _render_channel_page") : app_source.index("def _render_channel_summary_metrics")]
+
+        self.assertIn("summarize_channel_top_content_links", app_source)
+        self.assertIn('st.subheader("消耗 Top 内容链接")', channel_source)
+        self.assertIn("_top_content_links_display(top_content_links)", channel_source)
+        self.assertIn("笔记/视频链接", app_source)
+        self.assertIn("抖音", dashboard_source)
+        self.assertIn("小红书", dashboard_source)
+        self.assertIn("B站", dashboard_source)
+
+    def test_topic_table_keeps_topic_and_content_type_first_without_rank_column(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        topic_display_source = app_source[
+            app_source.index("def _topic_table_display") : app_source.index("def _topic_material_detail")
+        ]
+
+        self.assertLess(topic_display_source.index('"topic_name"'), topic_display_source.index('"spend"'))
+        self.assertLess(topic_display_source.index('"content_types"'), topic_display_source.index('"spend"'))
+        self.assertNotIn('"rank_position"', topic_display_source)
+        self.assertIn("preserve_order=True", app_source)
 
     def test_data_review_prioritizes_conflict_summary_before_editor(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -354,6 +402,36 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertNotIn('value=st.session_state["trend_period_start"]', trend_source)
         self.assertNotIn('value=st.session_state["trend_period_end"]', trend_source)
         self.assertNotIn('default=st.session_state.get("trend_quick_range"', trend_source)
+
+    def test_historical_trends_render_period_metric_grid_instead_of_content_type_trends(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        trend_source = app_source[app_source.index("def _page_trends") : app_source.index("def _page_content_details")]
+
+        self.assertIn("summarize_period_metric_trends", app_source)
+        self.assertNotIn("summarize_content_type_trends", app_source)
+        self.assertNotIn("最终内容类别", trend_source)
+        self.assertNotIn("图中展示 Top 内容类型数", trend_source)
+        self.assertIn("周/月", trend_source)
+        self.assertIn("最近 8 周", app_source)
+        self.assertIn("最近 12 个月", app_source)
+        self.assertIn("_render_period_metric_trend_grid", trend_source)
+        self.assertIn("_render_period_metric_chart", app_source)
+        for label in ["总消耗", "总曝光", "激活数", "激活成本", "付费数", "付费成本"]:
+            self.assertIn(label, app_source)
+
+    def test_historical_trends_use_selected_period_level_and_compact_axis_codes(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        trend_source = app_source[app_source.index("def _page_trends") : app_source.index("def _page_content_details")]
+        axis_source = app_source[
+            app_source.index("def _trend_axis_label") : app_source.index("def _trend_available_period_count")
+        ]
+
+        self.assertIn("summarize_period_metric_trends(", trend_source)
+        self.assertIn("selected_level,", trend_source)
+        self.assertIn("week_storage_key", app_source)
+        self.assertIn('strftime("%Y%m")', axis_source)
+        self.assertNotIn('strftime("%Y-%m")', axis_source)
+        self.assertNotIn("%m/%d", axis_source)
 
     def test_app_renders_single_item_category_review_flow(self):
         app_source = Path("app.py").read_text(encoding="utf-8")

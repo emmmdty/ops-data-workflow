@@ -314,7 +314,7 @@ class ContentLedgerTests(unittest.TestCase):
             self.assertEqual(row["ledger_match_source"], "唯一标题")
             self.assertEqual(row["match_risk_reason"], "")
 
-    def test_douyin_fuzzy_title_marks_review_candidate_without_autofill(self):
+    def test_douyin_fuzzy_title_autofills_and_marks_review(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_xlsx(
@@ -350,8 +350,9 @@ class ContentLedgerTests(unittest.TestCase):
             enriched = apply_content_ledger(canonical, ledger)
 
             row = enriched.iloc[0]
-            self.assertEqual(row["account"], "")
-            self.assertEqual(row["manual_category"], "")
+            self.assertEqual(row["account"], "投资号")
+            self.assertEqual(row["manual_category"], "资讯")
+            self.assertEqual(row["content_url"], "https://v.douyin.com/abc/")
             self.assertEqual(row["ledger_match_source"], "模糊标题")
             self.assertEqual(row["ledger_content_type"], "资讯")
             self.assertEqual(row["ledger_source_row"], 2)

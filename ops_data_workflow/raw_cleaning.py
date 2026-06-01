@@ -15,14 +15,15 @@ from typing import Iterable, Optional
 import pandas as pd
 
 from .channel_clean import write_channel_clean_workbooks
-from .content_ledger import apply_content_ledger, load_content_ledger
+from .content_ledger import apply_content_ledger, load_content_ledger, load_latest_reference_ledger
+from .field_mapping import load_field_mapping
 from .periods import ReviewPeriod, infer_review_period_from_text, period_raw_dir_name
 from .pipeline import (
     NUMERIC_COLUMNS,
     STANDARD_COLUMNS,
     TABULAR_SUFFIXES,
     _is_csv,
-    _matches_core_metric_alias,
+    _matches_configured_source_alias,
     _preprocess_canonical,
     _read_table,
     _social_market_channel,
@@ -47,6 +48,7 @@ SYNTHETIC_ROW_ID_COLUMN = "__清洗行ID"
 SYNTHETIC_ROW_TITLE_COLUMN = "__清洗行标题"
 GROUPED_CONTENT_TYPE_COLUMN = "__分组内容类型"
 GROUPED_CONTENT_TYPE_LABELS = {"图文", "视频", "直播", "短视频"}
+FIELD_MAPPING = load_field_mapping()
 
 EXTRA_CANONICAL_COLUMNS = [
     "source_sheet",
@@ -56,112 +58,10 @@ EXTRA_CANONICAL_COLUMNS = [
     "review_action",
 ]
 
-HEADER_TOKENS = {
-    "视频BVID",
-    "视频bvid",
-    "视频AVID",
-    "视频标题",
-    "单元名称",
-    "视频id",
-    "素材ID",
-    "素材中心id",
-    "笔记ID",
-    "笔记/素材ID",
-    "标题",
-    "创意名称",
-    "计划名称",
-    "链接",
-    "内容链接",
-    "笔记链接",
-    "消费",
-    "消耗",
-    "花费",
-    "展示量",
-    "展示数",
-    "展现量",
-    "曝光次数",
-    "点击量",
-    "点击数",
-    "点击次数",
-    "应用激活数",
-    "APP激活次数",
-    "激活数",
-    "付费次数",
-    "首次付费次数",
-    "应用内首次付费次数",
-    "内容类型",
-    "内容分类",
-    "账号",
-    "发布作者",
-    "Up主mid",
-}
-ADDITIVE_METRIC_TOKENS = {
-    "消费",
-    "消耗",
-    "花费",
-    "总花费",
-    "展示量",
-    "展示数",
-    "展现量",
-    "曝光次数",
-    "点击量",
-    "点击数",
-    "点击次数",
-    "应用激活数",
-    "APP激活次数",
-    "激活数",
-    "激活数(转化时间)",
-    "付费次数",
-    "首次付费次数",
-    "首次付费次数(转化时间)",
-    "应用内付费",
-    "应用内首次付费次数",
-    "注册次数",
-    "注册次数（点击归因）",
-}
-METRIC_TOKENS = {
-    "消费",
-    "消耗",
-    "花费",
-    "展示量",
-    "展示数",
-    "展现量",
-    "曝光次数",
-    "点击量",
-    "点击数",
-    "点击次数",
-    "应用激活数",
-    "APP激活次数",
-    "激活数",
-    "付费次数",
-    "首次付费次数",
-    "首次付费次数(转化时间)",
-    "应用内首次付费次数",
-    "应用内付费",
-    "注册次数",
-    "注册次数（点击归因）",
-    "激活数(转化时间)",
-}
-IDENTITY_TOKENS = {
-    "视频BVID",
-    "视频bvid",
-    "视频AVID",
-    "视频标题",
-    "单元名称",
-    "视频id",
-    "素材ID",
-    "素材中心id",
-    "笔记ID",
-    "笔记/素材ID",
-    "标题",
-    "创意名称",
-    "计划名称",
-    "链接",
-    "内容链接",
-    "笔记链接",
-    "视频链接",
-    "落地页",
-}
+HEADER_TOKENS = FIELD_MAPPING.mapped_source_columns
+ADDITIVE_METRIC_TOKENS = FIELD_MAPPING.additive_metric_columns
+METRIC_TOKENS = FIELD_MAPPING.metric_columns
+IDENTITY_TOKENS = FIELD_MAPPING.identity_columns
 SUMMARY_TOKENS = {"合计", "总计", "汇总", "小计", "总和", "Total", "TOTAL"}
 
 
@@ -319,10 +219,19 @@ def clean_source_directory(
     return buckets
 
 
-def clean_raw_period_dir(raw_dir: Path, period: ReviewPeriod, *, default_year: int) -> CleanedPeriodBucket:
-    """Clean an already-materialized raw period directory in place."""
+def clean_raw_period_dir(
+    raw_dir: Path,
+    period: ReviewPeriod,
+    *,
+    default_year: int,
+    output_dir: Path | None = None,
+    reference_root: Path | None = None,
+) -> CleanedPeriodBucket:
+    """Clean an already-materialized raw source directory into an output dir."""
     raw_dir = Path(raw_dir)
-    ledger = load_content_ledger(raw_dir, default_year=default_year, config_path=_default_content_ledger_config())
+    clean_dir = Path(output_dir) if output_dir is not None else raw_dir
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    ledger = _load_cleaning_ledger(raw_dir, default_year=default_year, reference_root=reference_root)
     ledger_source_files = {Path(path).resolve() for path in ledger.attrs.get("source_files", set())}
     source_paths = [
         path.relative_to(raw_dir).as_posix()
@@ -369,7 +278,7 @@ def clean_raw_period_dir(raw_dir: Path, period: ReviewPeriod, *, default_year: i
     )
     write_channel_clean_workbooks(
         cleaned,
-        raw_dir,
+        clean_dir,
         period_label=period.period_label,
         period_start=period.period_start,
         period_end=period.period_end,
@@ -386,7 +295,7 @@ def clean_raw_period_dir(raw_dir: Path, period: ReviewPeriod, *, default_year: i
         import_log_rows,
         columns=["source_file", "sheet_name", "status", "rows", "message"],
     )
-    cleaned_workbook = raw_dir / CLEANED_WORKBOOK_NAME
+    cleaned_workbook = clean_dir / CLEANED_WORKBOOK_NAME
     write_cleaned_workbook(
         cleaned_workbook,
         cleaned,
@@ -396,7 +305,7 @@ def clean_raw_period_dir(raw_dir: Path, period: ReviewPeriod, *, default_year: i
         ignored_frame,
         import_log,
     )
-    manifest_path = raw_dir / "period_manifest.json"
+    manifest_path = clean_dir / "period_manifest.json"
     _write_manifest(manifest_path, period, cleaned_workbook, source_paths, ignored_frame, duplicate_file_frame)
     return CleanedPeriodBucket(
         review_period=period,
@@ -453,8 +362,7 @@ def rewrite_cleaned_canonical(cleaned_workbook: Path, canonical: pd.DataFrame) -
 
 def cleaned_workbook_in_dir(input_dir: Path) -> Path | None:
     candidate = Path(input_dir) / CLEANED_WORKBOOK_NAME
-    manifest = Path(input_dir) / "period_manifest.json"
-    if candidate.exists() and manifest.exists():
+    if candidate.exists():
         return candidate
     return None
 
@@ -463,19 +371,19 @@ def reset_runtime_data(project_root: Path = Path(".")) -> None:
     """Clear generated runtime data while preserving source data and configs."""
     project_root = Path(project_root)
     for relative in [
-        "data/raw",
         "data/file_backup",
         "archive",
+        "processed",
         "outputs",
         "output/playwright",
     ]:
         target = project_root / relative
         if target.exists():
             shutil.rmtree(target)
-    db_path = project_root / "data" / "workflow.sqlite3"
+    db_path = project_root / ".runtime" / "workflow.sqlite3"
     if db_path.exists():
         db_path.unlink()
-    for relative in ["data/raw", "data/file_backup", "archive", "outputs", "output/playwright"]:
+    for relative in ["data/reference", "data/months", "data/weeks", "processed", "outputs", "output/playwright", ".runtime"]:
         (project_root / relative).mkdir(parents=True, exist_ok=True)
     init_db(db_path)
 
@@ -660,21 +568,7 @@ def _standardize_candidate(
             platform_group="B站",
             channel="B站",
             source_file=candidate.relative_source,
-            fields={
-                "content_id": ["视频BVID", "视频bvid", "视频AVID", "视频avid", "单元名称", SYNTHETIC_ROW_ID_COLUMN],
-                "material_id": ["素材中心id", "素材中心ID", "视频BVID", "视频bvid", "单元名称", SYNTHETIC_ROW_ID_COLUMN],
-                "title": ["视频标题", "单元名称", SYNTHETIC_ROW_TITLE_COLUMN],
-                "account_id": ["Up主mid", "UID", "uid", "mid"],
-                "account": ["Up主名称", "UP主名称", "UP主昵称", "账号名称"],
-                "cover_url": ["素材url"],
-                "content_url": ["视频链接", "素材url"],
-                "primary_category": [],
-                "spend": ["花费", "总花费", "求和项:总花费"],
-                "impressions": ["展示量", "求和项:展示量"],
-                "clicks": ["点击量", "求和项:点击量"],
-                "activations": ["应用激活数", "求和项:应用激活数"],
-                "first_pay_count": ["应用内付费", "应用内首次付费次数", "求和项:应用内首次付费次数"],
-            },
+            fields=FIELD_MAPPING.fields_for_source(kind),
         )
     if kind == "xhs_market":
         return _standardize_xiaohongshu_market(raw, candidate.relative_source)
@@ -696,24 +590,8 @@ def _standardize_xiaohongshu_commercial(raw: pd.DataFrame, source_file: str) -> 
         platform="小红书商业化",
         platform_group="小红书",
         channel="小红书商业化",
-            source_file=source_file,
-            fields={
-            "content_id": ["笔记ID", SYNTHETIC_ROW_ID_COLUMN],
-            "material_id": ["笔记ID", SYNTHETIC_ROW_ID_COLUMN],
-            "title": ["标题", SYNTHETIC_ROW_TITLE_COLUMN],
-            "account_id": ["作者ID", "用户ID", "小红书号", "账号ID"],
-            "account": ["发布作者", "账号"],
-            "cover_url": ["封面", "封面图", "图片链接"],
-            "content_url": ["笔记链接"],
-            "primary_category": ["类型"],
-            "manual_category": ["内容类别_解析", "内容分类", "内容类型"],
-            "category_status": ["类别来源_解析"],
-            "spend": ["消费"],
-            "impressions": ["展现量"],
-            "clicks": ["点击量"],
-            "activations": ["激活数"],
-            "first_pay_count": ["首次付费次数"],
-        },
+        source_file=source_file,
+        fields=FIELD_MAPPING.fields_for_source("xhs_commercial"),
     )
 
 
@@ -723,23 +601,8 @@ def _standardize_xiaohongshu_market(raw: pd.DataFrame, source_file: str) -> pd.D
         platform="小红书市场部",
         platform_group="小红书",
         channel="小红书市场部",
-            source_file=source_file,
-            fields={
-            "content_id": ["笔记/素材ID", "笔记ID", "素材ID", "计划ID", "链接", "笔记/素材链接", SYNTHETIC_ROW_ID_COLUMN],
-            "material_id": ["笔记/素材ID", "素材ID", "计划ID", SYNTHETIC_ROW_ID_COLUMN],
-            "title": ["标题", "笔记标题", "创意名称", "计划名称", "笔记/素材链接", SYNTHETIC_ROW_TITLE_COLUMN],
-            "account_id": ["作者ID", "用户ID", "账号ID"],
-            "account": ["发布作者", "账号", "账号名称"],
-            "cover_url": ["封面", "封面图", "图片链接"],
-            "content_url": ["笔记链接", "笔记/素材链接", "链接"],
-            "primary_category": ["类型", "营销诉求"],
-            "manual_category": ["内容分类", "内容类型"],
-            "spend": ["消费", "消耗", "花费"],
-            "impressions": ["展现量", "曝光次数", "展示数"],
-            "clicks": ["点击量", "点击次数", "点击数"],
-            "activations": ["激活数", "激活数(转化时间)", "APP激活次数"],
-            "first_pay_count": ["首次付费次数", "首次付费次数(转化时间)", "付费次数"],
-        },
+        source_file=source_file,
+        fields=FIELD_MAPPING.fields_for_source("xhs_market"),
     )
 
 
@@ -749,23 +612,8 @@ def _standardize_social(raw: pd.DataFrame, source_file: str, channel: str, *, pl
         platform=platform or channel,
         platform_group="微信" if platform else channel.replace("市场部", ""),
         channel=channel,
-            source_file=source_file,
-            fields={
-            "content_id": ["内容ID", "创意ID", "计划ID", "链接", "落地页", "创意名称", SYNTHETIC_ROW_ID_COLUMN],
-            "material_id": ["素材ID", "创意ID", "计划ID", "链接", "创意名称", SYNTHETIC_ROW_ID_COLUMN],
-            "title": ["创意名称", "标题", "内容标题", "链接", "落地页", SYNTHETIC_ROW_TITLE_COLUMN],
-            "account_id": ["账号ID", "账户ID"],
-            "account": ["账号", "账号名称", "账户名称"],
-            "cover_url": ["封面", "封面图", "图片链接"],
-            "content_url": ["链接", "落地页"],
-            "primary_category": ["营销诉求", "优化目标"],
-            "manual_category": ["内容分类", "内容类型"],
-            "spend": ["花费", "消费", "消耗"],
-            "impressions": ["曝光次数", "展现量", "展示数"],
-            "clicks": ["点击次数", "点击量", "点击数"],
-            "activations": ["APP激活次数", "激活数", "注册次数"],
-            "first_pay_count": ["注册次数", "注册次数（点击归因）", "付费次数", "首次付费次数"],
-        },
+        source_file=source_file,
+        fields=FIELD_MAPPING.fields_for_source("social"),
     )
 
 
@@ -777,22 +625,7 @@ def _standardize_douyin_cleaning(raw: pd.DataFrame, source_file: str, channel: s
         platform_group="抖音",
         channel=channel,
         source_file=source_file,
-        fields={
-            "content_id": ["视频id", "视频链接", SYNTHETIC_ROW_ID_COLUMN],
-            "material_id": ["素材ID", "视频链接", SYNTHETIC_ROW_ID_COLUMN],
-            "title": ["视频标题", "视频链接", SYNTHETIC_ROW_TITLE_COLUMN],
-            "account_id": ["账号ID", "账号id", "抖音号", "达人ID", "作者ID", "uid", "UID"],
-            "account": ["账号", "账号名称", "发布账号", "达人名称"],
-            "cover_url": ["视频封面图"],
-            "content_url": ["视频链接"],
-            "primary_category": [],
-            "manual_category": ["内容类型", GROUPED_CONTENT_TYPE_COLUMN],
-            "spend": ["消耗"],
-            "impressions": ["展示数"],
-            "clicks": ["点击数"],
-            "activations": ["激活数"],
-            "first_pay_count": ["付费次数", "付费数"],
-        },
+        fields=FIELD_MAPPING.fields_for_source(f"douyin:{channel}"),
     )
 
 
@@ -828,24 +661,8 @@ def _standardize_generic(raw: pd.DataFrame, source_file: str, channel: str) -> p
         platform=channel,
         platform_group=channel,
         channel=channel,
-            source_file=source_file,
-            fields={
-            "content_id": ["内容ID", "内容id", "视频id", "视频ID", "笔记ID", "作品ID", "id", "ID", SYNTHETIC_ROW_ID_COLUMN],
-            "material_id": ["素材ID", "素材id", "素材中心id", "内容ID", "视频id", "笔记ID", "链接", "创意名称", SYNTHETIC_ROW_ID_COLUMN],
-            "title": ["标题", "视频标题", "内容标题", "笔记标题", "创意名称", "链接", SYNTHETIC_ROW_TITLE_COLUMN],
-            "account_id": ["账号ID", "账号id", "作者ID", "用户ID", "uid", "UID", "mid"],
-            "account": ["账号", "账号名称", "发布账号", "达人名称", "作者", "发布作者"],
-            "cover_url": ["封面", "封面图", "图片链接", "视频封面图", "素材url"],
-            "content_url": ["链接", "内容链接", "视频链接", "笔记链接", "素材url"],
-            "primary_category": ["类型", "一级类型", "一级素材形式"],
-            "manual_category": ["内容类型", "内容分类", "二级栏目", "最终内容类别"],
-            "category_l3": ["三级题材", "题材"],
-            "spend": ["消耗", "消费", "花费", "spend"],
-            "impressions": ["展示数", "展示量", "展现量", "曝光量", "impressions"],
-            "clicks": ["点击数", "点击量", "clicks"],
-            "activations": ["激活数", "应用激活数", "APP激活次数", "activations"],
-            "first_pay_count": ["付费次数", "首次付费次数", "应用内付费", "注册次数", "注册次数（点击归因）"],
-        },
+        source_file=source_file,
+        fields=FIELD_MAPPING.fields_for_source("generic"),
     )
 
 
@@ -1068,8 +885,7 @@ def _additive_metric_columns(frame: pd.DataFrame) -> list[str]:
         text = str(column).strip()
         if (
             text in ADDITIVE_METRIC_TOKENS
-            or text.startswith("求和项:")
-            or any(_matches_core_metric_alias(metric, column) for metric in NUMERIC_COLUMNS)
+            or any(_matches_configured_source_alias(metric, column) for metric in NUMERIC_COLUMNS)
         ):
             columns.append(column)
     return columns
@@ -1372,6 +1188,14 @@ def _is_generated_channel_clean_file(path: Path) -> bool:
 def _default_content_ledger_config() -> Path | None:
     candidate = Path("config/feishu_sources.yml")
     return candidate if candidate.exists() else None
+
+
+def _load_cleaning_ledger(raw_dir: Path, *, default_year: int, reference_root: Path | None) -> pd.DataFrame:
+    if reference_root is not None:
+        ledger = load_latest_reference_ledger(reference_root, default_year=default_year)
+        if not ledger.empty:
+            return ledger
+    return load_content_ledger(raw_dir, default_year=default_year, config_path=_default_content_ledger_config())
 
 
 def _reset_period_raw_dir(raw_dir: Path) -> None:

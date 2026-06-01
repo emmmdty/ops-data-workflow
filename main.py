@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ops_data_workflow.storage import purge_history_state
 from ops_data_workflow.reference_tables import parse_period_from_raw_dir
+from ops_data_workflow.source_storage import migrate_legacy_raw_to_source_layout, source_period_from_path
 from ops_data_workflow.workflow import run_archived_workflow, run_workflow
 
 
@@ -14,8 +15,9 @@ def main() -> None:
     parser.add_argument("--period-start", help="Report period start date, e.g. 2026-04-01.")
     parser.add_argument("--period-end", help="Report period end date, e.g. 2026-04-27.")
     parser.add_argument("--output", default="outputs/latest", help="Directory for generated artifacts.")
-    parser.add_argument("--archive-root", default="archive", help="Directory for archived raw uploads.")
-    parser.add_argument("--db", default="data/workflow.sqlite3", help="SQLite database path.")
+    parser.add_argument("--processed-root", default="processed", help="Directory for cleaned/generated batch artifacts.")
+    parser.add_argument("--data-root", default="data", help="Raw source data root.")
+    parser.add_argument("--db", default=".runtime/workflow.sqlite3", help="SQLite database path.")
     parser.add_argument("--env", default=".env", help="Path to .env containing DEEPSEEK_API_KEY.")
     parser.add_argument(
         "--legacy-output-only",
@@ -32,11 +34,21 @@ def main() -> None:
         action="store_true",
         help="Delete persisted history results and generated batch artifacts before exiting.",
     )
+    parser.add_argument(
+        "--migrate-legacy-raw",
+        action="store_true",
+        help="One-time copy of legacy data/raw source files into data/months or data/weeks.",
+    )
     args = parser.parse_args()
 
     if args.purge_history:
-        purge_history_state(Path(args.db), Path(args.output), Path(args.archive_root))
+        purge_history_state(Path(args.db), Path(args.output), Path(args.processed_root))
         print("History results purged.")
+        return
+
+    if args.migrate_legacy_raw:
+        results = migrate_legacy_raw_to_source_layout(Path(args.data_root))
+        print(f"Migrated {len(results)} legacy raw directories.")
         return
 
     missing = [flag for flag, value in [("--input", args.input)] if not value]
@@ -47,9 +59,13 @@ def main() -> None:
     period_end = args.period_end
     if not period_start or not period_end:
         try:
-            period_start, period_end = parse_period_from_raw_dir(Path(args.input))
+            period = source_period_from_path(Path(args.input))
+            period_start, period_end = period.period_start, period.period_end
         except ValueError as exc:
-            parser.error(f"{exc}；或显式传入 --period-start 和 --period-end")
+            try:
+                period_start, period_end = parse_period_from_raw_dir(Path(args.input))
+            except ValueError:
+                parser.error(f"{exc}；或显式传入 --period-start 和 --period-end")
 
     if args.legacy_output_only:
         result = run_workflow(
@@ -65,13 +81,14 @@ def main() -> None:
             period_start,
             period_end,
             output_root=Path(args.output),
-            archive_root=Path(args.archive_root),
+            processed_root=Path(args.processed_root),
             db_path=Path(args.db),
             category_rules_path=Path(args.category_rules),
             env_path=Path(args.env),
+            reference_root=Path(args.data_root) / "reference",
         )
         print(f"Period stored as {result.batch_id}")
-        print(f"Archive written to {result.archive_dir}")
+        print(f"Processed artifacts written to {result.archive_dir}")
     print(f"Report written to {result.report_html}")
     print(f"Workbook written to {result.analysis_xlsx}")
     print(f"Canonical CSV written to {result.canonical_csv}")

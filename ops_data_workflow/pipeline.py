@@ -13,6 +13,7 @@ import pandas as pd
 from .account_filters import apply_account_filters, load_account_filter_config
 from .categories import category_from_tags, load_category_rules, suggest_category
 from .content_ledger import account_match_label, apply_content_ledger, load_content_ledger
+from .field_mapping import load_field_mapping, standardize_content_form, standardize_content_type
 from .reference_tables import (
     ReferenceTables,
     account_mapping_lookup,
@@ -31,6 +32,7 @@ STANDARD_COLUMNS = [
     "period_start",
     "period_end",
     "content_id",
+    "content_id_fallback",
     "material_id",
     "title",
     "account_raw",
@@ -43,6 +45,8 @@ STANDARD_COLUMNS = [
     "author",
     "cover_url",
     "content_url",
+    "source_time",
+    "duration",
     "category_l1",
     "category_l2",
     "category_l3",
@@ -50,6 +54,7 @@ STANDARD_COLUMNS = [
     "category_l2_source",
     "category_confidence",
     "review_status",
+    "content_form",
     "primary_category",
     "manual_category",
     "ai_category",
@@ -65,6 +70,15 @@ STANDARD_COLUMNS = [
     "ctr",
     "activation_rate",
     "first_pay_rate",
+    "activation_cost_raw",
+    "first_pay_cost_raw",
+    "ctr_raw",
+    "activation_rate_raw",
+    "first_pay_rate_raw",
+    "likes",
+    "comments",
+    "favorites",
+    "follows",
     "dedupe_key",
     "merged_row_count",
     "conflict_details",
@@ -80,33 +94,6 @@ STANDARD_COLUMNS = [
 
 INTERNAL_COMPAT_COLUMNS = {"platform", "platform_group"}
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
-CORE_METRIC_COLUMNS = set(NUMERIC_COLUMNS)
-CORE_METRIC_ALIAS_KEYWORDS = {
-    "spend": ("消耗", "消费", "花费", "spend"),
-    "impressions": ("展示", "曝光", "展现", "impression"),
-    "clicks": ("点击", "click"),
-    "activations": ("激活", "activation"),
-    "first_pay_count": ("首次付费", "应用内付费", "付费次数", "付费数", "注册次数", "firstpay"),
-}
-CORE_METRIC_EXCLUDE_KEYWORDS = (
-    "成本",
-    "率",
-    "单价",
-    "均价",
-    "千次",
-    "cost",
-    "rate",
-    "cpa",
-    "cpm",
-    "ctr",
-    "cvr",
-)
-CORE_METRIC_SPECIFIC_EXCLUDE_KEYWORDS = {
-    "impressions": ("费用", "金额", "花费", "消耗", "消费"),
-    "clicks": ("费用", "金额", "花费", "消耗", "消费"),
-    "activations": ("费用", "金额", "花费", "消耗", "消费"),
-    "first_pay_count": ("费用", "金额", "花费", "消耗", "消费", "收入"),
-}
 
 
 @dataclass(frozen=True)
@@ -163,17 +150,26 @@ def analyze_input_dir(
     reference_tables_path: Optional[Path] = None,
     account_filters_path: Optional[Path] = None,
     douyin_id_bridge: Optional[pd.DataFrame] = None,
+    cleaned_output_dir: Optional[Path] = None,
+    reference_root: Optional[Path] = None,
 ) -> AnalysisData:
     input_dir = Path(input_dir)
     raw_category_stats = collect_raw_category_stats(input_dir)
     from .periods import period_metadata_from_dates
     from .raw_cleaning import clean_raw_period_dir, cleaned_workbook_in_dir, load_cleaned_canonical
 
-    cleaned_workbook = cleaned_workbook_in_dir(input_dir)
+    cleaned_dir = Path(cleaned_output_dir) if cleaned_output_dir is not None else input_dir
+    cleaned_workbook = cleaned_workbook_in_dir(cleaned_dir)
     if cleaned_workbook is None:
         period = period_metadata_from_dates(period_start, period_end)
-        clean_raw_period_dir(input_dir, period, default_year=_default_year_from_period(period_start, period_end))
-        cleaned_workbook = cleaned_workbook_in_dir(input_dir)
+        clean_raw_period_dir(
+            input_dir,
+            period,
+            default_year=_default_year_from_period(period_start, period_end),
+            output_dir=cleaned_dir,
+            reference_root=reference_root,
+        )
+        cleaned_workbook = cleaned_workbook_in_dir(cleaned_dir)
     if cleaned_workbook is None:
         raise FileNotFoundError("未找到可识别的渠道数据文件，请上传 Excel、CSV 或 zip。")
 
@@ -283,6 +279,7 @@ def _normalize_replayed_canonical_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "period_start",
         "period_end",
         "content_id",
+        "content_id_fallback",
         "material_id",
         "title",
         "account_raw",
@@ -295,12 +292,15 @@ def _normalize_replayed_canonical_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "author",
         "cover_url",
         "content_url",
+        "source_time",
+        "duration",
         "category_l1",
         "category_l2",
         "category_l3",
         "category_source",
         "category_l2_source",
         "review_status",
+        "content_form",
         "primary_category",
         "manual_category",
         "ai_category",
@@ -349,28 +349,14 @@ def _find_file(input_dir: Path, tokens: Iterable[str]) -> Path:
 
 
 def _standardize_douyin(raw: pd.DataFrame, source_file: str, channel: str) -> pd.DataFrame:
+    field_mapping = load_field_mapping()
     return _standardize(
         raw,
         platform=channel,
         platform_group="抖音",
         channel=channel,
         source_file=source_file,
-        fields={
-            "content_id": ["视频id", "视频链接"],
-            "material_id": ["素材ID", "视频链接"],
-            "title": ["视频标题", "视频链接"],
-            "account_id": ["账号ID", "账号id", "抖音号", "达人ID", "作者ID", "uid", "UID"],
-            "account": ["账号", "账号名称", "发布账号", "达人名称"],
-            "cover_url": ["视频封面图"],
-            "content_url": ["视频链接"],
-            "primary_category": [],
-            "manual_category": ["内容类型"],
-            "spend": ["消耗"],
-            "impressions": ["展示数"],
-            "clicks": ["点击数"],
-            "activations": ["激活数"],
-            "first_pay_count": ["付费次数", "付费数"],
-        },
+        fields=field_mapping.fields_for_source(f"douyin:{channel}"),
     )
 
 
@@ -390,6 +376,7 @@ def _standardize(
     source_file: str,
     fields: Mapping[str, List[str]],
 ) -> pd.DataFrame:
+    field_mapping = load_field_mapping()
     normalized = pd.DataFrame(index=raw.index)
     normalized["platform"] = platform
     normalized["platform_group"] = platform_group
@@ -404,10 +391,17 @@ def _standardize(
 
     if "manual_category" not in normalized.columns and "content_category" in normalized.columns:
         normalized["manual_category"] = normalized["content_category"]
+    normalized["manual_category"] = raw.apply(lambda row: standardize_content_type(row, field_mapping), axis=1)
+    normalized["content_form"] = raw.apply(
+        lambda row: standardize_content_form(row, channel=channel, mapping=field_mapping),
+        axis=1,
+    )
 
     for column in STANDARD_COLUMNS:
         if column not in normalized.columns:
             normalized[column] = ""
+    fallback_mask = normalized["content_id"].map(_is_blank) & ~normalized["content_id_fallback"].map(_is_blank)
+    normalized.loc[fallback_mask, "content_id"] = normalized.loc[fallback_mask, "content_id_fallback"]
     normalized["account_raw"] = normalized["account"].map(lambda value: "" if _is_blank(value) else str(value).strip())
     normalized["author"] = normalized["author"].where(~normalized["author"].map(_is_blank), normalized["account"])
 
@@ -424,7 +418,7 @@ def _standardize(
     )
     normalized["author"] = normalized["author"].map(lambda value: "" if _is_blank(value) else str(value))
     normalized["author"] = normalized["author"].where(~normalized["author"].map(_is_blank), normalized["account"])
-    normalized = normalized[normalized[["title", "content_id", "material_id"]].ne("").any(axis=1)]
+    normalized = normalized[normalized[["title", "content_id", "material_id", "content_url"]].ne("").any(axis=1)]
     raw_extra = _raw_extra_columns(raw, expanded_fields, source_file)
     if not raw_extra.empty:
         normalized = pd.concat([normalized.reset_index(drop=True), raw_extra.loc[normalized.index].reset_index(drop=True)], axis=1)
@@ -434,50 +428,80 @@ def _standardize(
 def _expanded_field_candidates(raw: pd.DataFrame, fields: Mapping[str, List[str]]) -> dict[str, list[str]]:
     expanded: dict[str, list[str]] = {}
     for output, candidates in fields.items():
-        field_candidates = list(candidates)
-        if output in CORE_METRIC_COLUMNS:
-            for column in raw.columns:
-                if column in field_candidates:
-                    continue
-                if _matches_core_metric_alias(output, column):
-                    field_candidates.append(column)
-        expanded[output] = field_candidates
+        expanded[output] = [column for column in candidates if column in raw.columns]
     return expanded
 
 
 def _backfill_core_metric_aliases(frame: pd.DataFrame) -> pd.DataFrame:
     backfilled = frame.copy()
-    for output in CORE_METRIC_COLUMNS:
+    field_mapping = load_field_mapping()
+    for output in [field.internal for field in field_mapping.fields if field.internal in set(STANDARD_COLUMNS)]:
         if output not in backfilled.columns:
             backfilled[output] = pd.NA
         backfilled[output] = backfilled[output].astype("object")
-        aliases = [
-            column
-            for column in backfilled.columns
-            if column != output and _matches_core_metric_alias(output, column)
-        ]
+        aliases = _field_alias_columns(backfilled, output)
+        if output == "content_form":
+            aliases = aliases + [column for column in _field_alias_columns(backfilled, "manual_category") if column not in aliases]
         if not aliases:
             continue
-        alias_values = _first_non_blank(backfilled, aliases)
+        if output == "manual_category":
+            alias_values = backfilled.apply(lambda row: _first_valid_content_alias(row, aliases, field_mapping), axis=1)
+        elif output == "content_form":
+            alias_values = backfilled.apply(
+                lambda row: _content_form_from_aliases(row, aliases, field_mapping),
+                axis=1,
+            )
+        else:
+            alias_values = _first_non_blank(backfilled, aliases)
         mask = backfilled[output].map(_is_blank) & ~alias_values.map(_is_blank)
         backfilled.loc[mask, output] = alias_values.loc[mask]
+    if {"content_id", "content_id_fallback"}.issubset(backfilled.columns):
+        fallback_mask = backfilled["content_id"].map(_is_blank) & ~backfilled["content_id_fallback"].map(_is_blank)
+        backfilled.loc[fallback_mask, "content_id"] = backfilled.loc[fallback_mask, "content_id_fallback"]
     return backfilled
 
 
-def _matches_core_metric_alias(output: str, column: object) -> bool:
-    name = _compact_metric_column_name(column)
-    if not name or output not in CORE_METRIC_ALIAS_KEYWORDS:
+def _matches_configured_source_alias(output: str, column: object) -> bool:
+    try:
+        source_columns = set(load_field_mapping().source_columns_for(output))
+    except KeyError:
         return False
-    if any(keyword in name for keyword in CORE_METRIC_EXCLUDE_KEYWORDS):
-        return False
-    specific_excludes = CORE_METRIC_SPECIFIC_EXCLUDE_KEYWORDS.get(output, ())
-    if any(keyword in name for keyword in specific_excludes):
-        return False
-    return any(keyword in name for keyword in CORE_METRIC_ALIAS_KEYWORDS[output])
+    return _source_column_name(column) in source_columns
 
 
-def _compact_metric_column_name(column: object) -> str:
-    return re.sub(r"[\s_（）()\-\[\]【】:：/\\]+", "", str(column or "").strip().lower())
+def _field_alias_columns(frame: pd.DataFrame, output: str) -> list[str]:
+    source_columns = load_field_mapping().source_columns_for(output)
+    aliases: list[str] = []
+    for source_column in source_columns:
+        for column in frame.columns:
+            if column == output:
+                continue
+            if _source_column_name(column) == source_column and column not in aliases:
+                aliases.append(column)
+    return aliases
+
+
+def _source_column_name(column: object) -> str:
+    text = str(column or "").strip()
+    if text.startswith("raw__"):
+        parts = text.split("__", 2)
+        if len(parts) == 3:
+            return parts[2]
+    return text
+
+
+def _first_valid_content_alias(row: pd.Series, aliases: list[str], field_mapping) -> str:
+    for column in aliases:
+        value = standardize_content_type(pd.Series({_source_column_name(column): row.get(column, "")}), field_mapping)
+        if value:
+            return value
+    return ""
+
+
+def _content_form_from_aliases(row: pd.Series, aliases: list[str], field_mapping) -> str:
+    values = {_source_column_name(column): row.get(column, "") for column in aliases}
+    values["manual_category"] = row.get("manual_category", "")
+    return standardize_content_form(pd.Series(values), channel=str(row.get("channel", "")), mapping=field_mapping)
 
 
 def _normalize_social_dimensions(canonical: pd.DataFrame) -> pd.DataFrame:
@@ -1050,12 +1074,8 @@ def _apply_fixed_channel_categories(canonical: pd.DataFrame) -> None:
     bilibili = canonical["channel"].fillna("").astype(str).str.strip().eq("B站")
     if not bilibili.any():
         return
-    canonical.loc[bilibili, "manual_category"] = ""
-    canonical.loc[bilibili, "ai_category"] = "B站全部"
-    canonical.loc[bilibili, "content_category"] = "B站全部"
-    canonical.loc[bilibili, "category_status"] = "渠道固定规则"
-    canonical.loc[bilibili, "category_l2_source"] = "渠道固定规则"
-    canonical.loc[bilibili, "category_confidence"] = 1.0
+    if "content_form" in canonical.columns:
+        canonical.loc[bilibili & canonical["content_form"].map(_is_blank), "content_form"] = "视频"
 
 
 def _fill_missing_secondary_categories(canonical: pd.DataFrame) -> None:

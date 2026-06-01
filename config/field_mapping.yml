@@ -1,0 +1,149 @@
+fields:
+  - display: 标题
+    internal: title
+    role: identity
+    source_columns: [视频标题, 标题, 单元名称, 创意名称, 名称, 计划名称, 内容标题, 笔记标题, 链接, 笔记/素材链接, __清洗行标题]
+  - display: 内容ID
+    internal: content_id
+    role: identity
+    source_columns: [视频BVID, 视频bvid, 视频id, 视频ID, 笔记ID, 笔记/素材ID, 广告ID, 计划ID, 内容ID, 内容id, 作品ID, id, ID, 视频链接, 链接, 落地页, 单元名称, __清洗行ID]
+  - display: 备用内容ID
+    internal: content_id_fallback
+    role: identity
+    source_columns: [视频AVID]
+  - display: 素材ID
+    internal: material_id
+    role: identity
+    source_columns: [素材ID, 素材id, 素材中心id, 素材中心ID, 计划ID, 内容ID, 视频id, 笔记ID, 链接, 创意名称, 单元名称, __清洗行ID]
+  - display: 账号
+    internal: account
+    role: account
+    source_columns: [发布作者, 账号, 账号名称, 发布账号, 达人名称, Up主名称, UP主名称, UP主昵称, 账户名称, 作者]
+  - display: 账号ID
+    internal: account_id
+    role: account
+    source_columns: [Up主mid, UID, uid, mid, 账号ID, 账号id, 抖音号, 达人ID, 作者ID, 用户ID, 小红书号, 账户ID]
+  - display: 链接
+    internal: content_url
+    role: identity
+    source_columns: [链接, 内容链接, 视频链接, 笔记链接, 笔记/素材链接, 素材url, 落地页]
+  - display: 封面
+    internal: cover_url
+    role: identity
+    source_columns: [视频封面图, 封面, 封面图, 图片链接, 素材url]
+  - display: 时间
+    internal: source_time
+    role: context
+    source_columns: [时间, 日期, 创建时间]
+  - display: 时长
+    internal: duration
+    role: context
+    source_columns: [时长]
+  - display: 内容形式
+    internal: content_form
+    role: content
+    source_columns: [类型]
+  - display: 内容类型
+    internal: manual_category
+    role: content
+    source_columns: [内容分类, 内容类型, 内容类型_映射, __分组内容类型]
+  - display: 消耗
+    internal: spend
+    role: additive_metric
+    source_columns: [消耗, 消费, 花费, 总花费, 求和项:总花费, spend]
+  - display: 曝光量
+    internal: impressions
+    role: additive_metric
+    source_columns: [展示数, 展示量, 展现量, 曝光次数, 曝光量, 曝光量(次), 视频展示量, 求和项:展示量, impressions]
+  - display: 点击量
+    internal: clicks
+    role: additive_metric
+    source_columns: [点击量, 点击数, 点击次数, 求和项:点击量, clicks]
+  - display: 激活数
+    internal: activations
+    role: additive_metric
+    source_columns: [激活数, 激活数(转化时间), 应用激活数, APP激活数, APP激活次数, 求和项:应用激活数, activations]
+  - display: 付费数
+    internal: first_pay_count
+    role: additive_metric
+    source_columns: [首次付费次数, 首次付费次数(转化时间), 首次付费数, 七日付费数, 应用内付费, 应用内首次付费次数, 求和项:应用内首次付费次数, 付费次数, 付费数, 注册次数, 注册次数（点击归因）]
+  - display: 激活成本
+    internal: activation_cost_raw
+    role: derived_metric_raw
+    source_columns: [激活成本, 激活成本（元）, 激活成本(转化时间), 应用激活成本, APP激活成本]
+  - display: 付费成本
+    internal: first_pay_cost_raw
+    role: derived_metric_raw
+    source_columns: [首次付费成本, 首次付费成本(转化时间), 七日付费成本, 应用内首次付费成本, 付费成本, 注册次数成本]
+  - display: 点击率
+    internal: ctr_raw
+    role: derived_metric_raw
+    source_columns: [点击率]
+  - display: 激活率
+    internal: activation_rate_raw
+    role: derived_metric_raw
+    source_columns: [激活率, 激活率%, 激活率(转化时间), 应用激活率, APP点击激活率, APP下载激活率]
+  - display: 付费率
+    internal: first_pay_rate_raw
+    role: derived_metric_raw
+    source_columns: [首次付费率, 首次付费率%, 首次付费率(转化时间), 七日付费率, 应用内首次付费率]
+  - display: 点赞数
+    internal: likes
+    role: engagement
+    source_columns: [点赞, 点赞数, 点赞量]
+  - display: 评论数
+    internal: comments
+    role: engagement
+    source_columns: [评论, 评论量]
+  - display: 收藏数
+    internal: favorites
+    role: engagement
+    source_columns: [收藏]
+  - display: 关注数
+    internal: follows
+    role: engagement
+    source_columns: [关注]
+
+invalid_content_values: ["", "#REF!", "0", "nan", "None", "NONE"]
+graphic_values: [图文, 图文笔记]
+video_values: [视频, 视频笔记, 短视频, 直播]
+default_content_form_by_channel:
+  B站: 视频
+
+passthrough_fields:
+  category_l3: [三级题材, 题材]
+  category_status: [类别来源_解析]
+
+ignored_fields:
+  - 10s完播数
+  - 10秒播放率%
+  - "2026目标  10个爆款/月"
+  - "2026目标  2个爆款/月"
+  - "2026目标  5个爆款/月"
+  - 2秒播放率%
+  - 3秒播放率%
+  - 5秒播放率%
+  - APP下载完成次数
+  - APP下载成本
+  - 不感兴趣数
+  - 优化目标
+  - 千次展现均价
+  - 千次展示价格
+  - 单次点击价格
+  - "备注：内容类型公式"
+  - 完播率%
+  - 平均千次展示费用
+  - 平均点击单价(元)
+  - 开户
+  - 投放位置
+  - 拉新
+  - 曝光/展现率
+  - 曝光转化率
+  - 最大广告主Id
+  - 有效播放率%
+  - 深度优化目标
+  - 激活注册率
+  - 点击均价
+  - 状态
+  - 营销诉求
+  - 过审核率监控

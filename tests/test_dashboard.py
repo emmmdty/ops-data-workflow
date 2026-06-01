@@ -15,6 +15,7 @@ from ops_data_workflow.dashboard import (
     build_period_comparison_for_batch,
     build_content_recommendations,
     build_dashboard_summary,
+    compare_channel_topics,
     detect_high_metric_anomalies,
     filter_dashboard_items,
     format_beijing_datetime,
@@ -25,9 +26,12 @@ from ops_data_workflow.dashboard import (
     load_latest_dashboard_items,
     list_successful_dashboard_batches,
     metric_sort_ascending,
+    summarize_channel_category_comparison,
     summarize_channel_categories,
     summarize_channel_top_topics,
+    summarize_channel_top_content_links,
     summarize_dimension_for_metric,
+    summarize_period_metric_trends,
     summarize_topics_for_selection,
     summarize_content_type_trends,
     summarize_content_types,
@@ -1077,6 +1081,58 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("栏目99", set(result["category_name"]))
         self.assertIn("first_pay_rate", result.columns)
 
+    def test_summarize_channel_category_comparison_limits_current_top5_and_adds_previous_spend(self):
+        current = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "category_l2": f"栏目{i:02d}",
+                    "content_id": f"dy-{i}",
+                    "spend": float(i * 10),
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                }
+                for i in range(1, 8)
+            ]
+        )
+        previous = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "category_l2": "栏目07",
+                    "content_id": "old-7",
+                    "spend": 35.0,
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                },
+                {
+                    "channel": "抖音商业化",
+                    "category_l2": "栏目06",
+                    "content_id": "old-6",
+                    "spend": 60.0,
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                },
+                {
+                    "channel": "B站",
+                    "category_l2": "栏目07",
+                    "content_id": "bv-7",
+                    "spend": 999.0,
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                },
+            ]
+        )
+
+        result = summarize_channel_category_comparison(current, previous, "抖音商业化", top_n=5)
+
+        self.assertEqual(result["category_name"].tolist(), ["栏目07", "栏目06", "栏目05", "栏目04", "栏目03"])
+        self.assertAlmostEqual(result.iloc[0]["spend"], 70.0)
+        self.assertAlmostEqual(result.iloc[0]["spend_previous"], 35.0)
+        self.assertAlmostEqual(result.iloc[0]["spend_change_rate"], 1.0)
+        self.assertAlmostEqual(result.iloc[1]["spend_change_rate"], 0.0)
+        self.assertTrue(pd.isna(result.iloc[2]["spend_previous"]))
+
     def test_summarize_channel_top_topics_uses_top_20_spend_candidates_and_ai_labels(self):
         frame = pd.DataFrame(
             [
@@ -1096,7 +1152,7 @@ class DashboardTests(unittest.TestCase):
                 {
                     "channel": "B站",
                     "title": "其他渠道",
-                    "category_l2": "B站全部",
+                    "category_l2": "大佬采访",
                     "category_l3": "其他题材",
                     "content_id": "bv-1",
                     "spend": 500.0,
@@ -1210,11 +1266,95 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("拉新", markdown)
         self.assertIn("效率", markdown)
 
-    def test_summarize_topics_for_selection_uses_single_bilibili_bucket(self):
+    def test_compare_channel_topics_adds_previous_spend_by_topic_name(self):
+        current = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "topic_name": "短线交易", "content_types": "股友说", "spend": 120.0, "activations": 12.0},
+                {"channel": "抖音商业化", "topic_name": "芯片行情", "content_types": "资讯", "spend": 40.0, "activations": 4.0},
+            ]
+        )
+        previous = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "topic_name": "短线交易", "content_types": "股友说", "spend": 80.0, "activations": 8.0},
+                {"channel": "抖音商业化", "topic_name": "财商认知", "content_types": "资讯", "spend": 200.0, "activations": 20.0},
+            ]
+        )
+
+        result = compare_channel_topics(current, previous)
+
+        self.assertEqual(result["topic_name"].tolist(), ["短线交易", "芯片行情"])
+        self.assertAlmostEqual(result.iloc[0]["spend_previous"], 80.0)
+        self.assertAlmostEqual(result.iloc[0]["spend_change_rate"], 0.5)
+        self.assertTrue(pd.isna(result.iloc[1]["spend_previous"]))
+
+    def test_summarize_channel_top_content_links_uses_channel_limits_and_keeps_urls(self):
         frame = pd.DataFrame(
             [
-                {"channel": "B站", "title": "标题A", "category_l2": "B站全部", "category_l3": "题材A", "spend": 100.0, "activations": 10.0, "first_pay_count": 2.0},
-                {"channel": "B站", "title": "标题B", "category_l2": "B站全部", "category_l3": "题材B", "spend": 20.0, "activations": 2.0, "first_pay_count": 1.0},
+                {
+                    "channel": "抖音商业化",
+                    "title": f"抖音标题{i:02d}",
+                    "content_id": f"dy-{i:02d}",
+                    "content_url": f"https://douyin.example/{i:02d}",
+                    "spend": float(100 - i),
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                }
+                for i in range(25)
+            ]
+            + [
+                {
+                    "channel": "小红书商业化",
+                    "title": f"小红书标题{i:02d}",
+                    "content_id": f"note-{i:02d}",
+                    "content_url": f"https://xhs.example/{i:02d}",
+                    "spend": float(50 - i),
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                }
+                for i in range(12)
+            ]
+            + [
+                {
+                    "channel": "B站",
+                    "title": f"B站标题{i:02d}",
+                    "content_id": f"bv-{i:02d}",
+                    "content_url": f"https://bilibili.example/{i:02d}",
+                    "spend": float(20 - i),
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                }
+                for i in range(7)
+            ]
+            + [
+                {
+                    "channel": "其他渠道",
+                    "title": "其他标题",
+                    "content_id": "other-1",
+                    "content_url": "https://other.example/1",
+                    "spend": 999.0,
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                }
+            ]
+        )
+
+        douyin = summarize_channel_top_content_links(frame, "抖音商业化")
+        xhs = summarize_channel_top_content_links(frame, "小红书商业化")
+        bilibili = summarize_channel_top_content_links(frame, "B站")
+        other = summarize_channel_top_content_links(frame, "其他渠道")
+
+        self.assertEqual(len(douyin), 20)
+        self.assertEqual(len(xhs), 10)
+        self.assertEqual(len(bilibili), 5)
+        self.assertTrue(other.empty)
+        self.assertEqual(douyin.iloc[0]["title"], "抖音标题00")
+        self.assertEqual(douyin.iloc[0]["content_url"], "https://douyin.example/00")
+
+    def test_summarize_topics_for_selection_keeps_blank_bilibili_category_unmatched(self):
+        frame = pd.DataFrame(
+            [
+                {"channel": "B站", "title": "标题A", "category_l2": "", "category_l3": "题材A", "spend": 100.0, "activations": 10.0, "first_pay_count": 2.0},
+                {"channel": "B站", "title": "标题B", "category_l2": "", "category_l3": "题材B", "spend": 20.0, "activations": 2.0, "first_pay_count": 1.0},
                 {"channel": "抖音商业化", "title": "标题C", "category_l2": "资讯", "category_l3": "热点行情", "spend": 50.0, "activations": 5.0, "first_pay_count": 1.0},
             ]
         )
@@ -1222,7 +1362,7 @@ class DashboardTests(unittest.TestCase):
         result = summarize_topics_for_selection(frame, "B站", None, "spend", top_n=5)
 
         self.assertEqual(list(result["topic_name"]), ["题材A", "题材B"])
-        self.assertEqual(set(result["category_name"]), {"B站全部"})
+        self.assertEqual(set(result["category_name"]), {"未匹配栏目"})
 
     def test_summarize_topics_for_selection_accepts_ai_topic_labels(self):
         frame = pd.DataFrame(
@@ -1358,7 +1498,7 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(
             list(result.columns)[:6],
-            ["渠道", "标题", "消耗", "首次付费成本", "栏目", "分类来源"],
+            ["渠道", "标题", "消耗", "付费成本", "栏目", "分类来源"],
         )
         self.assertIn("曝光量", result.columns)
         self.assertNotIn("展示/曝光量", result.columns)
@@ -1486,6 +1626,114 @@ class DashboardTests(unittest.TestCase):
             old_row = result[result["batch_id"].eq("batch-old") & result["content_category"].eq("股友说")].iloc[0]
             self.assertEqual(old_row["trend_period"], "2026-04-01 至 2026-04-07")
             self.assertAlmostEqual(old_row["spend"], 100.0)
+
+    def test_summarize_period_metric_trends_filters_level_limits_recent_and_recomputes_costs(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = [
+                    ("week-1", "2026-04-03", "2026-04-09", PERIOD_LEVEL_WEEK, "20260403-20260409", 100.0, 10.0, 2.0),
+                    ("week-2", "2026-04-10", "2026-04-16", PERIOD_LEVEL_WEEK, "20260410-20260416", 240.0, 12.0, 3.0),
+                    ("week-3", "2026-04-17", "2026-04-23", PERIOD_LEVEL_WEEK, "20260417-20260423", 300.0, 15.0, 5.0),
+                    ("month-1", "2026-04-01", "2026-04-30", PERIOD_LEVEL_MONTH, "2026-04", 999.0, 99.0, 9.0),
+                ]
+                for batch_id, start, end, level, key, spend, activations, first_pay_count in rows:
+                    _insert_period_batch(conn, batch_id, start, end, period_level=level, period_key=key)
+                    _append_frame(
+                        conn,
+                        "canonical_items",
+                        batch_id,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "platform": "抖音",
+                                    "channel": "抖音商业化",
+                                    "period_start": start,
+                                    "period_end": end,
+                                    "content_id": batch_id,
+                                    "spend": spend,
+                                    "impressions": spend * 10,
+                                    "clicks": spend,
+                                    "activations": activations,
+                                    "first_pay_count": first_pay_count,
+                                    "activation_cost": 999.0,
+                                    "first_pay_cost": 999.0,
+                                }
+                            ]
+                        ),
+                    )
+                conn.commit()
+
+            items = load_all_dashboard_items(db_path)
+            batches = list_successful_dashboard_batches(db_path)
+
+            result = summarize_period_metric_trends(items, batches, PERIOD_LEVEL_WEEK, window_size=2)
+
+            self.assertEqual(result["batch_id"].tolist(), ["week-2", "week-3"])
+            self.assertEqual(result["trend_period"].tolist(), ["2026-04-10 至 2026-04-16", "2026-04-17 至 2026-04-23"])
+            self.assertAlmostEqual(result.iloc[1]["spend"], 300.0)
+            self.assertAlmostEqual(result.iloc[1]["activation_cost"], 20.0)
+            self.assertAlmostEqual(result.iloc[1]["first_pay_cost"], 60.0)
+            self.assertAlmostEqual(result.iloc[1]["first_pay_rate"], 5.0 / 15.0)
+
+    def test_summarize_period_metric_trends_filters_channels_before_aggregating(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                _insert_period_batch(
+                    conn,
+                    "week-1",
+                    "2026-04-03",
+                    "2026-04-09",
+                    period_level=PERIOD_LEVEL_WEEK,
+                    period_key="20260403-20260409",
+                )
+                _append_frame(
+                    conn,
+                    "canonical_items",
+                    "week-1",
+                    pd.DataFrame(
+                        [
+                            {
+                                "platform": "抖音",
+                                "channel": "抖音商业化",
+                                "period_start": "2026-04-03",
+                                "period_end": "2026-04-09",
+                                "content_id": "dy-1",
+                                "spend": 100.0,
+                                "impressions": 1000.0,
+                                "clicks": 100.0,
+                                "activations": 10.0,
+                                "first_pay_count": 2.0,
+                            },
+                            {
+                                "platform": "B站",
+                                "channel": "B站",
+                                "period_start": "2026-04-03",
+                                "period_end": "2026-04-09",
+                                "content_id": "bv-1",
+                                "spend": 40.0,
+                                "impressions": 400.0,
+                                "clicks": 20.0,
+                                "activations": 4.0,
+                                "first_pay_count": 1.0,
+                            },
+                        ]
+                    ),
+                )
+                conn.commit()
+
+            items = load_all_dashboard_items(db_path)
+            batches = list_successful_dashboard_batches(db_path)
+
+            result = summarize_period_metric_trends(items, batches, PERIOD_LEVEL_WEEK, channels=("B站",))
+
+            self.assertEqual(len(result), 1)
+            self.assertAlmostEqual(result.iloc[0]["spend"], 40.0)
+            self.assertAlmostEqual(result.iloc[0]["activations"], 4.0)
+            self.assertAlmostEqual(result.iloc[0]["activation_cost"], 10.0)
 
     def test_build_content_recommendations_returns_renderable_markdown(self):
         summary = build_dashboard_summary(pd.DataFrame([{"spend": 100.0, "activations": 10.0, "first_pay_count": 2.0}]))

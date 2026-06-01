@@ -187,7 +187,7 @@ def apply_review_resolutions_and_regenerate(
     batch_id: str,
     *,
     output_root: Path,
-    archive_root: Path,
+    processed_root: Path,
     category_rules_path: Path,
     env_path: Path,
 ):
@@ -195,22 +195,28 @@ def apply_review_resolutions_and_regenerate(
     record = read_batch_record(db_path, batch_id)
     if not record:
         raise ValueError("未找到当前周期，无法同步审核结果。")
-    raw_dir = Path(record["archive_dir"]) / "raw"
-    cleaned_workbook = raw_dir / "cleaned.xlsx"
+    processed_dir = Path(record["archive_dir"])
+    cleaned_workbook = processed_dir / "cleaned.xlsx"
     if not cleaned_workbook.exists():
         raise ValueError("当前周期不是由 cleaned.xlsx 生成，无法直接同步 Excel。")
     resolutions = _load_saved_resolutions(db_path, batch_id)
     canonical = apply_resolutions_to_frame(load_cleaned_canonical(cleaned_workbook), resolutions)
     rewrite_cleaned_canonical(cleaned_workbook, canonical)
     return run_archived_workflow(
-        raw_dir,
+        processed_dir,
         record.get("period_start", ""),
         record.get("period_end", ""),
         output_root=output_root,
-        archive_root=archive_root,
+        processed_root=processed_root,
         db_path=db_path,
         category_rules_path=category_rules_path,
         env_path=env_path,
+        period_level=record.get("period_level", ""),
+        period_key=record.get("period_key", ""),
+        period_label=record.get("period_label", ""),
+        data_start=record.get("data_start", ""),
+        data_end=record.get("data_end", ""),
+        source_type=record.get("source_type", ""),
     )
 
 

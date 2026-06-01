@@ -30,6 +30,27 @@ METRIC_COLUMNS = [
     "first_pay_rate",
 ]
 
+PERIOD_METRIC_TREND_COLUMNS = [
+    "batch_id",
+    "period_level",
+    "period_key",
+    "period_label",
+    "period_start",
+    "period_end",
+    "trend_period",
+    "source_type",
+    "item_count",
+    "spend",
+    "impressions",
+    "clicks",
+    "ctr",
+    "activations",
+    "activation_cost",
+    "first_pay_count",
+    "first_pay_cost",
+    "first_pay_rate",
+]
+
 CHANNEL_COMPARISON_COLUMNS = [
     "channel",
     "spend_current",
@@ -72,9 +93,6 @@ OVERVIEW_TABLE_COLUMNS = [
 
 COST_METRICS = {"activation_cost", "first_pay_cost"}
 BILIBILI_CHANNEL = "B站"
-BILIBILI_CATEGORY = "B站全部"
-LEGACY_BILIBILI_CATEGORY_VALUES = {"", "采访"}
-LEGACY_BILIBILI_TOPIC_VALUES = {"", "新手教学"}
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 BATCH_COLUMNS = [
     "batch_id",
@@ -113,6 +131,7 @@ DETAIL_COLUMNS = [
     "material_id",
     "account",
     "author",
+    "content_url",
     "category_l2",
     "category_l3",
     "category_source",
@@ -684,6 +703,73 @@ def summarize_content_type_trends(items: pd.DataFrame, period_start: str = "", p
     return grouped[columns].reset_index(drop=True)
 
 
+def summarize_period_metric_trends(
+    items: pd.DataFrame,
+    batches: pd.DataFrame,
+    period_level: str,
+    *,
+    window_size: int | None = None,
+    channels: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Build one trend row per retained week/month period for key metrics."""
+    selected_level = str(period_level or "").strip()
+    if selected_level not in {"week", "month"}:
+        return _empty_period_metric_trends()
+    if batches.empty:
+        return _empty_period_metric_trends()
+
+    trend_batches = normalize_batch_metadata(batches)
+    if "status" in trend_batches.columns:
+        trend_batches = trend_batches[trend_batches["status"].fillna("").astype(str).eq("ok")]
+    trend_batches = trend_batches[trend_batches["period_level"].fillna("").astype(str).eq(selected_level)].copy()
+    if trend_batches.empty:
+        return _empty_period_metric_trends()
+
+    trend_batches["_period_start_dt"] = pd.to_datetime(trend_batches["period_start"], errors="coerce")
+    trend_batches["_period_end_dt"] = pd.to_datetime(trend_batches["period_end"], errors="coerce")
+    trend_batches = trend_batches[trend_batches["_period_start_dt"].notna() & trend_batches["_period_end_dt"].notna()]
+    if trend_batches.empty:
+        return _empty_period_metric_trends()
+
+    trend_batches["_source_rank"] = trend_batches["source_type"].map({"upload": 0}).fillna(1).astype(int)
+    trend_batches["_created_dt"] = pd.to_datetime(trend_batches.get("created_at", ""), errors="coerce", utc=True)
+    trend_batches = trend_batches.sort_values(
+        ["_period_end_dt", "_period_start_dt", "_source_rank", "_created_dt"],
+        ascending=[False, False, True, False],
+    ).drop_duplicates(subset=["period_level", "period_key"], keep="first")
+    if window_size is not None and int(window_size) > 0:
+        trend_batches = trend_batches.head(int(window_size))
+    trend_batches = trend_batches.sort_values(["_period_start_dt", "_period_end_dt", "_created_dt"]).copy()
+
+    normalized = _normalize_items(items)
+    normalized = normalized[normalized["batch_id"].isin(set(trend_batches["batch_id"].astype(str)))].copy()
+    normalized = _filter_in(normalized, "channel", channels)
+    if normalized.empty:
+        grouped = pd.DataFrame(columns=["batch_id", "item_count", "spend", "impressions", "clicks", "activations", "first_pay_count"])
+    else:
+        grouped = (
+            normalized.groupby("batch_id", dropna=False)
+            .agg(
+                item_count=("content_id", "size"),
+                spend=("spend", _sum_or_zero),
+                impressions=("impressions", _sum_or_zero),
+                clicks=("clicks", _sum_or_zero),
+                activations=("activations", _sum_or_zero),
+                first_pay_count=("first_pay_count", _sum_or_zero),
+            )
+            .reset_index()
+        )
+
+    result = trend_batches[
+        ["batch_id", "period_level", "period_key", "period_label", "period_start", "period_end", "source_type"]
+    ].merge(grouped, on="batch_id", how="left")
+    for column in ["item_count", "spend", "impressions", "clicks", "activations", "first_pay_count"]:
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
+    result["trend_period"] = result["period_start"].astype(str) + " 至 " + result["period_end"].astype(str)
+    result = _add_rate_columns(result)
+    return result[PERIOD_METRIC_TREND_COLUMNS].reset_index(drop=True)
+
+
 def metric_sort_ascending(metric: str) -> bool:
     """Return True for metrics where lower values are better in rankings."""
     return metric in COST_METRICS
@@ -738,6 +824,57 @@ def summarize_channel_categories(items: pd.DataFrame, channel: str) -> pd.DataFr
     return _sort_metric_summary(summary, "spend")[columns].reset_index(drop=True)
 
 
+def summarize_channel_category_comparison(
+    current_items: pd.DataFrame,
+    previous_items: pd.DataFrame,
+    channel: str,
+    *,
+    top_n: int = 5,
+) -> pd.DataFrame:
+    """Compare a channel's current Top categories against the previous period."""
+    current = summarize_channel_categories(current_items, channel).head(int(top_n)).copy()
+    previous = summarize_channel_categories(previous_items, channel)
+    return _merge_spend_comparison(current, previous, "category_name")
+
+
+def compare_channel_topics(current_topics: pd.DataFrame, previous_topics: pd.DataFrame) -> pd.DataFrame:
+    """Attach previous-period spend and spend growth to current topic rows."""
+    current = current_topics.copy()
+    previous = previous_topics.copy()
+    if "topic_name" not in current.columns:
+        current["topic_name"] = ""
+    if "topic_name" not in previous.columns:
+        previous["topic_name"] = ""
+    return _merge_spend_comparison(current, previous, "topic_name")
+
+
+def summarize_channel_top_content_links(items: pd.DataFrame, channel: str) -> pd.DataFrame:
+    """Return channel-specific spend Top content rows with visible content links."""
+    channel_name = str(channel or "").strip()
+    limit = _channel_top_content_limit(channel_name)
+    columns = ["title", "spend", "content_url"]
+    if limit <= 0:
+        return pd.DataFrame(columns=columns)
+    normalized = _normalize_items(items)
+    if normalized.empty or "channel" not in normalized.columns:
+        return pd.DataFrame(columns=columns)
+    scoped = normalized[normalized["channel"].eq(channel_name)].copy()
+    if scoped.empty:
+        return pd.DataFrame(columns=columns)
+    scoped["spend"] = pd.to_numeric(scoped["spend"], errors="coerce")
+    scoped = scoped.dropna(subset=["spend"])
+    if scoped.empty:
+        return pd.DataFrame(columns=columns)
+    for column in columns:
+        if column not in scoped.columns:
+            scoped[column] = ""
+    return (
+        scoped.sort_values("spend", ascending=False, na_position="last")
+        .head(limit)[columns]
+        .reset_index(drop=True)
+    )
+
+
 def summarize_channel_top_topics(
     items: pd.DataFrame,
     channel: str,
@@ -769,12 +906,7 @@ def summarize_channel_top_topics(
     if top_rows.empty:
         return pd.DataFrame(columns=columns)
 
-    is_bilibili = channel_name == BILIBILI_CHANNEL
-    top_rows["category_name"] = (
-        BILIBILI_CATEGORY
-        if is_bilibili
-        else top_rows["category_l2"].fillna("").astype(str).str.strip()
-    )
+    top_rows["category_name"] = top_rows["category_l2"].fillna("").astype(str).str.strip()
     top_rows.loc[top_rows["category_name"].eq(""), "category_name"] = "未匹配栏目"
     labels = topic_labels or {}
     top_rows["topic_name"] = [
@@ -832,7 +964,7 @@ def build_channel_top_topic_insights(topic_summary: pd.DataFrame) -> str:
                 f"可作为低成本扩量候选。"
             ),
             (
-                f"- 付费转化优先关注 **{pay_topic['topic_name']}**：首次付费率 {_fmt_percent_text(pay_topic.get('first_pay_rate'))}，"
+                f"- 付费转化优先关注 **{pay_topic['topic_name']}**：付费率 {_fmt_percent_text(pay_topic.get('first_pay_rate'))}，"
                 f"付费 {_fmt_number(pay_topic.get('first_pay_count'), 0)}。"
             ),
             "建议：下一轮素材不要逐条按标题复投，优先围绕高消耗且能带来拉新的题材扩展相邻选题，同时用低成本题材做小预算测试。",
@@ -855,14 +987,13 @@ def summarize_topics_for_selection(
 
     channel_name = str(channel).strip()
     scoped = normalized[normalized["channel"].eq(channel_name)].copy()
-    is_bilibili = channel_name == BILIBILI_CHANNEL
-    if not is_bilibili and category_l2:
+    if category_l2:
         scoped = scoped[scoped["category_l2"].eq(str(category_l2).strip())].copy()
     if scoped.empty:
         return pd.DataFrame(columns=["category_name", "topic_name", *METRIC_COLUMNS])
 
     labels = topic_labels or {}
-    scoped["category_name"] = BILIBILI_CATEGORY if is_bilibili else scoped["category_l2"].fillna("").astype(str).str.strip()
+    scoped["category_name"] = scoped["category_l2"].fillna("").astype(str).str.strip()
     scoped.loc[scoped["category_name"].eq(""), "category_name"] = str(category_l2 or "").strip() or "未匹配栏目"
     scoped["topic_name"] = [
         _topic_label_for_row(index, row, labels)
@@ -1184,6 +1315,7 @@ def _normalize_items(items: pd.DataFrame) -> pd.DataFrame:
         "account",
         "account_id",
         "author",
+        "content_url",
     ]:
         normalized[column] = normalized[column].fillna("").astype(str)
     if "channel" in normalized.columns:
@@ -1193,7 +1325,6 @@ def _normalize_items(items: pd.DataFrame) -> pd.DataFrame:
         missing_platform = normalized["platform"].str.strip().eq("")
         normalized.loc[missing_platform, "platform"] = normalized.loc[missing_platform, "channel"]
     _normalize_social_display_dimensions(normalized)
-    _normalize_bilibili_display_categories(normalized)
     normalized["batch_period_start"] = normalized["batch_period_start"].fillna(normalized["period_start"]).astype(str)
     normalized["batch_period_end"] = normalized["batch_period_end"].fillna(normalized["period_end"]).astype(str)
     normalized = _add_rate_columns(normalized)
@@ -1293,17 +1424,6 @@ def _comparison_summary(items: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([by_channel, total], ignore_index=True, sort=False)
 
 
-def _normalize_bilibili_display_categories(items: pd.DataFrame) -> None:
-    channel = items["channel"].fillna("").astype(str).str.strip()
-    bilibili = channel.eq(BILIBILI_CHANNEL)
-    if not bilibili.any():
-        return
-    for column in ["category_l2", "content_category"]:
-        values = items[column].fillna("").astype(str).str.strip()
-        legacy_or_blank = values.isin(LEGACY_BILIBILI_CATEGORY_VALUES)
-        items.loc[bilibili & legacy_or_blank, column] = BILIBILI_CATEGORY
-
-
 def _normalize_social_display_dimensions(items: pd.DataFrame) -> None:
     platform_from_platform = items["platform"].map(social_platform_from_name)
     platform_from_channel = items["channel"].map(social_platform_from_name)
@@ -1367,7 +1487,7 @@ def _algorithmic_channel_topic_label(row: pd.Series) -> str:
 
     for column in ["category_l2", "content_category", "category_l3"]:
         label = str(row.get(column, "") or "").strip()
-        if label and label != BILIBILI_CATEGORY and not _looks_like_single_title(label, row):
+        if label and not _looks_like_single_title(label, row):
             return _clean_topic_label(label)
     return "未归类题材"
 
@@ -1438,6 +1558,52 @@ def _sort_metric_summary(summary: pd.DataFrame, metric: str) -> pd.DataFrame:
                 sort_columns.append(column)
                 ascending.append(False)
     return summary.sort_values(sort_columns, ascending=ascending, na_position="last")
+
+
+def _merge_spend_comparison(current: pd.DataFrame, previous: pd.DataFrame, key_column: str) -> pd.DataFrame:
+    result = current.copy()
+    if key_column not in result.columns:
+        result[key_column] = ""
+    if result.empty:
+        result["spend_previous"] = pd.Series(dtype="Float64")
+        result["spend_change_rate"] = pd.Series(dtype="Float64")
+        return result
+    if previous.empty or key_column not in previous.columns or "spend" not in previous.columns:
+        result["spend_previous"] = pd.NA
+    else:
+        previous_spend = previous[[key_column, "spend"]].copy()
+        previous_spend[key_column] = previous_spend[key_column].fillna("").astype(str).str.strip()
+        previous_spend["spend_previous"] = pd.to_numeric(previous_spend["spend"], errors="coerce")
+        previous_spend = previous_spend[[key_column, "spend_previous"]].drop_duplicates(
+            subset=[key_column],
+            keep="first",
+        )
+        result[key_column] = result[key_column].fillna("").astype(str).str.strip()
+        result = result.merge(previous_spend, on=key_column, how="left")
+    result["spend"] = pd.to_numeric(result.get("spend"), errors="coerce")
+    result["spend_previous"] = pd.to_numeric(result["spend_previous"], errors="coerce")
+    result["spend_change_rate"] = _change_rate(result["spend"], result["spend_previous"])
+    return result
+
+
+def _change_rate(current: pd.Series, previous: pd.Series) -> pd.Series:
+    current_values = pd.to_numeric(current, errors="coerce").astype(float)
+    previous_values = pd.to_numeric(previous, errors="coerce").astype(float)
+    result = pd.Series(pd.NA, index=current.index, dtype="Float64")
+    mask = previous_values.notna() & previous_values.ne(0.0)
+    result.loc[mask] = (current_values.loc[mask] - previous_values.loc[mask]) / previous_values.loc[mask]
+    return result
+
+
+def _channel_top_content_limit(channel: str) -> int:
+    name = str(channel or "").strip()
+    if "抖音" in name:
+        return 20
+    if "小红书" in name:
+        return 10
+    if "B站" in name:
+        return 5
+    return 0
 
 
 def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -1542,6 +1708,7 @@ def _empty_items() -> pd.DataFrame:
             "account_id",
             "account",
             "author",
+            "content_url",
             "category_l2",
             "category_l3",
             "category_source",
@@ -1555,6 +1722,10 @@ def _empty_items() -> pd.DataFrame:
             "source_file",
         ]
     )
+
+
+def _empty_period_metric_trends() -> pd.DataFrame:
+    return pd.DataFrame(columns=PERIOD_METRIC_TREND_COLUMNS)
 
 
 def _empty_batches() -> pd.DataFrame:

@@ -16,15 +16,11 @@ from ops_data_workflow.categories import CATEGORY_TAG_MAP, category_from_tags
 from ops_data_workflow.source_channels import infer_channel_from_path
 from ops_data_workflow.storage import init_db
 from ops_data_workflow.storage import (
-    delete_batch_permanently,
-    list_file_backups,
     load_category_mappings,
     load_douyin_id_bridge,
     load_topic_labels_for_batch,
-    move_batch_to_file_backup,
     purge_history_state,
     read_batch_record,
-    restore_file_backup,
     upsert_category_mappings,
 )
 from ops_data_workflow.upload_input import (
@@ -366,10 +362,10 @@ class ProductizedWorkflowTests(unittest.TestCase):
 
         self.assertIsNone(infer_period_from_upload_names(uploads))
 
-    def test_cli_infers_period_from_raw_directory_name(self):
+    def test_cli_infers_period_from_source_directory_name(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            raw_dir = tmp_path / "data" / "raw" / "20260401-20260427"
+            raw_dir = tmp_path / "data" / "months" / "202604"
             raw_dir.mkdir(parents=True)
             _write_raw_fixture(raw_dir)
 
@@ -381,8 +377,8 @@ class ProductizedWorkflowTests(unittest.TestCase):
                     str(raw_dir),
                     "--output",
                     str(tmp_path / "outputs"),
-                    "--archive-root",
-                    str(tmp_path / "archive"),
+                    "--processed-root",
+                    str(tmp_path / "processed"),
                     "--db",
                     str(tmp_path / "workflow.sqlite3"),
                     "--env",
@@ -404,7 +400,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(
                 period,
-                ("2026-04-01", "2026-04-30", "month", "2026-04", "2026-04-01", "2026-04-27", "upload"),
+                ("2026-04-01", "2026-04-30", "month", "2026-04", "2026-04-01", "2026-04-30", "upload"),
             )
 
     def test_resolve_deepseek_settings_reads_explicit_env_without_leaking_secret(self):
@@ -491,7 +487,8 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertTrue(result.archive_dir.exists())
             self.assertIn("未配置 DEEPSEEK_API_KEY", result.ai_summary)
             self.assertIn("无历史对比数据", result.comparison_note)
-            self.assertTrue((result.archive_dir / "raw" / "B站.xlsx").exists())
+            self.assertTrue((result.archive_dir / "cleaned.xlsx").exists())
+            self.assertFalse((raw_dir / "cleaned.xlsx").exists())
             output_dir = result.report_html.parent
             self.assertTrue((output_dir / "report.html").exists())
 
@@ -555,10 +552,11 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 category_matcher=lambda items, category_library, env_path: {},
             )
 
-            self.assertTrue((raw_dir / "cleaned.xlsx").exists())
-            self.assertTrue((raw_dir / "period_manifest.json").exists())
-            self.assertTrue((result.archive_dir / "raw" / "cleaned.xlsx").exists())
-            import_log = pd.read_excel(raw_dir / "cleaned.xlsx", sheet_name="导入日志")
+            self.assertFalse((raw_dir / "cleaned.xlsx").exists())
+            self.assertFalse((raw_dir / "period_manifest.json").exists())
+            self.assertTrue((result.archive_dir / "cleaned.xlsx").exists())
+            self.assertTrue((result.archive_dir / "period_manifest.json").exists())
+            import_log = pd.read_excel(result.archive_dir / "cleaned.xlsx", sheet_name="导入日志")
             self.assertEqual(set(import_log["sheet_name"]), {"Sheet1", "Sheet2"})
             self.assertEqual(len(result.canonical), 1)
             self.assertAlmostEqual(result.canonical["spend"].sum(), 10.0)
@@ -641,7 +639,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 progress_callback=messages.append,
             )
 
-            self.assertIn("正在归档原始文件", messages)
+            self.assertIn("正在整理清洗产物", messages)
             self.assertIn("正在读取渠道数据并标准化", messages)
             self.assertIn("正在校验数据质量与题材分类", messages)
             self.assertIn("正在写入周期库并生成当前下载文件", messages)
@@ -782,7 +780,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             db_path = tmp_path / "workflow.sqlite3"
-            archive_root = tmp_path / "archive"
+            processed_root = tmp_path / "processed"
             output_root = tmp_path / "outputs"
             first_raw = tmp_path / "first"
             first_raw.mkdir()
@@ -793,7 +791,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 "2026-04-01",
                 "2026-04-07",
                 output_root=output_root,
-                archive_root=archive_root,
+                processed_root=processed_root,
                 db_path=db_path,
                 env_path=tmp_path / "missing.env",
             )
@@ -805,12 +803,12 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 "2026-04-08",
                 "2026-04-14",
                 output_root=output_root,
-                archive_root=archive_root,
+                processed_root=processed_root,
                 db_path=db_path,
                 env_path=tmp_path / "missing.env",
             )
 
-            purge_history_state(db_path, output_root, archive_root)
+            purge_history_state(db_path, output_root, processed_root)
 
             with closing(sqlite3.connect(db_path)) as conn:
                 for table in ["upload_batches", "uploaded_files", "canonical_items", "ai_reports", "channel_comparison_items"]:
@@ -820,96 +818,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 self.assertEqual(category_mapping_count, 0)
 
             self.assertEqual(list(output_root.iterdir()), [])
-            self.assertEqual(list(archive_root.iterdir()), [])
-
-    def test_move_batch_to_file_backup_hides_and_restores_period_files(self):
-        with TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            db_path = tmp_path / "workflow.sqlite3"
-            archive_root = tmp_path / "archive"
-            output_root = tmp_path / "outputs"
-            raw_root = tmp_path / "data" / "raw"
-            backup_root = tmp_path / "data" / "file_backup"
-            raw_dir = raw_root / "20260401-20260407"
-            raw_dir.mkdir(parents=True)
-            _write_raw_fixture(raw_dir)
-
-            result = run_archived_workflow(
-                raw_dir,
-                "2026-04-01",
-                "2026-04-07",
-                output_root=output_root,
-                archive_root=archive_root,
-                db_path=db_path,
-                env_path=tmp_path / "missing.env",
-            )
-
-            move_batch_to_file_backup(db_path, result.batch_id, raw_root, backup_root)
-            backups = list_file_backups(db_path)
-
-            self.assertFalse(raw_dir.exists())
-            self.assertEqual(list(backups["batch_id"]), [result.batch_id])
-            self.assertTrue(Path(backups.iloc[0]["backup_dir"]).exists())
-
-            restore_file_backup(db_path, result.batch_id, raw_root, backup_root)
-            restored_backups = list_file_backups(db_path)
-
-            self.assertTrue(raw_dir.exists())
-            self.assertTrue(restored_backups.empty)
-
-    def test_delete_batch_permanently_removes_batch_artifacts_but_keeps_mappings(self):
-        with TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            db_path = tmp_path / "workflow.sqlite3"
-            archive_root = tmp_path / "archive"
-            output_root = tmp_path / "outputs"
-            raw_root = tmp_path / "data" / "raw"
-            backup_root = tmp_path / "data" / "file_backup"
-            raw_dir = raw_root / "20260401-20260407"
-            raw_dir.mkdir(parents=True)
-            _write_raw_fixture(raw_dir)
-            upsert_category_mappings(
-                db_path,
-                pd.DataFrame(
-                    [
-                        {
-                            "platform": "抖音",
-                            "platform_group": "抖音",
-                            "channel": "抖音商业化",
-                            "content_id": "content",
-                            "material_id": "material",
-                            "title": "标题",
-                            "category_l1": "",
-                            "category_l2": "股友说",
-                            "category_l3": "短线交易",
-                        }
-                    ]
-                ),
-            )
-            result = run_archived_workflow(
-                raw_dir,
-                "2026-04-01",
-                "2026-04-07",
-                output_root=output_root,
-                archive_root=archive_root,
-                db_path=db_path,
-                env_path=tmp_path / "missing.env",
-            )
-            with closing(sqlite3.connect(db_path)) as conn:
-                mapping_count_before = conn.execute("select count(*) from category_mappings").fetchone()[0]
-
-            delete_batch_permanently(db_path, result.batch_id, raw_root, backup_root)
-
-            with closing(sqlite3.connect(db_path)) as conn:
-                batch_count = conn.execute("select count(*) from upload_batches").fetchone()[0]
-                canonical_count = conn.execute("select count(*) from canonical_items").fetchone()[0]
-                mapping_count = conn.execute("select count(*) from category_mappings").fetchone()[0]
-            self.assertEqual(batch_count, 0)
-            self.assertEqual(canonical_count, 0)
-            self.assertEqual(mapping_count, mapping_count_before)
-            self.assertFalse(raw_dir.exists())
-            self.assertFalse(result.report_html.parent.exists())
-            self.assertFalse(result.archive_dir.exists())
+            self.assertEqual(list(processed_root.iterdir()), [])
 
     def test_archived_workflow_persists_focused_topic_labels(self):
         with TemporaryDirectory() as tmp:

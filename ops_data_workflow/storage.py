@@ -476,7 +476,8 @@ def read_batch_record(db_path: Path, batch_id: str) -> dict[str, str]:
         row = conn.execute(
             """
             select batch_id, period_start, period_end, created_at, status, archive_dir, output_dir,
-                   comparison_batch_id, comparison_note
+                   comparison_batch_id, comparison_note, period_level, period_key, period_label,
+                   data_start, data_end, source_type
             from upload_batches
             where batch_id = ?
             """,
@@ -494,6 +495,12 @@ def read_batch_record(db_path: Path, batch_id: str) -> dict[str, str]:
         "output_dir",
         "comparison_batch_id",
         "comparison_note",
+        "period_level",
+        "period_key",
+        "period_label",
+        "data_start",
+        "data_end",
+        "source_type",
     ]
     return {column: "" if value is None else str(value) for column, value in zip(columns, row)}
 

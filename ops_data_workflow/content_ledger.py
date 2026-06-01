@@ -14,6 +14,8 @@ import pandas as pd
 import yaml
 
 from .categories import category_from_tags
+from .field_mapping import load_field_mapping, standardize_content_form
+from .source_storage import latest_reference_workbook
 from .title_matching import extract_historical_title, normalized_title_key
 
 
@@ -86,6 +88,23 @@ def load_content_ledger(
     return result
 
 
+def load_latest_reference_ledger(reference_dir: Path, *, default_year: int = 2026) -> pd.DataFrame:
+    """Load only the newest human-maintained content ledger from data/reference."""
+    workbook = latest_reference_workbook(reference_dir)
+    if workbook is None:
+        empty = pd.DataFrame(columns=LEDGER_COLUMNS)
+        empty.attrs["source_files"] = set()
+        return empty
+    frame = parse_content_ledger_file(workbook, root=Path(reference_dir))
+    if frame.empty:
+        frame.attrs["source_files"] = set()
+        return frame
+    ledger = _dedupe_ledger_by_earliest_date(frame, default_year=default_year)
+    result = ledger[LEDGER_COLUMNS].copy()
+    result.attrs["source_files"] = {str(workbook.resolve())}
+    return result
+
+
 def parse_content_ledger_file(
     path: Path,
     *,
@@ -141,10 +160,13 @@ def apply_content_ledger(
             enriched[column] = ""
     if "needs_manual_review" not in enriched.columns:
         enriched["needs_manual_review"] = False
+    if "content_form" not in enriched.columns:
+        enriched["content_form"] = ""
 
     if ledger.empty and (douyin_id_bridge is None or douyin_id_bridge.empty):
         return enriched
 
+    field_mapping = load_field_mapping()
     lookup = _build_lookup(ledger)
     fuzzy_rows = _fuzzy_ledger_rows(ledger)
     bridge_lookup = _build_douyin_bridge_lookup(douyin_id_bridge)
@@ -179,6 +201,9 @@ def apply_content_ledger(
                     "投稿台账分类冲突",
                 )
                 enriched.at[index, "needs_manual_review"] = True
+            _fill_content_form_from_type(enriched, index, content_type, field_mapping)
+        if match.risk_reason:
+            _mark_match_risk(enriched, index, match.risk_reason)
     return enriched
 
 
@@ -500,7 +525,7 @@ def _match_fuzzy_title(row: pd.Series, ledger_rows: list[pd.Series]) -> LedgerMa
         "模糊标题",
         f"抖音::fuzzy_title::{title_key}->{candidate_key}",
         1,
-        fill_allowed=False,
+        fill_allowed=True,
         risk_reason="标题近似匹配，需确认",
     )
 
@@ -816,6 +841,21 @@ def _fill_title(frame: pd.DataFrame, index: object, value: object) -> None:
     replacement = _clean_text(value)
     if replacement and (not current or _is_url_only(current)):
         frame.at[index, "title"] = replacement
+
+
+def _fill_content_form_from_type(frame: pd.DataFrame, index: object, content_type: str, field_mapping) -> None:
+    if "content_form" not in frame.columns:
+        frame["content_form"] = ""
+    form = standardize_content_form(
+        pd.Series({"manual_category": content_type}),
+        channel=_clean_text(frame.at[index, "channel"] if "channel" in frame.columns else ""),
+        mapping=field_mapping,
+    )
+    if not form:
+        return
+    current = _clean_text(frame.at[index, "content_form"])
+    if not current or form == "图文":
+        frame.at[index, "content_form"] = form
 
 
 def _is_url_only(value: object) -> bool:

@@ -1,4 +1,4 @@
-"""Synchronize period raw folders into archived workflow batches."""
+"""Synchronize raw source folders into workflow batches."""
 
 from __future__ import annotations
 
@@ -6,16 +6,13 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
-import json
 import sqlite3
 from typing import Callable, Optional
 
 import pandas as pd
 
 from .pipeline import TABULAR_SUFFIXES
-from .reference_tables import parse_period_from_raw_dir
-from .periods import ReviewPeriod, period_metadata_from_dates
-from .storage import is_period_active
+from .source_storage import discover_source_period_dirs
 from .workflow import run_archived_workflow
 
 
@@ -46,25 +43,18 @@ class RawSyncResult:
 FileSignature = tuple[str, str, int]
 
 
-def discover_raw_periods(raw_root: Path) -> list[RawPeriod]:
-    raw_root = Path(raw_root)
-    if not raw_root.exists():
+def discover_raw_periods(data_root: Path) -> list[RawPeriod]:
+    data_root = Path(data_root)
+    if not data_root.exists():
         return []
 
     periods: list[RawPeriod] = []
-    for child in sorted(raw_root.iterdir(), key=lambda item: item.name):
-        if not child.is_dir() or child.name == "uploaded_originals":
-            continue
-        try:
-            metadata = _period_metadata_for_raw_dir(child)
-        except ValueError:
-            continue
-        if not _raw_tabular_files(child):
-            continue
+    for source in discover_source_period_dirs(data_root):
+        metadata = source.period
         periods.append(
             RawPeriod(
-                name=child.name,
-                path=child,
+                name=source.name,
+                path=source.path,
                 period_start=metadata.period_start,
                 period_end=metadata.period_end,
                 period_level=metadata.period_level,
@@ -79,30 +69,19 @@ def discover_raw_periods(raw_root: Path) -> list[RawPeriod]:
 
 
 def sync_raw_periods(
-    raw_root: Path,
+    data_root: Path,
     *,
     db_path: Path,
     output_root: Path,
-    archive_root: Path,
+    processed_root: Path,
     category_rules_path: Optional[Path] = None,
     env_path: Optional[Path] = None,
+    reference_root: Optional[Path] = None,
     category_matcher: Optional[Callable] = None,
 ) -> list[RawSyncResult]:
     results: list[RawSyncResult] = []
-    for period in _canonical_raw_periods(discover_raw_periods(raw_root)):
+    for period in _canonical_raw_periods(discover_raw_periods(data_root)):
         try:
-            if not is_period_active(db_path, period.period_start, period.period_end):
-                results.append(
-                    RawSyncResult(
-                        period.name,
-                        period.period_start,
-                        period.period_end,
-                        "skipped",
-                        "",
-                        "周期已备份或删除",
-                    )
-                )
-                continue
             current_signature = _raw_signature(period.path)
             latest_batch_id = _latest_successful_batch_for_period(db_path, period)
             if latest_batch_id and current_signature == _stored_signature(db_path, latest_batch_id):
@@ -113,7 +92,7 @@ def sync_raw_periods(
                         period.period_end,
                         "skipped",
                         latest_batch_id,
-                        "raw 文件未变化",
+                        "源文件未变化",
                     )
                 )
                 continue
@@ -123,10 +102,11 @@ def sync_raw_periods(
                 period.period_start,
                 period.period_end,
                 output_root=output_root,
-                archive_root=archive_root,
+                processed_root=processed_root,
                 db_path=db_path,
                 category_rules_path=category_rules_path,
                 env_path=env_path,
+                reference_root=reference_root,
                 category_matcher=category_matcher,
                 period_level=period.period_level,
                 period_key=period.period_key,
@@ -142,7 +122,7 @@ def sync_raw_periods(
                     period.period_end,
                     "generated",
                     workflow_result.batch_id,
-                    "已根据 raw 文件生成当前周期",
+                    "已根据源文件生成当前周期",
                 )
             )
         except Exception as exc:
@@ -196,34 +176,12 @@ def _canonical_period_for_group(periods: list[RawPeriod]) -> RawPeriod:
     return sorted(
         periods,
         key=lambda period: (
-            (period.path / "period_manifest.json").exists(),
             period.data_end,
             period.period_end,
             period.name,
         ),
         reverse=True,
     )[0]
-
-
-def _period_metadata_for_raw_dir(period_dir: Path) -> ReviewPeriod:
-    manifest = Path(period_dir) / "period_manifest.json"
-    if manifest.exists():
-        try:
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            return period_metadata_from_dates(
-                str(payload.get("period_start", "")),
-                str(payload.get("period_end", "")),
-                str(payload.get("period_level", "")),
-                str(payload.get("period_key", "")),
-                str(payload.get("period_label", "")),
-                str(payload.get("data_start", "")),
-                str(payload.get("data_end", "")),
-                str(payload.get("source_type", "")),
-            )
-        except Exception as exc:
-            raise ValueError(f"period_manifest.json 无法解析：{exc}") from exc
-    period_start, period_end = parse_period_from_raw_dir(period_dir)
-    return period_metadata_from_dates(period_start, period_end)
 
 
 def _raw_signature(period_dir: Path) -> list[FileSignature]:

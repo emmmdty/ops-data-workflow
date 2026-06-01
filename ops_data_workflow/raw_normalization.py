@@ -7,16 +7,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-import json
 import re
 import shutil
 from tempfile import TemporaryDirectory
 from typing import Iterable, Protocol
 from zipfile import ZipFile
 
-from .periods import ReviewPeriod, infer_review_period_from_text, period_raw_dir_name, review_period_from_dates
+from .periods import ReviewPeriod, infer_review_period_from_text, review_period_from_dates
 from .pipeline import TABULAR_SUFFIXES
 from .source_channels import infer_channel_from_path
+from .source_storage import source_dir_for_period
 
 
 class UploadedFileLike(Protocol):
@@ -53,14 +53,14 @@ class NormalizedUploadChannelConflict:
 
 def normalize_uploaded_periods(
     uploads: Iterable[UploadedFileLike],
-    raw_root: Path,
+    data_root: Path,
     *,
     default_year: int,
     replace_same_channel: bool = False,
 ) -> list[NormalizedPeriodBucket]:
-    """Materialize uploaded files into normalized raw dirs grouped by review period."""
-    raw_root = Path(raw_root)
-    raw_root.mkdir(parents=True, exist_ok=True)
+    """Materialize uploaded files into canonical source dirs grouped by review period."""
+    data_root = Path(data_root)
+    data_root.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory() as tmp:
         staging_dir = Path(tmp) / f"staging_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         staging_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +95,7 @@ def normalize_uploaded_periods(
         buckets: list[NormalizedPeriodBucket] = []
         for key, entries in sorted(tabular_by_key.items(), key=lambda item: (item[1][0][0].period_start, item[0][0], item[0][1])):
             period = _combine_periods([entry[0] for entry in entries])
-            raw_dir = raw_root / period_raw_dir_name(period)
+            raw_dir = source_dir_for_period(data_root, period)
             raw_dir.mkdir(parents=True, exist_ok=True)
             incoming_channels = {infer_channel_from_path(entry[2]) for entry in entries}
             conflicts = _existing_channels(raw_dir, incoming_channels)
@@ -113,27 +113,11 @@ def normalize_uploaded_periods(
                 copied.append(destination)
                 source_paths.append(source_name)
 
-            manifest_path = raw_dir / "period_manifest.json"
-            manifest = {
-                "period_level": period.period_level,
-                "period_key": period.period_key,
-                "period_label": period.period_label,
-                "period_start": period.period_start,
-                "period_end": period.period_end,
-                "data_start": period.data_start,
-                "data_end": period.data_end,
-                "source_type": period.source_type,
-                "file_count": len(copied),
-                "ignored_file_count": int(ignored_by_key.get(key, 0)),
-                "source_paths": source_paths,
-                "files": [path.relative_to(raw_dir).as_posix() for path in copied],
-            }
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
             buckets.append(
                 NormalizedPeriodBucket(
                     review_period=period,
                     raw_dir=raw_dir,
-                    manifest_path=manifest_path,
+                    manifest_path=raw_dir / "period_manifest.json",
                     files=copied,
                     source_paths=source_paths,
                     ignored_file_count=int(ignored_by_key.get(key, 0)),
@@ -178,7 +162,7 @@ def detect_normalized_upload_channel_conflicts(
 ) -> list[NormalizedUploadChannelConflict]:
     conflicts: list[NormalizedUploadChannelConflict] = []
     for bucket in preview_uploaded_period_buckets(uploads, default_year=default_year):
-        raw_dir = Path(raw_root) / period_raw_dir_name(bucket.review_period)
+        raw_dir = source_dir_for_period(Path(raw_root), bucket.review_period)
         incoming_by_channel: dict[str, list[str]] = defaultdict(list)
         for source_path in bucket.source_paths:
             path = Path(source_path)

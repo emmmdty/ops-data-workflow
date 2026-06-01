@@ -9,6 +9,8 @@
 .streamlit/secrets.toml
 archive/
 data/
+.runtime/
+processed/
 output/
 outputs/
 build/

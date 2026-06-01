@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 from dataclasses import dataclass
-import json
 from pathlib import Path
 import sqlite3
 from typing import Iterable, Optional
@@ -13,6 +12,7 @@ from typing import Iterable, Optional
 import pandas as pd
 
 from .storage import init_db, upsert_category_mappings
+from .source_storage import source_period_from_path
 from .title_matching import extract_historical_title, normalized_title_key
 from .workflow import run_archived_workflow
 
@@ -175,9 +175,9 @@ def import_historical_content_mappings(
     workbook_path: Path,
     *,
     db_path: Path,
-    raw_root: Path,
+    data_root: Path,
     output_root: Path,
-    archive_root: Path,
+    processed_root: Path,
     category_rules_path: Optional[Path],
     env_path: Optional[Path],
     target_periods: Iterable[str],
@@ -195,9 +195,9 @@ def import_historical_content_mappings(
         for period_key in targets:
             batch_id = _rebuild_target_period(
                 period_key,
-                raw_root=raw_root,
+                data_root=data_root,
                 output_root=output_root,
-                archive_root=archive_root,
+                processed_root=processed_root,
                 db_path=db_path,
                 category_rules_path=category_rules_path,
                 env_path=env_path,
@@ -209,10 +209,10 @@ def import_historical_content_mappings(
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Import historical organic-post content mappings.")
     parser.add_argument("--workbook", required=True, help="历史投稿 Excel 文件路径。")
-    parser.add_argument("--db", default="data/workflow.sqlite3", help="SQLite database path.")
-    parser.add_argument("--raw-root", default="data/raw", help="Raw period directory root.")
+    parser.add_argument("--db", default=".runtime/workflow.sqlite3", help="SQLite database path.")
+    parser.add_argument("--data-root", default="data", help="Raw source data root.")
     parser.add_argument("--output-root", default="outputs", help="Output root for regenerated batches.")
-    parser.add_argument("--archive-root", default="archive", help="Archive root for regenerated batches.")
+    parser.add_argument("--processed-root", default="processed", help="Processed artifact root for regenerated batches.")
     parser.add_argument("--category-rules", default="config/category_rules.yml", help="Category rules YAML path.")
     parser.add_argument("--env", default=".env", help="Environment file path.")
     parser.add_argument("--target-period", action="append", default=[], help="Period key/raw dir name to preview or rebuild.")
@@ -223,9 +223,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     result = import_historical_content_mappings(
         Path(args.workbook),
         db_path=Path(args.db),
-        raw_root=Path(args.raw_root),
+        data_root=Path(args.data_root),
         output_root=Path(args.output_root),
-        archive_root=Path(args.archive_root),
+        processed_root=Path(args.processed_root),
         category_rules_path=Path(args.category_rules),
         env_path=Path(args.env),
         target_periods=args.target_period,
@@ -399,41 +399,45 @@ def _latest_batch_for_period_key(conn: sqlite3.Connection, period_key: str) -> s
 def _rebuild_target_period(
     period_key: str,
     *,
-    raw_root: Path,
+    data_root: Path,
     output_root: Path,
-    archive_root: Path,
+    processed_root: Path,
     db_path: Path,
     category_rules_path: Optional[Path],
     env_path: Optional[Path],
 ) -> str:
-    raw_dir = Path(raw_root) / period_key
+    raw_dir = _source_dir_for_target(Path(data_root), period_key)
     if not raw_dir.exists():
         raise ValueError(f"未找到目标周期目录：{raw_dir}")
-    manifest = _read_period_manifest(raw_dir)
+    period = source_period_from_path(raw_dir)
     result = run_archived_workflow(
         raw_dir,
-        str(manifest.get("period_start", "")),
-        str(manifest.get("period_end", "")),
+        period.period_start,
+        period.period_end,
         output_root=output_root,
-        archive_root=archive_root,
+        processed_root=processed_root,
         db_path=db_path,
         category_rules_path=category_rules_path,
         env_path=env_path,
-        period_level=str(manifest.get("period_level", "")),
-        period_key=str(manifest.get("period_key", "")),
-        period_label=str(manifest.get("period_label", "")),
-        data_start=str(manifest.get("data_start", "")),
-        data_end=str(manifest.get("data_end", "")),
-        source_type=str(manifest.get("source_type", "")),
+        reference_root=Path(data_root) / "reference",
+        period_level=period.period_level,
+        period_key=period.period_key,
+        period_label=period.period_label,
+        data_start=period.data_start,
+        data_end=period.data_end,
+        source_type=period.source_type,
     )
     return result.batch_id
 
 
-def _read_period_manifest(raw_dir: Path) -> dict[str, object]:
-    manifest_path = raw_dir / "period_manifest.json"
-    if not manifest_path.exists():
-        raise ValueError(f"未找到周期 manifest：{manifest_path}")
-    return json.loads(manifest_path.read_text(encoding="utf-8"))
+def _source_dir_for_target(data_root: Path, period_key: str) -> Path:
+    key = str(period_key or "").strip()
+    compact = key.replace("-", "")
+    if "w" in compact.lower():
+        return data_root / "weeks" / compact.lower()
+    if len(compact) == 6 and compact.isdigit():
+        return data_root / "months" / compact
+    raise ValueError(f"无法从目标周期定位源文件目录：{period_key}")
 
 
 def _format_result_summary(result: HistoricalApplyResult, *, applied: bool, rebuilt: bool) -> str:

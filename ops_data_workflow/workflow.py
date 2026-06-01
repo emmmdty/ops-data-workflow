@@ -17,14 +17,14 @@ from .channel_clean import write_channel_clean_workbooks
 from .comparison import build_channel_comparison
 from .external_context import fetch_external_context
 from .models import WorkflowResult
-from .pipeline import analyze_canonical_frame, analyze_input_dir
+from .pipeline import TABULAR_SUFFIXES, analyze_canonical_frame, analyze_input_dir
 from .periods import SOURCE_TYPE_ROLLUP, SOURCE_TYPE_UPLOAD, ReviewPeriod, period_metadata_from_dates, period_result_id
 from .raw_cleaning import clean_raw_period_dir, cleaned_workbook_in_dir, load_cleaned_canonical
 from .reference_tables import parse_period_from_raw_dir
+from .source_storage import source_storage_key
 from .reporting import write_outputs
 from .storage import (
     ArchivedFile,
-    archive_input_files,
     load_category_mappings,
     load_douyin_id_bridge,
     persist_workflow_result,
@@ -50,6 +50,7 @@ def run_workflow(
         period_end,
         category_rules_path,
         category_matcher=lambda items, category_library, env_path: {},
+        cleaned_output_dir=Path(output_dir),
     )
     report_html, analysis_xlsx, canonical_csv, total_summary_xlsx = write_outputs(
         Path(output_dir),
@@ -121,11 +122,13 @@ def run_archived_workflow(
     period_start: str,
     period_end: str,
     output_root: Path = Path("outputs"),
-    archive_root: Path = Path("archive"),
-    db_path: Path = Path("data/workflow.sqlite3"),
+    processed_root: Path = Path("processed"),
+    archive_root: Path | None = None,
+    db_path: Path = Path(".runtime/workflow.sqlite3"),
     category_rules_path: Optional[Path] = None,
     uploaded_zip_path: Optional[Path] = None,
     env_path: Optional[Path] = None,
+    reference_root: Path | None = None,
     category_matcher=None,
     period_level: str = "",
     period_key: str = "",
@@ -154,18 +157,25 @@ def run_archived_workflow(
     period_start = period.period_start
     period_end = period.period_end
     batch_id = period_result_id(period)
-    archive_dir = Path(archive_root) / f"{period_start}_{batch_id}"
-    progress("正在归档原始文件")
     input_dir = Path(input_dir)
-    if cleaned_workbook_in_dir(input_dir) is None:
-        clean_raw_period_dir(input_dir, period, default_year=date.fromisoformat(period.data_start).year)
-    if _is_archive_raw_dir(input_dir, archive_dir):
-        archived_raw_dir = input_dir
-        archived_files = _archived_file_records(archived_raw_dir)
+    processed_dir = Path(processed_root) / source_storage_key(period) / batch_id
+    progress("正在整理清洗产物")
+    existing_cleaned = cleaned_workbook_in_dir(input_dir)
+    if existing_cleaned is not None:
+        processed_dir = input_dir
+        cleaned_workbook = existing_cleaned
+        archived_files = _source_file_records(input_dir)
     else:
-        _replace_directory(archive_dir)
-        archived_files = archive_input_files(input_dir, archive_dir, uploaded_zip_path)
-        archived_raw_dir = archive_dir / "raw"
+        _replace_directory(processed_dir)
+        cleaned_bucket = clean_raw_period_dir(
+            input_dir,
+            period,
+            default_year=date.fromisoformat(period.data_start).year,
+            output_dir=processed_dir,
+            reference_root=reference_root,
+        )
+        cleaned_workbook = cleaned_bucket.cleaned_workbook
+        archived_files = _source_file_records(input_dir)
 
     previous_batch_id = previous_successful_batch_id_for_period(
         db_path,
@@ -178,7 +188,6 @@ def run_archived_workflow(
     category_mappings = load_category_mappings(db_path)
     douyin_id_bridge = load_douyin_id_bridge(db_path)
     progress("正在读取渠道数据并标准化")
-    cleaned_workbook = cleaned_workbook_in_dir(archived_raw_dir)
     if cleaned_workbook is None:
         raise FileNotFoundError("未找到 cleaned.xlsx，请先完成原始 Excel 清洗。")
     analysis = analyze_canonical_frame(
@@ -258,7 +267,7 @@ def run_archived_workflow(
         batch_id,
         period_start,
         period_end,
-        archive_dir,
+        processed_dir,
         output_dir,
         archived_files,
         analysis.canonical,
@@ -317,7 +326,7 @@ def run_archived_workflow(
         analysis_xlsx=analysis_xlsx,
         canonical_csv=canonical_csv,
         total_summary_xlsx=total_summary_xlsx,
-        archive_dir=archive_dir,
+        archive_dir=processed_dir,
         channel_clean_workbooks=channel_clean_workbooks,
         account_filter_rules=analysis.account_filter_rules,
         account_filter_details=analysis.account_filter_details,
@@ -329,7 +338,8 @@ def run_rollup_workflow(
     component_batch_ids: list[str],
     period: ReviewPeriod,
     output_root: Path = Path("outputs"),
-    archive_root: Path = Path("archive"),
+    processed_root: Path = Path("processed"),
+    archive_root: Path | None = None,
     category_rules_path: Optional[Path] = None,
     env_path: Optional[Path] = None,
     category_matcher=None,
@@ -346,10 +356,9 @@ def run_rollup_workflow(
     canonical = canonical.drop(columns=[column for column in canonical.columns if column.startswith("batch_")], errors="ignore")
 
     batch_id = period_result_id(period)
-    archive_dir = Path(archive_root) / f"{period.period_start}_{batch_id}"
-    _replace_directory(archive_dir)
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    (archive_dir / "rollup_manifest.json").write_text(
+    processed_dir = Path(processed_root) / source_storage_key(period) / batch_id
+    _replace_directory(processed_dir)
+    (processed_dir / "rollup_manifest.json").write_text(
         json.dumps(
             {
                 "period_level": period.period_level,
@@ -444,7 +453,7 @@ def run_rollup_workflow(
         batch_id,
         period.period_start,
         period.period_end,
-        archive_dir,
+        processed_dir,
         output_dir,
         [],
         analysis.canonical,
@@ -502,7 +511,7 @@ def run_rollup_workflow(
         analysis_xlsx=analysis_xlsx,
         canonical_csv=canonical_csv,
         total_summary_xlsx=total_summary_xlsx,
-        archive_dir=archive_dir,
+        archive_dir=processed_dir,
         channel_clean_workbooks=channel_clean_workbooks,
         account_filter_rules=analysis.account_filter_rules,
         account_filter_details=analysis.account_filter_details,
@@ -513,18 +522,11 @@ def _new_batch_id() -> str:
     return f"{date.today().isoformat()}-{uuid4().hex[:8]}"
 
 
-def _is_archive_raw_dir(input_dir: Path, archive_dir: Path) -> bool:
-    try:
-        return Path(input_dir).resolve() == (Path(archive_dir).resolve() / "raw")
-    except FileNotFoundError:
-        return False
-
-
-def _archived_file_records(raw_dir: Path) -> list[ArchivedFile]:
+def _source_file_records(raw_dir: Path) -> list[ArchivedFile]:
     records: list[ArchivedFile] = []
     raw_dir = Path(raw_dir)
     for path in sorted(raw_dir.rglob("*")):
-        if not path.is_file():
+        if not path.is_file() or path.suffix.lower() not in TABULAR_SUFFIXES or _is_generated_artifact(path, raw_dir):
             continue
         records.append(
             ArchivedFile(
@@ -535,6 +537,19 @@ def _archived_file_records(raw_dir: Path) -> list[ArchivedFile]:
             )
         )
     return records
+
+
+def _is_generated_artifact(path: Path, root: Path) -> bool:
+    item = Path(path)
+    try:
+        relative = item.relative_to(root)
+    except ValueError:
+        relative = item
+    if item.name in {"cleaned.xlsx", "period_manifest.json"}:
+        return True
+    if item.stem.lower().endswith("_clean"):
+        return True
+    return "channel_clean" in relative.parts
 
 
 def _sha256(path: Path) -> str:

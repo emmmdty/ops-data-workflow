@@ -8,6 +8,7 @@ import pandas as pd
 
 from ops_data_workflow.periods import PERIOD_LEVEL_MONTH
 from ops_data_workflow.raw_cleaning import (
+    _additive_metric_columns,
     clean_source_directory,
     load_cleaned_canonical,
     reset_runtime_data,
@@ -56,6 +57,19 @@ def _xiaohongshu_row(content_id: str, title: str, spend: float = 10.0) -> dict:
 
 
 class RawCleaningTests(unittest.TestCase):
+    def test_additive_metric_detection_uses_configured_columns_only(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "标题": "一条内容",
+                    "求和项:总花费": 10,
+                    "求和项:未配置指标": 99,
+                }
+            ]
+        )
+
+        self.assertEqual(_additive_metric_columns(frame), ["求和项:总花费"])
+
     def test_clean_source_directory_prefers_matching_sheet_and_records_ignored_wide_sheet(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -498,6 +512,7 @@ class RawCleaningTests(unittest.TestCase):
                     "周期",
                     "渠道",
                     "账号",
+                    "内容形式",
                     "内容类型",
                     "内容分类",
                     "标题",
@@ -516,6 +531,7 @@ class RawCleaningTests(unittest.TestCase):
             display_row = display.iloc[0]
             self.assertEqual(display_row["渠道"], "抖音商业化")
             self.assertEqual(display_row["账号"], "投资号")
+            self.assertEqual(display_row["内容形式"], "视频")
             self.assertEqual(display_row["内容类型"], "股友说")
             self.assertEqual(display_row["内容分类"], "股友说")
             self.assertEqual(display_row["id/BV或者唯一标识"], "人和人的缘分就像炒股")
@@ -807,19 +823,25 @@ class RawCleaningTests(unittest.TestCase):
                 "data/raw/20260508-20260514/old.xlsx",
                 "data/file_backup/old/raw/old.xlsx",
                 "archive/old/raw/old.xlsx",
+                "processed/old/cleaned.xlsx",
                 "outputs/old/report.html",
                 "output/playwright/old.png",
             ]:
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("old", encoding="utf-8")
-            init_db(root / "data" / "workflow.sqlite3")
+            init_db(root / ".runtime" / "workflow.sqlite3")
 
             reset_runtime_data(root)
 
-            self.assertTrue((root / "data" / "workflow.sqlite3").exists())
-            self.assertTrue((root / "data" / "raw").exists())
+            self.assertTrue((root / ".runtime" / "workflow.sqlite3").exists())
+            self.assertTrue((root / "data" / "reference").exists())
+            self.assertTrue((root / "data" / "months").exists())
+            self.assertTrue((root / "data" / "weeks").exists())
+            self.assertTrue((root / "data" / "raw" / "20260508-20260514" / "old.xlsx").exists())
+            self.assertFalse((root / "data" / "file_backup" / "old").exists())
             self.assertFalse((root / "archive" / "old").exists())
+            self.assertFalse((root / "processed" / "old").exists())
             self.assertFalse((root / "outputs" / "old").exists())
             self.assertFalse((root / "output" / "playwright" / "old.png").exists())
 

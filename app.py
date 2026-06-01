@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import html
-import json
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -22,6 +21,7 @@ from ops_data_workflow.dashboard import (
     build_period_comparison_for_batch,
     build_content_recommendations,
     build_dashboard_summary,
+    compare_channel_topics,
     dashboard_detail_items,
     detect_high_metric_anomalies,
     filter_dashboard_items,
@@ -36,9 +36,11 @@ from ops_data_workflow.dashboard import (
     load_review_queue_for_batch,
     list_successful_dashboard_batches,
     metric_sort_ascending,
+    summarize_period_metric_trends,
+    summarize_channel_category_comparison,
     summarize_channel_categories,
+    summarize_channel_top_content_links,
     summarize_topics_for_selection,
-    summarize_content_type_trends,
     summarize_content_types,
     summarize_unique_content,
 )
@@ -47,8 +49,7 @@ from ops_data_workflow.account_filters import load_account_filter_config
 from ops_data_workflow.external_context import fetch_external_context
 from ops_data_workflow.reference_tables import load_reference_tables
 from ops_data_workflow.raw_sync import sync_raw_periods
-from ops_data_workflow.periods import PERIOD_LEVEL_LABELS, PERIOD_LEVELS, PERIOD_LEVEL_WEEK, SOURCE_TYPE_UPLOAD, review_period_from_dates
-from ops_data_workflow.raw_cleaning import clean_raw_period_dir
+from ops_data_workflow.periods import PERIOD_LEVEL_LABELS, PERIOD_LEVELS, PERIOD_LEVEL_MONTH, PERIOD_LEVEL_WEEK, SOURCE_TYPE_UPLOAD, review_period_from_dates
 from ops_data_workflow.raw_normalization import (
     detect_normalized_upload_channel_conflicts,
     normalize_uploaded_periods,
@@ -64,28 +65,28 @@ from ops_data_workflow.review_resolutions import (
 )
 from ops_data_workflow.rollups import rollup_period_for, select_rollup_component_batches
 from ops_data_workflow.storage import (
-    delete_batch_permanently,
-    list_file_backups,
     load_topic_labels_for_batch,
-    move_batch_to_file_backup,
-    restore_file_backup,
+    previous_batch_from_rows,
     upsert_category_mappings,
 )
+from ops_data_workflow.source_storage import source_dir_for_period, week_storage_key
 from ops_data_workflow.topic_analysis import channel_topic_limit, summarize_persisted_topic_labels
 from ops_data_workflow.upload_input import detect_upload_channel_conflicts, infer_period_from_upload_names, materialize_uploaded_files
 from ops_data_workflow.workflow import run_archived_workflow, run_rollup_workflow
 
 
-APP_DB = Path("data/workflow.sqlite3")
-APP_RAW = Path("data/raw")
-APP_FILE_BACKUP = Path("data/file_backup")
-APP_ARCHIVE = Path("archive")
+APP_DATA_ROOT = Path("data")
+APP_PROCESSED = Path("processed")
+APP_DB = Path(".runtime/workflow.sqlite3")
 APP_OUTPUTS = Path("outputs")
 OVERVIEW_CACHE_VERSION = 2
 CATEGORY_RULES = Path("config/category_rules.yml")
 ENV_PATH = Path(".env")
-TREND_QUICK_RANGES = ["全部", "一周", "两周", "一个月"]
-TREND_RANGE_DAYS = {"一周": 7, "两周": 14, "一个月": 30}
+TREND_PERIOD_LEVELS = [PERIOD_LEVEL_WEEK, PERIOD_LEVEL_MONTH]
+TREND_WINDOW_OPTIONS = {
+    PERIOD_LEVEL_WEEK: [("最近 8 周", 8), ("最近 6 周", 6), ("全部", None)],
+    PERIOD_LEVEL_MONTH: [("最近 12 个月", 12), ("最近 6 个月", 6), ("全部", None)],
+}
 CHART_METRICS = {
     "总消耗": ("spend", "总消耗", False),
     "总曝光": ("impressions", "总曝光", False),
@@ -96,8 +97,8 @@ CHART_METRICS = {
 }
 GENERATION_PROGRESS_STEPS = (
     "正在识别上传文件和复盘周期",
-    "正在整理 raw 周期目录",
-    "正在归档原始文件",
+    "正在整理源文件周期目录",
+    "正在整理清洗产物",
     "正在读取渠道数据并标准化",
     "正在校验数据质量与题材分类",
     "正在固化重点题材",
@@ -106,8 +107,8 @@ GENERATION_PROGRESS_STEPS = (
 )
 GENERATION_PROGRESS_VALUES = {
     "正在识别上传文件和复盘周期": 5,
-    "正在整理 raw 周期目录": 15,
-    "正在归档原始文件": 25,
+    "正在整理源文件周期目录": 15,
+    "正在整理清洗产物": 25,
     "正在读取渠道数据并标准化": 45,
     "正在校验数据质量与题材分类": 70,
     "正在固化重点题材": 82,
@@ -121,7 +122,6 @@ GROWTH_METRICS = {
     "激活成本": ("activation_cost_current", "activation_cost_change_rate", 1, "inverse"),
     "付费成本": ("first_pay_cost_current", "first_pay_cost_change_rate", 1, "inverse"),
 }
-BILIBILI_CATEGORY = "B站全部"
 BAR_COLOR_SEQUENCE = [
     "#0A84FF",
     "#30B0C7",
@@ -137,6 +137,7 @@ BAR_COLOR_SEQUENCE = [
 BAR_CONTINUOUS_SCALE = ["#D7ECFF", "#64D2FF", "#0A84FF", "#0B3D91"]
 RATE_METRIC_COLUMNS = {"ctr", "first_pay_rate", "spend_change_rate", "activations_change_rate", "first_pay_count_change_rate", "activation_cost_change_rate", "first_pay_cost_change_rate"}
 SOURCE_TYPE_LABELS = {SOURCE_TYPE_UPLOAD: "上传原始包", "rollup": "系统汇总"}
+PERIOD_COMPARISON_CHART_HEIGHT = 420
 
 
 def _get_logo_base64() -> str:
@@ -515,47 +516,19 @@ def _apply_previewed_generate_period(periods, uploads) -> None:
     st.session_state["generate_period_source"] = signature
 
 
-def _trend_window_from_quick_range(
-    quick_range: str,
-    default_start: date,
-    default_end: date,
-) -> tuple[date, date]:
-    if quick_range not in TREND_RANGE_DAYS:
-        return default_start, default_end
-    days = TREND_RANGE_DAYS[quick_range]
-    return default_end - timedelta(days=days - 1), default_end
-
-
-def _init_trend_filters(default_start: date, default_end: date) -> None:
-    if "trend_quick_range" not in st.session_state:
-        st.session_state["trend_quick_range"] = "全部"
-    if "trend_period_start" not in st.session_state:
-        st.session_state["trend_period_start"] = default_start
-    if "trend_period_end" not in st.session_state:
-        st.session_state["trend_period_end"] = default_end
-
-
-def _on_trend_quick_range_change() -> None:
-    default_start = st.session_state.get("trend_default_start", date.today())
-    default_end = st.session_state.get("trend_default_end", date.today())
-    selected = st.session_state.get("trend_quick_range", "全部")
-    start, end = _trend_window_from_quick_range(selected, default_start, default_end)
-    st.session_state["trend_period_start"] = start
-    st.session_state["trend_period_end"] = end
-
-
 def _run_raw_sync() -> list:
     if st.session_state.get("raw_sync_running"):
         return []
     st.session_state["raw_sync_running"] = True
     try:
         results = sync_raw_periods(
-            APP_RAW,
+            APP_DATA_ROOT,
             db_path=APP_DB,
             output_root=APP_OUTPUTS,
-            archive_root=APP_ARCHIVE,
+            processed_root=APP_PROCESSED,
             category_rules_path=CATEGORY_RULES,
             env_path=ENV_PATH,
+            reference_root=APP_DATA_ROOT / "reference",
         )
     finally:
         st.session_state["raw_sync_running"] = False
@@ -563,9 +536,9 @@ def _run_raw_sync() -> list:
     generated = [item for item in results if item.status == "generated"]
     errors = [item for item in results if item.status == "error"]
     if generated:
-        st.session_state["raw_sync_notice"] = f"已自动刷新 {len(generated)} 个 raw 周期。"
+        st.session_state["raw_sync_notice"] = f"已手动同步 {len(generated)} 个源文件周期。"
     elif errors:
-        st.session_state["raw_sync_notice"] = "raw 自动刷新遇到错误：" + "；".join(
+        st.session_state["raw_sync_notice"] = "源文件手动同步遇到错误：" + "；".join(
             f"{item.period_name}: {item.message}" for item in errors[:3]
         )
     return results
@@ -844,16 +817,12 @@ def _preview_generate_periods(uploaded) -> list:
 
 def _normalize_generate_uploads(uploaded, *, replace_same_channel: bool = False) -> list:
     try:
-        buckets = normalize_uploaded_periods(
+        return normalize_uploaded_periods(
             uploaded,
-            APP_RAW,
+            APP_DATA_ROOT,
             default_year=date.today().year,
             replace_same_channel=replace_same_channel,
         )
-        return [
-            clean_raw_period_dir(bucket.raw_dir, bucket.review_period, default_year=date.today().year)
-            for bucket in buckets
-        ]
     except ValueError:
         return []
 
@@ -875,7 +844,7 @@ def _render_generate_period_preview(buckets: list) -> None:
             for bucket in buckets
         ]
     )
-    st.caption("系统已按路径识别复盘周期；生成时会写入 period_manifest.json，可在生成前核对复盘层级和数据时间。")
+    st.caption("系统已按路径识别复盘周期；生成时会把源文件落到 data/months 或 data/weeks，并在 processed 生成清洗产物。")
     st.dataframe(preview, width="stretch", hide_index=True)
 
 
@@ -884,15 +853,20 @@ def _generate_upload_conflict_labels(uploaded, preview_buckets: list, period_sta
         return []
     try:
         if preview_buckets:
-            conflicts = detect_normalized_upload_channel_conflicts(uploaded, APP_RAW, default_year=date.today().year)
+            conflicts = detect_normalized_upload_channel_conflicts(uploaded, APP_DATA_ROOT, default_year=date.today().year)
             return [
                 f"{conflict.review_period.period_label}：{conflict.channel}"
                 for conflict in conflicts
             ]
-        period_dir = f"{period_start:%Y%m%d}-{period_end:%Y%m%d}"
+        fallback_period = review_period_from_dates(
+            period_start,
+            period_end,
+            st.session_state.get("generate_period_level", PERIOD_LEVEL_WEEK),
+            source_type=SOURCE_TYPE_UPLOAD,
+        )
         conflicts = detect_upload_channel_conflicts(
             uploaded,
-            APP_RAW / period_dir,
+            source_dir_for_period(APP_DATA_ROOT, fallback_period),
             strip_common_period_root=True,
         )
         return [conflict.channel for conflict in conflicts]
@@ -913,29 +887,6 @@ def _period_for_generate_bucket(bucket, bucket_count: int, period_start: date, p
         logic_end=period_end,
         source_type=period.source_type,
     )
-
-
-def _update_bucket_manifest(bucket, period) -> None:
-    try:
-        payload = json.loads(bucket.manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        payload = {}
-    payload.update(
-        {
-            "period_level": period.period_level,
-            "period_key": period.period_key,
-            "period_label": period.period_label,
-            "period_start": period.period_start,
-            "period_end": period.period_end,
-            "data_start": period.data_start,
-            "data_end": period.data_end,
-            "source_type": period.source_type,
-        }
-    )
-    try:
-        bucket.manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
 
 
 def _db_file_signature(db_path: Path) -> tuple[int, int]:
@@ -1027,15 +978,15 @@ def _page_overview() -> None:
         st.info("还没有成功周期。请先到“生成报告”上传数据并生成。")
         return
 
-    if st.button("刷新报告和数据", width="stretch"):
+    if st.button("手动同步源文件", width="stretch"):
         _load_cached_overview_data.clear()
         results = _run_raw_sync()
         if any(item.status == "generated" for item in results):
             st.rerun()
         if any(item.status == "error" for item in results):
-            st.error(st.session_state.get("raw_sync_notice", "raw 自动刷新遇到错误。"))
+            st.error(st.session_state.get("raw_sync_notice", "源文件手动同步遇到错误。"))
         else:
-            st.success("已检查 raw 目录，当前没有需要生成的新内容。")
+            st.success("已检查源文件目录，当前没有需要生成的新内容。")
 
     overview_data = _load_overview_data(APP_DB, selected_batch_id)
     items = overview_data["items"]
@@ -1150,9 +1101,9 @@ def _compact_recommendations(markdown: str, max_items: int = 4) -> str:
 
 def _page_generate() -> None:
     _ensure_generate_period_defaults()
-    _render_section_shell("􀈟", "生成报告", "支持上传整个文件夹或多文件包，自动归档并生成下载结果。")
+    _render_section_shell("􀈟", "生成报告", "支持上传整个文件夹或多文件包，更新本周期源文件并生成下载结果。")
     st.title("生成报告")
-    st.caption("上传 Excel、CSV 或 zip，系统会保存到 raw 周期目录、标准化明细、补齐栏目题材、写入历史库并生成下载文件。")
+    st.caption("上传 Excel、CSV 或 zip，系统会保存到 data/months 或 data/weeks，清洗产物写入 processed，并更新当前周期数据。")
 
     with st.container(border=True):
         st.subheader("生成参数")
@@ -1204,7 +1155,7 @@ def _page_generate() -> None:
             )
         else:
             st.session_state["overwrite_existing_channels"] = False
-        generate = st.button("生成并存档", type="primary", width="stretch")
+        generate = st.button("生成本周期数据", type="primary", width="stretch")
 
     if generate:
         if not uploaded:
@@ -1258,21 +1209,21 @@ def _run_with_generation_progress(
                 uploaded,
                 replace_same_channel=overwrite_existing_channels,
             )
-            progress_callback("正在整理 raw 周期目录")
+            progress_callback("正在整理源文件周期目录")
             if normalized_buckets:
                 result = None
                 for bucket in normalized_buckets:
                     period = _period_for_generate_bucket(bucket, len(normalized_buckets), period_start, period_end)
-                    _update_bucket_manifest(bucket, period)
                     result = run_archived_workflow(
                         bucket.raw_dir,
                         period.period_start,
                         period.period_end,
                         output_root=APP_OUTPUTS,
-                        archive_root=APP_ARCHIVE,
+                        processed_root=APP_PROCESSED,
                         db_path=APP_DB,
                         category_rules_path=CATEGORY_RULES,
                         env_path=ENV_PATH,
+                        reference_root=APP_DATA_ROOT / "reference",
                         period_level=period.period_level,
                         period_key=period.period_key,
                         period_label=period.period_label,
@@ -1283,23 +1234,33 @@ def _run_with_generation_progress(
                     )
                 assert result is not None
             else:
-                period_dir = f"{period_start:%Y%m%d}-{period_end:%Y%m%d}"
+                fallback_period = review_period_from_dates(
+                    period_start,
+                    period_end,
+                    st.session_state.get("generate_period_level", PERIOD_LEVEL_WEEK),
+                    source_type=SOURCE_TYPE_UPLOAD,
+                )
                 materialized = materialize_uploaded_files(
                     uploaded,
-                    APP_RAW / period_dir,
+                    source_dir_for_period(APP_DATA_ROOT, fallback_period),
                     strip_common_period_root=True,
                     replace_same_channel=overwrite_existing_channels,
                 )
                 result = run_archived_workflow(
                     materialized.raw_dir,
-                    period_start.isoformat(),
-                    period_end.isoformat(),
+                    fallback_period.period_start,
+                    fallback_period.period_end,
                     output_root=APP_OUTPUTS,
-                    archive_root=APP_ARCHIVE,
+                    processed_root=APP_PROCESSED,
                     db_path=APP_DB,
                     category_rules_path=CATEGORY_RULES,
                     env_path=ENV_PATH,
-                    period_level=st.session_state.get("generate_period_level", PERIOD_LEVEL_WEEK),
+                    reference_root=APP_DATA_ROOT / "reference",
+                    period_level=fallback_period.period_level,
+                    period_key=fallback_period.period_key,
+                    period_label=fallback_period.period_label,
+                    data_start=fallback_period.data_start,
+                    data_end=fallback_period.data_end,
                     source_type=SOURCE_TYPE_UPLOAD,
                     progress_callback=progress_callback,
                 )
@@ -1345,7 +1306,7 @@ def _render_rollup_generator() -> None:
                     components,
                     period,
                     output_root=APP_OUTPUTS,
-                    archive_root=APP_ARCHIVE,
+                    processed_root=APP_PROCESSED,
                     category_rules_path=CATEGORY_RULES,
                     env_path=ENV_PATH,
                 )
@@ -1395,87 +1356,190 @@ def _page_content_types() -> None:
 
 
 def _page_trends() -> None:
-    _render_section_shell("􀑪", "历史趋势", "用快捷日期窗口和渠道筛选追踪周期变化。")
+    _render_section_shell("􀑪", "历史趋势", "按周/月复盘周期追踪关键指标变化。")
     st.title("历史趋势")
-    st.caption("读取保留周期，按周期展示内容类型变化。")
+    st.caption("切换周/月和展示窗口，查看全部关键指标趋势；不再按内容分类拆线。")
     items = load_all_dashboard_items(APP_DB)
-    if items.empty:
+    batches = list_successful_dashboard_batches(APP_DB)
+    if items.empty or batches.empty:
         st.info("还没有可展示的周期数据。")
         return
 
-    period_start, period_end = _dashboard_period_bounds(items)
-    _init_trend_filters(period_start, period_end)
-    st.session_state["trend_default_start"] = period_start
-    st.session_state["trend_default_end"] = period_end
-    with st.container(border=True):
-        quick_range = st.segmented_control(
-            "统计日期",
-            TREND_QUICK_RANGES,
-            key="trend_quick_range",
-            width="stretch",
-            on_change=_on_trend_quick_range_change,
-        )
-        c1, c2, c3, c4 = st.columns([1, 1, 1, 1.15])
-        selected_start = c1.date_input(
-            "时间线开始",
-            key="trend_period_start",
-        )
-        selected_end = c2.date_input(
-            "时间线结束",
-            key="trend_period_end",
-        )
-        metric = c3.selectbox(
-            "趋势指标",
-            ["spend", "activations", "first_pay_count", "activation_cost", "first_pay_rate", "unique_content_count"],
-            format_func=lambda value: localize_columns(pd.DataFrame(columns=[value])).columns[0],
-        )
-        platforms = c4.multiselect("渠道", _dashboard_options(items, "channel"), key="trend_platforms")
-
-        c5, c6 = st.columns(2)
-        categories = c5.multiselect("最终内容类别", _dashboard_options(items, "content_category"), key="trend_categories")
-        top_n = c6.slider("图中展示 Top 内容类型数", 3, 20, 8, key="trend_top_n")
-    if quick_range == "全部":
-        st.caption("当前按完整历史区间统计。")
-    else:
-        st.caption(f"当前快捷区间：{quick_range}。可继续手动微调开始和结束日期。")
-
-    if selected_start > selected_end:
-        st.error("时间线开始日期不能晚于结束日期。")
+    available_levels = [level for level in TREND_PERIOD_LEVELS if level in set(batches["period_level"].astype(str))]
+    if not available_levels:
+        st.info("当前没有周或月维度的历史周期。")
         return
 
-    trend_items = filter_dashboard_items(
+    level_key = "trend_period_level"
+    if level_key in st.session_state and st.session_state[level_key] not in available_levels:
+        del st.session_state[level_key]
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([0.9, 1.2, 1.8])
+        with c1:
+            selected_level = st.segmented_control(
+                "周期粒度",
+                available_levels,
+                format_func=lambda value: PERIOD_LEVEL_LABELS.get(value, value),
+                key=level_key,
+                width="stretch",
+            )
+        selected_level = selected_level or available_levels[0]
+        window_options = TREND_WINDOW_OPTIONS.get(selected_level, TREND_WINDOW_OPTIONS[PERIOD_LEVEL_WEEK])
+        window_labels = [label for label, _ in window_options]
+        with c2:
+            selected_window_label = st.segmented_control(
+                "展示窗口",
+                window_labels,
+                key=f"trend_window_{selected_level}",
+                width="stretch",
+            )
+        selected_window_label = selected_window_label or window_labels[0]
+        platforms = c3.multiselect("渠道", _dashboard_options(items, "channel"), key="trend_platforms")
+
+    window_size = dict(window_options).get(selected_window_label)
+    trends = summarize_period_metric_trends(
         items,
-        DashboardFilters(
-            channels=tuple(platforms),
-            content_categories=tuple(categories),
-        ),
-    )
-    trends = summarize_content_type_trends(
-        trend_items,
-        selected_start.isoformat(),
-        selected_end.isoformat(),
+        batches,
+        selected_level,
+        window_size=window_size,
+        channels=tuple(platforms),
     )
     if trends.empty:
-        st.info("当前时间线和筛选条件下没有趋势数据。")
+        st.info("当前周期粒度和筛选条件下没有趋势数据。")
         return
 
-    plotted = _top_trend_rows(trends, metric, top_n)
-    fig = px.line(
-        plotted,
-        x="trend_period",
-        y=metric,
-        color="category_display",
-        markers=True,
-        labels={
-            "trend_period": "趋势周期",
-            metric: localize_columns(pd.DataFrame(columns=[metric])).columns[0],
-            "category_display": "内容类型",
-        },
-    )
-    st.plotly_chart(fig)
+    available_count = _trend_available_period_count(batches, selected_level)
+    if window_size and available_count < window_size:
+        st.caption(f"当前只有 {available_count} 个{PERIOD_LEVEL_LABELS.get(selected_level, selected_level)}周期，已展示全部可用周期。")
+    else:
+        st.caption(f"当前展示：{PERIOD_LEVEL_LABELS.get(selected_level, selected_level)} · {selected_window_label}。")
 
-    st.subheader("趋势明细")
-    st.dataframe(localize_and_sort_columns(trends), width="stretch", hide_index=True)
+    _render_period_metric_trend_grid(trends)
+
+    with st.expander("查看周期级明细", expanded=False):
+        st.dataframe(localize_and_sort_columns(trends), width="stretch", hide_index=True)
+
+
+def _render_period_metric_trend_grid(trends: pd.DataFrame) -> None:
+    metric_items = list(CHART_METRICS.items())
+    for start in range(0, len(metric_items), 3):
+        cols = st.columns(3)
+        for offset, (col, (metric_name, (metric, metric_label, is_cost))) in enumerate(
+            zip(cols, metric_items[start : start + 3])
+        ):
+            color = BAR_COLOR_SEQUENCE[(start + offset) % len(BAR_COLOR_SEQUENCE)]
+            with col:
+                with st.container(border=True):
+                    _render_period_metric_chart(trends, metric_name, metric, metric_label, is_cost, color)
+
+
+def _render_period_metric_chart(
+    trends: pd.DataFrame,
+    metric_name: str,
+    metric: str,
+    metric_label: str,
+    is_cost: bool,
+    color: str,
+) -> None:
+    if metric not in trends.columns:
+        return
+    chart = trends.copy()
+    chart[metric] = pd.to_numeric(chart[metric], errors="coerce")
+    value_candidates = chart[metric].dropna()
+    current_value = value_candidates.iloc[-1] if not value_candidates.empty else pd.NA
+    current_text = _format_chart_value(current_value, metric) or "暂无"
+    delta = _period_metric_change_rate(chart[metric])
+    delta_text = _fmt_growth_delta(delta) or "（-）"
+    delta_color = _trend_delta_color(delta, is_cost=is_cost)
+    trend_note = "成本越低越好" if is_cost else "提升为正向"
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:0.75rem;margin-bottom:0.35rem;">
+          <div>
+            <div style="color:#5f6f86;font-size:0.9rem;font-weight:650;">{html.escape(metric_name)}</div>
+            <div style="color:#10233f;font-size:1.7rem;font-weight:760;line-height:1.25;">{html.escape(current_text)}</div>
+          </div>
+          <div style="color:{delta_color};background:rgba(248,250,252,0.9);border-radius:999px;padding:0.25rem 0.55rem;font-size:0.86rem;font-weight:720;white-space:nowrap;">
+            较上期 {html.escape(delta_text)}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if chart[metric].dropna().empty:
+        st.info(f"{metric_name}暂无可绘制数据。")
+        return
+
+    chart["__axis_label"] = chart.apply(_trend_axis_label, axis=1)
+    chart["__value_text"] = chart[metric].map(lambda value: _format_chart_value(value, metric) or "暂无")
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=chart["__axis_label"],
+            y=chart[metric],
+            customdata=chart[["trend_period", "__value_text"]].to_numpy(),
+            mode="lines+markers",
+            line={"color": color, "width": 3},
+            marker={"color": "#ffffff", "line": {"color": color, "width": 2}, "size": 8},
+            hovertemplate=f"周期：%{{customdata[0]}}<br>{metric_label}：%{{customdata[1]}}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=245,
+        margin=dict(l=12, r=12, t=10, b=48),
+        showlegend=False,
+        plot_bgcolor="rgba(255,255,255,0.96)",
+        paper_bgcolor="rgba(255,255,255,0)",
+        font=dict(color="#10233f"),
+    )
+    fig.update_xaxes(title="", tickangle=-22, automargin=True, gridcolor="rgba(255,255,255,0)")
+    fig.update_yaxes(title="", tickformat=_axis_tick_format(metric), gridcolor="rgba(95,115,148,0.14)")
+    st.plotly_chart(fig, config={"displayModeBar": False})
+    st.caption(trend_note)
+
+
+def _period_metric_change_rate(values: pd.Series) -> object:
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if len(numeric) < 2:
+        return pd.NA
+    previous = float(numeric.iloc[-2])
+    current = float(numeric.iloc[-1])
+    if previous == 0:
+        return pd.NA
+    return (current - previous) / previous
+
+
+def _trend_delta_color(value: object, *, is_cost: bool) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric) or float(numeric) == 0.0:
+        return "#667085"
+    if float(numeric) > 0:
+        return "#079455" if is_cost else "#d92d20"
+    return "#d92d20" if is_cost else "#079455"
+
+
+def _trend_axis_label(row: pd.Series) -> str:
+    start = pd.to_datetime(row.get("period_start", ""), errors="coerce")
+    if pd.isna(start):
+        key = str(row.get("period_key", "") or row.get("trend_period", "")).strip()
+        return key.replace("-", "")
+    if str(row.get("period_level", "")) == PERIOD_LEVEL_MONTH:
+        return start.strftime("%Y%m")
+    if str(row.get("period_level", "")) == PERIOD_LEVEL_WEEK:
+        return week_storage_key(start.date())
+    key = str(row.get("period_key", "") or row.get("trend_period", "")).strip()
+    return key.replace("-", "")
+
+
+def _trend_available_period_count(batches: pd.DataFrame, period_level: str) -> int:
+    if batches.empty or "period_level" not in batches.columns:
+        return 0
+    scoped = batches[batches["period_level"].fillna("").astype(str).eq(str(period_level))]
+    if {"period_level", "period_key"}.issubset(scoped.columns):
+        scoped = scoped.drop_duplicates(subset=["period_level", "period_key"])
+    return int(len(scoped))
 
 
 def _page_content_details() -> None:
@@ -1621,7 +1685,7 @@ def _page_data_review() -> None:
                     APP_DB,
                     selected_batch_id,
                     output_root=APP_OUTPUTS,
-                    archive_root=APP_ARCHIVE,
+                    processed_root=APP_PROCESSED,
                     category_rules_path=CATEGORY_RULES,
                     env_path=ENV_PATH,
                 )
@@ -1822,104 +1886,6 @@ def _page_category_review() -> None:
         st.dataframe(localize_columns(queue[preview_columns]), width="stretch", hide_index=True)
 
 
-def _page_file_backup() -> None:
-    _render_section_shell("􀈽", "文件备份", "把周期移到备份区，或从备份区恢复回分析列表。")
-    st.title("文件备份")
-    st.caption("移动后周期会从常规选择器隐藏；只有在这里恢复后，才会重新出现在各分析页。")
-
-    notice = st.session_state.pop("file_backup_notice", "")
-    if notice:
-        st.success(notice)
-
-    active_batches = list_successful_dashboard_batches(APP_DB)
-    if active_batches.empty:
-        st.info("当前没有可操作的成功周期。")
-    else:
-        st.subheader("周期删除与备份")
-        batch_ids = [str(value) for value in active_batches["batch_id"]]
-        label_by_id = {
-            str(row["batch_id"]): (
-                f"{row.get('period_start', '')} 至 {row.get('period_end', '')}"
-                f"｜{format_beijing_datetime(row.get('created_at', ''))}"
-            )
-            for _, row in active_batches.iterrows()
-        }
-        selected_batch_id = st.selectbox(
-            "选择周期",
-            batch_ids,
-            key="file_backup_batch_id",
-            format_func=lambda batch_id: label_by_id.get(batch_id, batch_id),
-            width="stretch",
-        )
-        action = st.radio(
-            "操作类型",
-            ["移动到文件备份", "直接删除"],
-            horizontal=True,
-            key="file_backup_action",
-        )
-        confirmation_text = st.text_input(
-            "输入周期标识确认",
-            key="file_backup_confirmation",
-            placeholder=selected_batch_id,
-        )
-        can_execute = confirmation_text.strip() == selected_batch_id
-        if action == "移动到文件备份":
-            if st.button("移动到文件备份", type="primary", width="stretch", disabled=not can_execute):
-                try:
-                    move_batch_to_file_backup(APP_DB, selected_batch_id, APP_RAW, APP_FILE_BACKUP)
-                    st.session_state["global_batch_id"] = ""
-                    st.session_state["file_backup_notice"] = f"已移动到文件备份：{selected_batch_id}"
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"移动失败：{exc}")
-        else:
-            st.warning("直接删除会清理当前周期记录、输出和归档文件，且不可从备份页恢复。")
-            if st.button("直接删除", width="stretch", disabled=not can_execute):
-                try:
-                    delete_batch_permanently(APP_DB, selected_batch_id, APP_RAW, APP_FILE_BACKUP)
-                    st.session_state["global_batch_id"] = ""
-                    st.session_state["file_backup_notice"] = f"已永久删除：{selected_batch_id}"
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"删除失败：{exc}")
-
-    st.subheader("已备份周期")
-    backups = list_file_backups(APP_DB)
-    if backups.empty:
-        st.info("暂无文件备份。")
-        return
-
-    st.dataframe(localize_and_sort_columns(backups), width="stretch", hide_index=True)
-    backup_ids = [str(value) for value in backups["batch_id"]]
-    backup_label_by_id = {
-        str(row["batch_id"]): (
-            f"{row.get('period_start', '')} 至 {row.get('period_end', '')}"
-            f"｜{format_beijing_datetime(row.get('backed_up_at', ''))}"
-        )
-        for _, row in backups.iterrows()
-    }
-    selected_backup_id = st.selectbox(
-        "选择备份",
-        backup_ids,
-        key="file_backup_restore_id",
-        format_func=lambda batch_id: backup_label_by_id.get(batch_id, batch_id),
-        width="stretch",
-    )
-    selected_backup = backups[backups["batch_id"].astype(str).eq(str(selected_backup_id))].iloc[0]
-    st.caption(f"备份目录：{selected_backup.get('backup_dir', '')}")
-    can_restore = Path(str(selected_backup.get("backup_dir", ""))).exists()
-    if not can_restore:
-        st.warning("备份目录不存在，无法恢复。")
-    if st.button("恢复到周期", width="stretch", disabled=not can_restore):
-        try:
-            restore_file_backup(APP_DB, selected_backup_id, APP_RAW, APP_FILE_BACKUP)
-            st.session_state["global_batch_id"] = selected_backup_id
-            st.session_state["file_backup_notice"] = f"已恢复周期：{selected_backup_id}"
-            st.rerun()
-        except Exception as exc:
-            st.error(f"恢复失败：{exc}")
-
-
 def _render_channel_page(channel_name: str) -> None:
     topic_limit = channel_topic_limit(channel_name)
     topic_scope = f"消耗 Top {topic_limit} 重点题材" if topic_limit else "达人数据暂不做题材分析"
@@ -1940,6 +1906,13 @@ def _render_channel_page(channel_name: str) -> None:
         st.info("当前周期没有可分析的数据。")
         return
 
+    previous_batch_id = _previous_batch_id_for_channel_page(batches, selected_batch_id)
+    previous_items = load_dashboard_items_for_batch(APP_DB, previous_batch_id) if previous_batch_id else pd.DataFrame()
+    channel_comparison = load_channel_comparison_for_batch(APP_DB, selected_batch_id)
+    if channel_comparison.empty:
+        channel_comparison = build_period_comparison_for_batch(APP_DB, selected_batch_id)
+    channel_growth_row = _chart_comparison_by_channel(channel_comparison).get(channel_name)
+
     channel_items = items[items["channel"].eq(channel_name)].copy()
     if channel_items.empty:
         st.info(f"当前周期没有 {channel_name} 数据。")
@@ -1948,22 +1921,19 @@ def _render_channel_page(channel_name: str) -> None:
     st.subheader("渠道核心指标")
     channel_summary = aggregate_dashboard(channel_items, ["channel"])
     if not channel_summary.empty:
-        _render_channel_summary_metrics(channel_summary)
+        _render_channel_summary_metrics(channel_summary, channel_growth_row)
 
     category_summary = summarize_channel_categories(items, channel_name)
     st.subheader("栏目汇总")
     if category_summary.empty:
         st.info("当前渠道没有可展示的栏目数据。")
     else:
-        _render_vertical_bar_chart(
-            category_summary,
+        category_comparison = summarize_channel_category_comparison(items, previous_items, channel_name, top_n=5)
+        _render_period_comparison_bar_chart(
+            category_comparison,
             "category_name",
-            "spend",
             "栏目",
-            "消耗",
             f"{channel_name} 栏目消耗",
-            "activations",
-            "激活数",
         )
         st.dataframe(
             localize_columns(_category_table_display(category_summary)),
@@ -1976,27 +1946,26 @@ def _render_channel_page(channel_name: str) -> None:
         st.info("达人数据暂不做题材分析，后台明细仍会保留。")
     else:
         topic_labels = load_topic_labels_for_batch(APP_DB, selected_batch_id)
+        previous_topic_labels = load_topic_labels_for_batch(APP_DB, previous_batch_id) if previous_batch_id else pd.DataFrame()
         channel_topic_labels = topic_labels[topic_labels["channel"].astype(str).eq(str(channel_name))].copy() if not topic_labels.empty else pd.DataFrame()
         topic_summary = summarize_persisted_topic_labels(topic_labels, channel_name)
         if topic_summary.empty:
             st.warning("当前周期还没有固化的重点题材。请重新生成该周期，系统会在生成报告时完成 AI 题材固化。")
         else:
+            previous_topic_summary = summarize_persisted_topic_labels(previous_topic_labels, channel_name)
+            topic_comparison = compare_channel_topics(topic_summary, previous_topic_summary)
             st.caption(f"展示范围：{channel_name} 消耗 Top {topic_limit} 内容；AI 结果已随周期固化，页面只读取入库题材。")
             topic_insights = build_channel_top_topic_insights(topic_summary)
             if "重点题材分析结论" not in topic_insights:
                 topic_insights = f"#### 重点题材分析结论\n{topic_insights}"
             st.markdown(topic_insights)
-            _render_vertical_bar_chart(
-                topic_summary,
+            _render_period_comparison_bar_chart(
+                topic_comparison,
                 "topic_name",
-                "spend",
                 "题材",
-                "消耗",
                 f"{channel_name} 重点题材消耗",
-                "activations",
-                "激活数",
             )
-            _render_short_table_blocks(_topic_table_display(topic_summary), "重点题材明细")
+            _render_short_table_blocks(_topic_table_display(topic_comparison), "重点题材明细", preserve_order=True)
             with st.expander("查看题材对应素材", expanded=False):
                 st.dataframe(
                     localize_and_sort_columns(_topic_material_detail(channel_topic_labels)),
@@ -2004,23 +1973,41 @@ def _render_channel_page(channel_name: str) -> None:
                     hide_index=True,
                 )
 
+    top_content_links = summarize_channel_top_content_links(items, channel_name)
+    if not top_content_links.empty:
+        st.subheader("消耗 Top 内容链接")
+        st.dataframe(
+            _top_content_links_display(top_content_links),
+            width="stretch",
+            hide_index=True,
+        )
+
     st.subheader("异常数据检测")
     _detect_and_display_anomalies(channel_items, pd.DataFrame(), "activation_cost", 20)
 
 
-def _render_channel_summary_metrics(channel_summary: pd.DataFrame) -> None:
+def _render_channel_summary_metrics(channel_summary: pd.DataFrame, channel_growth_row: dict[str, object] | pd.Series | None = None) -> None:
     """渲染渠道汇总指标"""
     if channel_summary.empty:
         return
     row = channel_summary.iloc[0]
-    _render_metric_grid(
+    metrics = [
+        ("消耗", _fmt_metric_number(row.get("spend", 0), 0), "spend_change_rate", False),
+        ("激活数", _fmt_metric_number(row.get("activations", 0), 0), "activations_change_rate", False),
+        ("激活成本", _fmt_metric_number(row.get("activation_cost", 0), 1), "activation_cost_change_rate", True),
+        ("付费数", _fmt_metric_number(row.get("first_pay_count", 0), 0), "first_pay_count_change_rate", False),
+        ("付费成本", _fmt_metric_number(row.get("first_pay_cost", 0), 1), "first_pay_cost_change_rate", True),
+        ("付费率", _fmt_percent(row.get("first_pay_rate", 0)), "first_pay_rate_change_rate", False),
+    ]
+    _render_metric_grid_with_deltas(
         [
-            ("消耗", _fmt_metric_number(row.get("spend", 0), 0)),
-            ("激活数", _fmt_metric_number(row.get("activations", 0), 0)),
-            ("激活成本", _fmt_metric_number(row.get("activation_cost", 0), 1)),
-            ("付费数", _fmt_metric_number(row.get("first_pay_count", 0), 0)),
-            ("付费成本", _fmt_metric_number(row.get("first_pay_cost", 0), 1)),
-            ("付费率", _fmt_percent(row.get("first_pay_rate", 0))),
+            (
+                label,
+                value,
+                _fmt_growth_delta(_growth_value(channel_growth_row, rate_column)) or "（-）",
+                "normal" if is_cost else "inverse",
+            )
+            for label, value, rate_column, is_cost in metrics
         ],
         columns=3,
     )
@@ -2106,6 +2093,21 @@ def _period_caption_for_batch(batches: pd.DataFrame, batch_id: str) -> str:
     return f"{label}｜生成时间 {created_at}" if created_at else label
 
 
+def _previous_batch_id_for_channel_page(batches: pd.DataFrame, batch_id: str) -> str:
+    if batches.empty or not batch_id:
+        return ""
+    match = batches[batches["batch_id"].astype(str).eq(str(batch_id))]
+    if match.empty:
+        return ""
+    row = match.iloc[0]
+    return previous_batch_from_rows(
+        batches,
+        str(row.get("period_start", "") or ""),
+        str(row.get("period_level", "") or ""),
+        str(row.get("period_key", "") or ""),
+    )
+
+
 def _channel_top_topic_candidates(items: pd.DataFrame, channel_name: str, top_n: int = 20) -> pd.DataFrame:
     if items.empty or "channel" not in items.columns:
         return pd.DataFrame()
@@ -2143,6 +2145,8 @@ def _topic_table_display(topic_summary: pd.DataFrame) -> pd.DataFrame:
         "material_count",
         "spend_share",
         "spend",
+        "spend_previous",
+        "spend_change_rate",
         "impressions",
         "clicks",
         "ctr",
@@ -2154,6 +2158,26 @@ def _topic_table_display(topic_summary: pd.DataFrame) -> pd.DataFrame:
     ]
     display = topic_summary[[column for column in columns if column in topic_summary.columns]].copy()
     return display
+
+
+def _top_content_links_display(top_content_links: pd.DataFrame) -> pd.DataFrame:
+    columns = ["title", "spend", "content_url"]
+    display = top_content_links[[column for column in columns if column in top_content_links.columns]].copy()
+    for column in columns:
+        if column not in display.columns:
+            display[column] = ""
+    display["title"] = display["title"].fillna("").astype(str).str.strip()
+    display.loc[display["title"].eq(""), "title"] = "-"
+    display["content_url"] = display["content_url"].fillna("").astype(str).str.strip()
+    display.loc[display["content_url"].eq(""), "content_url"] = "-"
+    display["spend"] = display["spend"].map(lambda value: _fmt_metric_number(value, 0))
+    return display.rename(
+        columns={
+            "title": "标题",
+            "spend": "消耗",
+            "content_url": "笔记/视频链接",
+        }
+    )
 
 
 def _topic_material_detail(topic_labels: pd.DataFrame) -> pd.DataFrame:
@@ -2177,7 +2201,7 @@ def _topic_material_detail(topic_labels: pd.DataFrame) -> pd.DataFrame:
     return topic_labels[[column for column in columns if column in topic_labels.columns]].copy()
 
 
-def _render_short_table_blocks(frame: pd.DataFrame, label: str, rows_per_block: int = 8) -> None:
+def _render_short_table_blocks(frame: pd.DataFrame, label: str, rows_per_block: int = 8, *, preserve_order: bool = False) -> None:
     if frame.empty:
         return
     total_rows = len(frame)
@@ -2185,7 +2209,7 @@ def _render_short_table_blocks(frame: pd.DataFrame, label: str, rows_per_block: 
         block = frame.iloc[start : start + rows_per_block].copy()
         if total_rows > rows_per_block:
             st.caption(f"{label} {start + 1}-{start + len(block)} / {total_rows}")
-        display = localize_and_sort_columns(block).reset_index(drop=True)
+        display = (localize_columns(block) if preserve_order else localize_and_sort_columns(block)).reset_index(drop=True)
         st.table(display.style.hide(axis="index"))
 
 
@@ -2367,6 +2391,22 @@ def _render_metric_grid(metrics: list[tuple[str, str]], columns: int) -> None:
             col.metric(label, value)
 
 
+def _render_metric_grid_with_deltas(metrics: list[tuple[str, str, str, str]], columns: int) -> None:
+    for start in range(0, len(metrics), columns):
+        batch = metrics[start : start + columns]
+        cols = st.columns(len(batch))
+        for col, (label, value, delta, delta_color) in zip(cols, batch):
+            col.metric(label, value, delta=delta, delta_color=delta_color)
+
+
+def _growth_value(growth_row: dict[str, object] | pd.Series | None, rate_column: str) -> object:
+    if growth_row is None:
+        return pd.NA
+    if isinstance(growth_row, pd.Series):
+        return growth_row.get(rate_column, pd.NA)
+    return growth_row.get(rate_column, pd.NA)
+
+
 def _fmt_metric_number(value: object, digits: int) -> str:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric):
@@ -2500,6 +2540,87 @@ def _axis_tick_format(metric: str) -> str:
     if metric in {"activation_cost", "first_pay_cost"}:
         return ",.1f"
     return ",.0f"
+
+
+def _render_period_comparison_bar_chart(
+    frame: pd.DataFrame,
+    label_column: str,
+    x_label: str,
+    title: str,
+) -> None:
+    if frame.empty or label_column not in frame.columns or "spend" not in frame.columns:
+        return
+    chart = frame.copy()
+    chart[label_column] = chart[label_column].fillna("").astype(str).str.strip()
+    chart = chart[chart[label_column].ne("")]
+    chart["spend"] = pd.to_numeric(chart["spend"], errors="coerce")
+    chart["spend_previous"] = pd.to_numeric(chart.get("spend_previous", pd.NA), errors="coerce")
+    chart["spend_change_rate"] = pd.to_numeric(chart.get("spend_change_rate", pd.NA), errors="coerce")
+    chart = chart.dropna(subset=["spend"])
+    if chart.empty:
+        return
+
+    chart["__axis_label"] = chart[label_column].map(_compact_axis_label)
+    chart["__current_text"] = chart["spend"].map(lambda value: _format_chart_value(value, "spend"))
+    chart["__previous_text"] = chart["spend_previous"].map(lambda value: _format_chart_value(value, "spend") or "-")
+    chart["__growth_text"] = chart["spend_change_rate"].map(lambda value: _fmt_growth_delta(value) or "（-）")
+    chart["__current_bar_text"] = chart["__current_text"] + "<br>环比 " + chart["__growth_text"]
+    chart["__current_index"] = 100.0
+    chart["__previous_index"] = (
+        chart["spend_previous"] / chart["spend"].where(chart["spend"].gt(0)) * 100
+    )
+    chart["__previous_index_plot"] = chart["__previous_index"].fillna(0.0)
+    customdata = chart[[label_column, "__current_text", "__previous_text", "__growth_text"]].to_numpy()
+    y_max = pd.concat([chart["__current_index"], chart["__previous_index_plot"]], ignore_index=True).max(skipna=True)
+    y_range = [0, max(118.0, float(y_max) * 1.18)] if pd.notna(y_max) and float(y_max) > 0 else [0, 118]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=chart["__axis_label"],
+            y=chart["__current_index"],
+            text=chart["__current_bar_text"],
+            customdata=customdata,
+            marker={"color": "#0A84FF", "line": {"width": 0.8, "color": "rgba(255,255,255,0.72)"}},
+            name="本期消耗",
+            offsetgroup="本期",
+            texttemplate="%{text}",
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate=f"{x_label}：%{{customdata[0]}}<br>本期消耗：%{{customdata[1]}}<br>环比：%{{customdata[3]}}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=chart["__axis_label"],
+            y=chart["__previous_index_plot"],
+            text=chart["__previous_text"],
+            customdata=customdata,
+            marker={"color": "#8E9AAF", "line": {"width": 0.8, "color": "rgba(255,255,255,0.72)"}},
+            name="上期消耗",
+            offsetgroup="上期",
+            texttemplate="%{text}",
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate=f"{x_label}：%{{customdata[0]}}<br>上期消耗：%{{customdata[2]}}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=PERIOD_COMPARISON_CHART_HEIGHT,
+        margin=dict(l=20, r=20, t=68, b=92),
+        bargap=0.24,
+        bargroupgap=0.08,
+        showlegend=True,
+        uniformtext=dict(mode="show", minsize=10),
+        plot_bgcolor="rgba(255,255,255,0.96)",
+        paper_bgcolor="rgba(255,255,255,0)",
+        font=dict(color="#10233f"),
+        title=dict(text=title, font=dict(size=18, color="#10233f")),
+        legend=dict(yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_xaxes(title=x_label, tickangle=-25, automargin=True)
+    fig.update_yaxes(title="周期对比指数（本期=100）", tickformat=",.0f", range=y_range, gridcolor="rgba(95,115,148,0.16)")
+    st.plotly_chart(fig, config={"displayModeBar": False})
 
 
 def _render_platform_chart(
@@ -2743,31 +2864,11 @@ def _metric_value(summary: pd.DataFrame, channel: str, column: str) -> float:
     return 0.0 if pd.isna(value) else float(value)
 
 
-def _dashboard_period_bounds(items: pd.DataFrame) -> tuple[date, date]:
-    starts = pd.to_datetime(items["batch_period_start"], errors="coerce").dropna()
-    ends = pd.to_datetime(items["batch_period_end"], errors="coerce").dropna()
-    today = date.today()
-    start = starts.min().date() if not starts.empty else today
-    end = ends.max().date() if not ends.empty else today
-    return start, end
-
-
 def _dashboard_options(items: pd.DataFrame, column: str) -> list[str]:
     if column not in items.columns:
         return []
     values = items[column].fillna("").astype(str).str.strip()
     return sorted(value for value in values.unique() if value)
-
-
-def _top_trend_rows(trends: pd.DataFrame, metric: str, top_n: int) -> pd.DataFrame:
-    metric_totals = (
-        trends.groupby("category_display", as_index=False)[metric]
-        .sum(numeric_only=True)
-        .sort_values(metric, ascending=False)
-        .head(top_n)
-    )
-    keep = set(metric_totals["category_display"])
-    return trends[trends["category_display"].isin(keep)].copy()
 
 
 def _localized_label_map() -> dict[str, str]:
@@ -2824,7 +2925,6 @@ def _build_navigation_pages() -> list:
             st.Page(_page_data_review, title="数据审核"),
             st.Page(_page_reference_tables, title="维护台账"),
             st.Page(_page_category_review, title="分类审核"),
-            st.Page(_page_file_backup, title="文件备份"),
         ]
     )
     return pages

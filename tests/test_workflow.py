@@ -148,9 +148,11 @@ class WorkflowTests(unittest.TestCase):
 
             result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
 
-            self.assertTrue((raw_dir / "cleaned.xlsx").exists())
-            self.assertTrue((raw_dir / "period_manifest.json").exists())
-            import_log = pd.read_excel(raw_dir / "cleaned.xlsx", sheet_name="导入日志")
+            self.assertFalse((raw_dir / "cleaned.xlsx").exists())
+            self.assertFalse((raw_dir / "period_manifest.json").exists())
+            self.assertTrue((output_dir / "cleaned.xlsx").exists())
+            self.assertTrue((output_dir / "period_manifest.json").exists())
+            import_log = pd.read_excel(output_dir / "cleaned.xlsx", sheet_name="导入日志")
             self.assertIn("B站.xlsx", set(import_log["source_file"]))
             clean_dir = output_dir / "channel_clean"
             xhs_clean = clean_dir / "小红书商业化_clean.xlsx"
@@ -168,6 +170,7 @@ class WorkflowTests(unittest.TestCase):
                     "周期",
                     "渠道",
                     "账号",
+                    "内容形式",
                     "内容类型",
                     "内容分类",
                     "标题",
@@ -187,6 +190,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(row["周期"], "2026-04-01 至 2026-04-27")
             self.assertEqual(row["渠道"], "小红书商业化")
             self.assertEqual(row["账号"], "同花顺理财")
+            self.assertEqual(row["内容形式"], "图文")
             self.assertEqual(row["内容分类"], "热点行情")
             self.assertEqual(row["标题"], "存储芯片板块再度爆发")
             self.assertEqual(row["内容类型"], "热点行情")
@@ -342,8 +346,9 @@ class WorkflowTests(unittest.TestCase):
             self.assertAlmostEqual(first["spend"], 589.62)
             self.assertAlmostEqual(first["activations"], 14.0)
             self.assertAlmostEqual(first["first_pay_count"], 3.0)
-            self.assertEqual(first["content_category"], "B站全部")
-            self.assertEqual(first["category_l2"], "B站全部")
+            self.assertEqual(first["content_form"], "视频")
+            self.assertEqual(first["content_category"], "")
+            self.assertEqual(first["category_l2"], "")
             self.assertEqual(first["category_l3"], "")
 
     def test_bilibili_impression_aliases_are_ingested_by_keyword(self):
@@ -1010,10 +1015,11 @@ xiaohongshu:
             self.assertEqual(set(canonical["primary_category"].fillna("").astype(str)), {""})
             self.assertEqual(set(canonical["category_l1"].fillna("").astype(str)), {""})
             bilibili = canonical[canonical["content_id"].eq("bv1")].iloc[0]
-            self.assertEqual(bilibili["content_category"], "B站全部")
-            self.assertEqual(bilibili["category_l2"], "B站全部")
+            self.assertEqual(bilibili["content_form"], "视频")
+            self.assertEqual(bilibili["content_category"], "大佬采访")
+            self.assertEqual(bilibili["category_l2"], "大佬采访")
             self.assertEqual(bilibili["category_l3"], "实盘大赛冠军孙辉--370万到2000万的传奇交易之路")
-            self.assertEqual(bilibili["category_status"], "渠道固定规则")
+            self.assertEqual(bilibili["category_status"], "标题关键词匹配")
             self.assertEqual(
                 canonical.loc[canonical["content_id"].eq("note-1"), "content_category"].iloc[0],
                 "热点行情",
@@ -1545,7 +1551,7 @@ xiaohongshu:
             self.assertIn("视频/笔记id", csv_columns)
             self.assertNotIn("一级内容分类", csv_columns)
             self.assertNotIn("一级类型", csv_columns)
-            self.assertIn("人工内容类别", csv_columns)
+            self.assertIn("内容类型", csv_columns)
             self.assertIn("AI生成内容类别", csv_columns)
             self.assertIn("最终内容类别", csv_columns)
             self.assertIn("内容类别来源", csv_columns)
@@ -1570,7 +1576,7 @@ xiaohongshu:
             self.assertNotIn("一级类型", detail_headers)
             self.assertNotIn("一级内容分类", ranking_headers)
             self.assertNotIn("一级类型", ranking_headers)
-            self.assertIn("人工内容类别", detail_headers)
+            self.assertIn("内容类型", detail_headers)
             self.assertIn("AI生成内容类别", detail_headers)
             self.assertIn("最终内容类别", detail_headers)
             self.assertIn("拉新综合评分", ranking_headers)
@@ -1624,16 +1630,16 @@ xiaohongshu:
             douyin_market = exported[exported["视频/笔记id"].eq("dy-m-1")].iloc[0]
             xhs_missing_secondary = exported[exported["视频/笔记id"].eq("note-2")].iloc[0]
 
-            self.assertEqual(bilibili["人工内容类别"], "")
-            self.assertEqual(bilibili["AI生成内容类别"], "B站全部")
-            self.assertEqual(bilibili["最终内容类别"], "B站全部")
-            self.assertEqual(bilibili["栏目"], "B站全部")
+            self.assertEqual(bilibili["内容类型"], "")
+            self.assertEqual(bilibili["AI生成内容类别"], "大佬采访")
+            self.assertEqual(bilibili["最终内容类别"], "大佬采访")
+            self.assertEqual(bilibili["栏目"], "大佬采访")
             self.assertEqual(bilibili["三级题材"], "实盘大赛冠军孙辉--370万到2000万的传奇交易之路")
-            self.assertEqual(bilibili["内容类别来源"], "渠道固定规则")
+            self.assertEqual(bilibili["内容类别来源"], "标题关键词匹配")
             self.assertNotIn("一级内容分类", exported.columns)
             self.assertNotIn("一级类型", exported.columns)
             self.assertEqual(douyin_market["点击量"], "")
-            self.assertEqual(xhs_missing_secondary["人工内容类别"], "")
+            self.assertEqual(xhs_missing_secondary["内容类型"], "")
             self.assertEqual(xhs_missing_secondary["AI生成内容类别"], "股友说")
             self.assertEqual(xhs_missing_secondary["最终内容类别"], "股友说")
 
@@ -1686,7 +1692,7 @@ xiaohongshu:
             self.assertIn("消耗", headers)
             self.assertIn("消耗占比", headers)
             self.assertIn("激活成本", headers)
-            self.assertIn("首次付费率", headers)
+            self.assertIn("付费率", headers)
             platform_headers = [cell.value for cell in next(workbook["分渠道总数据"].iter_rows(max_row=1))]
             platform_category_headers = [
                 cell.value for cell in next(workbook["分渠道栏目题材排名"].iter_rows(max_row=1))

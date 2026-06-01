@@ -9,6 +9,8 @@ from typing import Mapping
 
 import pandas as pd
 
+from .field_mapping import load_field_mapping
+
 
 REFERENCE_SHEETS = {
     "content_hierarchy": "内容类型分级表",
@@ -30,48 +32,6 @@ DEFAULT_ACCOUNT_MAPPING = pd.DataFrame(
             "映射来源": "默认维护",
             "说明": "B站导出账号为 Up主mid，已确认该 MID 对应同花顺投资。",
         }
-    ]
-)
-
-
-DEFAULT_FIELD_MAPPING = pd.DataFrame(
-    [
-        {
-            "来源文件": "*B站*",
-            "Sheet": "sheet1",
-            "来源字段": "Up主mid",
-            "标准字段": "账号ID",
-            "字段角色": "账号",
-            "优先级": 1,
-            "填充规则": "保留为账号ID，再通过账号映射表补实际账号名。",
-        },
-        {
-            "来源文件": "*B站*",
-            "Sheet": "sheet1",
-            "来源字段": "视频BVID",
-            "标准字段": "视频/笔记id",
-            "字段角色": "标识",
-            "优先级": 1,
-            "填充规则": "缺失时使用视频AVID。",
-        },
-        {
-            "来源文件": "*小红书*",
-            "Sheet": "kos账户投放数据",
-            "来源字段": "发布作者",
-            "标准字段": "实际账号",
-            "字段角色": "账号",
-            "优先级": 1,
-            "填充规则": "小红书账号字段默认为实际账号名。",
-        },
-        {
-            "来源文件": "*抖音*",
-            "Sheet": "Sheet2",
-            "来源字段": "账号/账号名称/发布账号/达人名称",
-            "标准字段": "实际账号",
-            "字段角色": "账号",
-            "优先级": 1,
-            "填充规则": "抖音账号字段默认为实际账号名。",
-        },
     ]
 )
 
@@ -180,7 +140,7 @@ class ReferenceTables:
 
     @property
     def field_mapping(self) -> pd.DataFrame:
-        return to_canonical_reference_columns(self.tables.get("字段映射表", DEFAULT_FIELD_MAPPING).copy())
+        return to_canonical_reference_columns(_field_mapping_table())
 
     @property
     def content_hierarchy(self) -> pd.DataFrame:
@@ -216,6 +176,10 @@ def load_reference_tables(path: Path = Path("config/reference_tables.xlsx")) -> 
                 tables[sheet_name] = _clean_table(pd.read_excel(workbook, sheet_name=sheet_name, dtype=object))
 
     changed = False
+    field_mapping_table = _field_mapping_table()
+    if not tables.get("字段映射表", pd.DataFrame()).equals(field_mapping_table):
+        tables["字段映射表"] = field_mapping_table
+        changed = True
     for sheet_name, frame in _default_tables().items():
         if sheet_name not in tables:
             tables[sheet_name] = frame.copy()
@@ -265,9 +229,13 @@ def _default_tables() -> dict[str, pd.DataFrame]:
         "账号内容类型对照表": DEFAULT_ACCOUNT_CONTENT_TYPE.copy(),
         "账号映射表": DEFAULT_ACCOUNT_MAPPING.copy(),
         "周期报告模板": DEFAULT_PERIOD_REPORT_TEMPLATE.copy(),
-        "字段映射表": DEFAULT_FIELD_MAPPING.copy(),
+        "字段映射表": _field_mapping_table(),
         "处理规则": DEFAULT_PROCESSING_RULES.copy(),
     }
+
+
+def _field_mapping_table() -> pd.DataFrame:
+    return load_field_mapping().to_frame()
 
 
 def _clean_table(frame: pd.DataFrame) -> pd.DataFrame:
