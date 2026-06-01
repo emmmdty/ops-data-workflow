@@ -26,26 +26,49 @@ def _write_config(data: dict, root: Path) -> Path:
 
 
 def _local_data_headers() -> set[str]:
-    base = Path(__file__).resolve().parents[2] / "data"
-    if not base.exists():
-        raise unittest.SkipTest("../data is not available in this checkout")
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        repo_root / "data" / "months",
+        repo_root / "data" / "weeks",
+        repo_root.parent / "data",
+    ]
+    bases = [base for base in candidates if base.exists()]
+    if not bases:
+        raise unittest.SkipTest("local data is not available in this checkout")
     headers: set[str] = set()
-    for path in sorted(base.rglob("*")):
-        if path.suffix.lower() not in {".xlsx", ".xls"}:
-            continue
-        if path.name.startswith(".~") or path.name.startswith("~$"):
-            continue
-        workbook = load_workbook(path, read_only=True, data_only=True)
-        try:
-            for worksheet in workbook.worksheets:
-                for row in worksheet.iter_rows(min_row=1, max_row=5, values_only=True):
-                    values = [str(value).strip() for value in row if value is not None and str(value).strip()]
-                    if values:
-                        headers.update(values)
-                        break
-        finally:
-            workbook.close()
+    for base in bases:
+        for path in sorted(base.rglob("*")):
+            if _skip_local_data_workbook(path, base):
+                continue
+            workbook = load_workbook(path, read_only=True, data_only=True)
+            try:
+                for worksheet in workbook.worksheets:
+                    for row in worksheet.iter_rows(min_row=1, max_row=5, values_only=True):
+                        values = [str(value).strip() for value in row if value is not None and str(value).strip()]
+                        if values:
+                            headers.update(values)
+                            break
+            finally:
+                workbook.close()
+    if not headers:
+        raise unittest.SkipTest("local data workbooks have no detectable headers")
     return headers
+
+
+def _skip_local_data_workbook(path: Path, base: Path) -> bool:
+    if path.suffix.lower() not in {".xlsx", ".xls"}:
+        return True
+    if path.name.startswith(".~") or path.name.startswith("~$"):
+        return True
+    try:
+        relative = path.relative_to(base)
+    except ValueError:
+        relative = path
+    if path.name in {"cleaned.xlsx", "period_manifest.json"}:
+        return True
+    if path.stem.lower().endswith("_clean"):
+        return True
+    return "channel_clean" in relative.parts
 
 
 class FieldMappingTests(unittest.TestCase):
