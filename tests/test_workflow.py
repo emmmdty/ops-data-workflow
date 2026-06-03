@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 
 from ops_data_workflow.channel_clean import write_unified_channel_clean_workbook
 from ops_data_workflow.workflow import refresh_historical_source_periods, run_archived_workflow, run_workflow
-from ops_data_workflow.pipeline import analyze_canonical_frame, analyze_input_dir
+from ops_data_workflow.pipeline import _build_review_queue, analyze_canonical_frame, analyze_input_dir
 from ops_data_workflow.reference_tables import account_mapping_lookup, load_reference_tables, parse_period_from_raw_dir
 
 
@@ -1848,6 +1848,48 @@ xiaohongshu:
             self.assertIn("数据质量报告", workbook.sheetnames)
             self.assertIn("人工审核表", workbook.sheetnames)
             workbook.close()
+
+    def test_review_queue_defaults_to_key_items_without_full_ai_review_backlog(self):
+        rows = []
+        for index in range(25):
+            spend = 5000.0 - index * 100 if index <= 21 else 100.0
+            rows.append(
+                {
+                    "period_start": "2026-05-15",
+                    "period_end": "2026-05-21",
+                    "channel": "抖音商业化",
+                    "title": f"低风险 AI 已分类素材 {index:02d}",
+                    "content_url": f"https://example.com/{index}",
+                    "content_id": f"dy-{index:02d}",
+                    "material_id": f"mat-{index:02d}",
+                    "content_category": "资讯",
+                    "category_l2": "资讯",
+                    "category_l3": "",
+                    "category_source": "DeepSeek匹配",
+                    "category_confidence": 0.75,
+                    "review_status": "待复核",
+                    "needs_manual_review": "False",
+                    "review_reasons": "",
+                    "spend": spend,
+                    "activations": 1,
+                }
+            )
+        rows[23]["content_url"] = ""
+        rows[23]["review_reasons"] = "内容链接补齐失败"
+        rows[24]["review_reasons"] = "内容类型冲突"
+        rows[24]["needs_manual_review"] = True
+
+        queue = _build_review_queue(pd.DataFrame(rows))
+
+        queued_titles = set(queue["title"])
+        self.assertEqual(len(queue), 24)
+        self.assertIn("低风险 AI 已分类素材 00", queued_titles)
+        self.assertIn("低风险 AI 已分类素材 21", queued_titles)
+        self.assertIn("低风险 AI 已分类素材 23", queued_titles)
+        self.assertIn("低风险 AI 已分类素材 24", queued_titles)
+        self.assertNotIn("低风险 AI 已分类素材 22", queued_titles)
+        self.assertIn("content_url", queue.columns)
+        self.assertTrue(queue["needs_manual_review"].astype(bool).all())
 
     def test_workflow_summarizes_channels_without_external_totals(self):
         with TemporaryDirectory() as tmp:

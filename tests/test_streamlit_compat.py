@@ -644,7 +644,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         review_source = app_source[app_source.index("def _page_category_review") : app_source.index("def _render_channel_page")]
 
         self.assertIn("内容审核", app_source)
-        self.assertIn("build_top_content_review_queue", app_source)
+        self.assertIn("load_review_queue_for_batch", app_source)
         self.assertIn("AI 初审", review_source)
         self.assertIn("人工异常队列", review_source)
         self.assertIn("AI 已通过", review_source)
@@ -658,6 +658,17 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertNotIn('("账号"', review_source)
         self.assertNotIn("三级题材", review_source)
         self.assertNotIn('"category_l3"', review_source)
+
+    def test_content_review_page_uses_focused_review_queue_and_regenerates_outputs(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        review_source = app_source[app_source.index("def _page_category_review") : app_source.index("def _render_channel_page")]
+
+        self.assertIn("仅需审核重点内容", review_source)
+        self.assertIn("普通低风险 AI 分类结果不会全量进入审核队列", review_source)
+        self.assertIn("load_review_queue_for_batch(APP_DB, selected_batch_id)", review_source)
+        self.assertIn("output_mode=\"ui_only\"", review_source)
+        self.assertIn("_store_artifacts(result)", review_source)
+        self.assertIn("当前条目已保存并同步到最终数据、图表和手动 AI 复盘输入。", review_source)
 
     def test_app_hides_removed_pages_and_tertiary_topic_ui(self):
         app_source = Path("app.py").read_text(encoding="utf-8")

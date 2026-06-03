@@ -2168,9 +2168,9 @@ def _page_category_review() -> None:
         f"""
         <div style="margin:0 0 .8rem 0;">
             <div style="font-size:.86rem;font-weight:700;color:#5f7394;margin-bottom:.2rem;">内容审核</div>
-            <div style="font-size:2.05rem;line-height:1.1;font-weight:760;color:#10233f;">AI 初审 + 人工确认</div>
+            <div style="font-size:2.05rem;line-height:1.1;font-weight:760;color:#10233f;">仅需审核重点内容</div>
             <div style="margin-top:.35rem;color:#5f7394;">
-                只确认素材的内容类型和链接；置信度达到 {AI_REVIEW_AUTO_PASS_THRESHOLD:.2f} 且链接完整的高价值素材自动通过。
+                队列默认收录每渠道 Top 20、单条消耗 2000 元以上、冲突和关键字段补齐失败内容；普通低风险 AI 分类结果不会全量进入审核队列。
             </div>
         </div>
         """,
@@ -2183,10 +2183,9 @@ def _page_category_review() -> None:
         st.info("当前没有可审核内容。")
         return
 
-    items = load_dashboard_items_for_batch(APP_DB, selected_batch_id)
-    all_review_items = build_top_content_review_queue(items, include_auto_passed=True)
+    all_review_items = load_review_queue_for_batch(APP_DB, selected_batch_id)
     if all_review_items.empty:
-        st.info("当前周期没有可审核的分渠道 Top 素材。")
+        st.info("当前周期没有需要人工审核的重点内容。")
         return
 
     channel_options = ["全部渠道"] + sorted(value for value in all_review_items["channel"].fillna("").astype(str).unique() if value)
@@ -2229,6 +2228,11 @@ def _page_category_review() -> None:
             all_review_items[column] = ""
 
     all_review_items = all_review_items.reset_index(drop=True).copy()
+    all_review_items["needs_review"] = True
+    all_review_items["ai_review_status"] = "需人工审核"
+    all_review_items["audit_flags"] = all_review_items["review_reasons"].fillna("").astype(str)
+    all_review_items["ai_review_reason"] = all_review_items["review_reasons"].fillna("").astype(str)
+    all_review_items["rank_in_channel"] = pd.to_numeric(all_review_items["rank_in_channel"], errors="coerce")
     total_count = len(all_review_items)
     manual_count = int(all_review_items["needs_review"].astype(bool).sum())
     auto_count = int(total_count - manual_count)
@@ -2273,7 +2277,7 @@ def _page_category_review() -> None:
     queue_col, content_col, action_col = st.columns([0.95, 1.5, 1.05])
     with queue_col:
         st.subheader("人工异常队列")
-        st.caption("仅展示分渠道 Top 素材中的低置信、缺链接或冲突项。")
+        st.caption("仅展示高消耗、分渠道 Top、冲突或关键字段补齐失败内容。")
         for row_index, row in queue.head(10).iterrows():
             active = row_index == index
             marker = "▶ " if active else ""
@@ -2300,7 +2304,7 @@ def _page_category_review() -> None:
             if content_url:
                 st.write(content_url)
             else:
-                st.error("缺失，需要补齐")
+                st.error("缺链接，需要补齐")
         with focus2:
             st.markdown("**AI 内容类型建议**")
             st.write(current_l2 or "未匹配")
@@ -2405,10 +2409,10 @@ def _page_category_review() -> None:
                         enable_external_context=False,
                     )
                     _store_artifacts(result)
-                st.success("当前条目已保存并同步到后续数据。")
+                st.success("当前条目已保存并同步到最终数据、图表和手动 AI 复盘输入。")
                 st.rerun()
 
-    with st.expander("AI 已通过 / 全部 Top 素材预览"):
+    with st.expander("AI 已通过 / 重点审核队列预览"):
         preview_columns = [
             "ai_review_status",
             "ai_review_reason",

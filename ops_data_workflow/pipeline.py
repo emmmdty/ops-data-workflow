@@ -95,6 +95,24 @@ STANDARD_COLUMNS = [
 
 INTERNAL_COMPAT_COLUMNS = {"platform", "platform_group"}
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
+REVIEW_QUEUE_TOP_N = 20
+REVIEW_QUEUE_HIGH_SPEND_THRESHOLD = 2000.0
+REVIEW_QUEUE_CRITICAL_FIELDS = [
+    ("content_url", "内容链接"),
+    ("content_id", "内容ID"),
+    ("title", "标题"),
+    ("content_category", "内容类型"),
+]
+REVIEW_QUEUE_HIGH_RISK_PATTERNS = [
+    "同ID标题冲突",
+    "标题冲突",
+    "同标题多链接",
+    "投稿台账多候选",
+    "内容类型冲突",
+    "类型/台账冲突",
+    "内容ID冲突",
+    "高风险",
+]
 
 
 @dataclass(frozen=True)
@@ -1723,19 +1741,40 @@ def _build_data_quality_report(canonical: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
-    queue = canonical[
-        canonical["review_status"].isin(["待审核", "待复核"])
-        | canonical["content_category"].map(_is_blank)
-        | canonical["needs_manual_review"].astype(bool)
-    ].copy()
+    prepared = canonical.copy()
+    for column in [
+        "period_start",
+        "period_end",
+        "channel",
+        "spend",
+        "activations",
+        "needs_manual_review",
+        "review_reasons",
+        "conflict_details",
+        "match_risk_level",
+        "match_risk_reason",
+        *[field for field, _ in REVIEW_QUEUE_CRITICAL_FIELDS],
+    ]:
+        if column not in prepared.columns:
+            prepared[column] = False if column == "needs_manual_review" else ""
+
+    spend = pd.to_numeric(prepared["spend"], errors="coerce").fillna(0.0)
+    prepared["__review_rank_in_channel"] = _review_queue_rank_in_channel(prepared, spend)
+    top_content = prepared["__review_rank_in_channel"].le(REVIEW_QUEUE_TOP_N)
+    high_spend = spend.ge(REVIEW_QUEUE_HIGH_SPEND_THRESHOLD)
+    high_risk = _review_queue_high_risk_mask(prepared)
+    missing_critical = _review_queue_missing_critical_mask(prepared)
+    queue = prepared[top_content | high_spend | high_risk | missing_critical].copy()
     if queue.empty:
         return pd.DataFrame(
             columns=[
                 "review_status",
+                "rank_in_channel",
                 "needs_manual_review",
                 "review_reasons",
                 "channel",
                 "title",
+                "content_url",
                 "account_id",
                 "account_raw",
                 "account",
@@ -1745,6 +1784,9 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
                 "dedupe_key",
                 "merged_row_count",
                 "conflict_details",
+                "manual_category",
+                "ai_category",
+                "content_category",
                 "category_l2",
                 "category_l3",
                 "category_source",
@@ -1767,12 +1809,17 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
                 "review_action",
             ]
         )
+    queue["rank_in_channel"] = queue["__review_rank_in_channel"].astype("Int64")
+    queue["review_reasons"] = queue.apply(_review_queue_reasons, axis=1)
+    queue["needs_manual_review"] = True
     columns = [
         "review_status",
+        "rank_in_channel",
         "needs_manual_review",
         "review_reasons",
         "channel",
         "title",
+        "content_url",
         "account_id",
         "account_raw",
         "account",
@@ -1782,6 +1829,9 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
         "dedupe_key",
         "merged_row_count",
         "conflict_details",
+        "manual_category",
+        "ai_category",
+        "content_category",
         "category_l2",
         "category_l3",
         "category_source",
@@ -1806,7 +1856,75 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
     for column in columns:
         if column not in queue.columns:
             queue[column] = ""
-    return queue.sort_values(["spend", "activations"], ascending=[False, False])[columns].reset_index(drop=True)
+    return queue.sort_values(["spend", "rank_in_channel", "activations"], ascending=[False, True, False])[columns].reset_index(drop=True)
+
+
+def _review_queue_rank_in_channel(canonical: pd.DataFrame, spend: pd.Series) -> pd.Series:
+    frame = canonical[["period_start", "period_end", "channel"]].copy()
+    frame["__spend"] = spend
+    return (
+        frame.groupby(["period_start", "period_end", "channel"], dropna=False)["__spend"]
+        .rank(method="first", ascending=False)
+        .astype("Int64")
+    )
+
+
+def _review_queue_high_risk_mask(canonical: pd.DataFrame) -> pd.Series:
+    text = pd.Series("", index=canonical.index, dtype=object)
+    for column in ["review_reasons", "conflict_details", "match_risk_level", "match_risk_reason"]:
+        if column in canonical.columns:
+            text = text.str.cat(canonical[column].fillna("").astype(str), sep="；")
+    matched = pd.Series(False, index=canonical.index)
+    for pattern in REVIEW_QUEUE_HIGH_RISK_PATTERNS:
+        matched = matched | text.str.contains(pattern, na=False)
+    manual_flag = canonical.get("needs_manual_review", pd.Series(False, index=canonical.index)).map(_review_queue_truthy)
+    return matched | manual_flag
+
+
+def _review_queue_missing_critical_mask(canonical: pd.DataFrame) -> pd.Series:
+    mask = pd.Series(False, index=canonical.index)
+    for column, _ in REVIEW_QUEUE_CRITICAL_FIELDS:
+        if column in canonical.columns:
+            mask = mask | canonical[column].map(_is_blank)
+    return mask
+
+
+def _review_queue_reasons(row: pd.Series) -> str:
+    reasons = _split_reasons(row.get("review_reasons", ""))
+    rank = parse_number(row.get("rank_in_channel"))
+    if not pd.isna(rank) and rank <= REVIEW_QUEUE_TOP_N:
+        reasons.append("分渠道消耗Top20")
+    spend = parse_number(row.get("spend"))
+    if not pd.isna(spend) and spend >= REVIEW_QUEUE_HIGH_SPEND_THRESHOLD:
+        reasons.append("单条消耗>=2000元")
+    for column, label in REVIEW_QUEUE_CRITICAL_FIELDS:
+        if _is_blank(row.get(column)):
+            reasons.append(f"{label}补齐失败")
+    if _review_row_has_high_risk_conflict(row):
+        reasons.append("高风险冲突")
+
+    unique_reasons = []
+    for reason in reasons:
+        text = str(reason or "").strip()
+        if text and text not in unique_reasons:
+            unique_reasons.append(text)
+    return "；".join(unique_reasons)
+
+
+def _review_row_has_high_risk_conflict(row: pd.Series) -> bool:
+    text = "；".join(
+        str(row.get(column, "") or "")
+        for column in ["review_reasons", "conflict_details", "match_risk_level", "match_risk_reason"]
+    )
+    if _review_queue_truthy(row.get("needs_manual_review", False)):
+        return True
+    return any(pattern in text for pattern in REVIEW_QUEUE_HIGH_RISK_PATTERNS)
+
+
+def _review_queue_truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "是", "需复核", "待审核"}
+    return bool(value)
 
 
 def _build_account_audit(
