@@ -2806,7 +2806,7 @@ def _display_generation_results() -> None:
         st.dataframe(localize_columns(st.session_state["account_audit"]), width="stretch", hide_index=True)
     with st.expander("字段完整性报告"):
         st.dataframe(localize_columns(st.session_state["data_quality"]), width="stretch", hide_index=True)
-    with st.expander("分类审核队列"):
+    with st.expander("重点审核队列"):
         st.dataframe(localize_columns(st.session_state["review_queue"]), width="stretch", hide_index=True)
     with st.expander("分渠道总数据"):
         st.dataframe(localize_columns(st.session_state["platform_summary"]), width="stretch", hide_index=True)
