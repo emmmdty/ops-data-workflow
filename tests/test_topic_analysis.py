@@ -12,6 +12,7 @@ from ops_data_workflow.topic_analysis import (
     build_topic_label_frame,
     channel_topic_limit,
     select_topic_candidates,
+    summarize_persisted_content_types,
     summarize_persisted_topic_labels,
 )
 
@@ -220,6 +221,27 @@ class TopicAnalysisTests(unittest.TestCase):
         self.assertEqual(summary.iloc[0]["material_count"], 2)
         self.assertAlmostEqual(summary.iloc[0]["spend"], 99.9)
         self.assertAlmostEqual(summary.iloc[0]["spend_share"], 99.9 / 149.9)
+
+    def test_summarize_persisted_content_types_groups_types_and_metrics(self):
+        labels = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "content_type": "股友说", "spend": 79.0, "impressions": 790.0, "clicks": 79.0, "activations": 7.0, "first_pay_count": 1.0},
+                {"channel": "抖音商业化", "content_type": "股友说", "spend": 20.9, "impressions": 210.0, "clicks": 21.0, "activations": 3.0, "first_pay_count": 2.0},
+                {"channel": "抖音商业化", "content_type": "", "spend": 50.0, "impressions": 500.0, "clicks": 25.0, "activations": 5.0, "first_pay_count": 0.0},
+                {"channel": "B站", "content_type": "长视频", "spend": 999.0, "impressions": 9990.0, "clicks": 999.0, "activations": 9.0, "first_pay_count": 1.0},
+            ]
+        )
+
+        summary = summarize_persisted_content_types(labels, "抖音商业化")
+
+        self.assertEqual(list(summary["content_type"]), ["股友说", "未匹配"])
+        self.assertAlmostEqual(summary.iloc[0]["spend"], 99.9)
+        self.assertAlmostEqual(summary.iloc[0]["spend_share"], 99.9 / 149.9)
+        self.assertAlmostEqual(summary.iloc[0]["ctr"], 100.0 / 1000.0)
+        self.assertAlmostEqual(summary.iloc[0]["activation_cost"], 99.9 / 10.0)
+        self.assertAlmostEqual(summary.iloc[0]["first_pay_cost"], 99.9 / 3.0)
+        self.assertAlmostEqual(summary.iloc[0]["first_pay_rate"], 3.0 / 10.0)
+        self.assertNotIn("长视频", set(summary["content_type"]))
 
 
 if __name__ == "__main__":

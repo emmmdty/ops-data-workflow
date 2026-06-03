@@ -5,6 +5,8 @@ from pathlib import Path
 
 from ops_data_workflow.storage import purge_history_state
 from ops_data_workflow.reference_tables import parse_period_from_raw_dir
+from ops_data_workflow.raw_sync import sync_raw_periods
+from ops_data_workflow.source_import import build_source_import_plan, execute_source_import_plan
 from ops_data_workflow.source_storage import migrate_legacy_raw_to_source_layout, source_period_from_path
 from ops_data_workflow.workflow import run_archived_workflow, run_workflow
 
@@ -39,6 +41,11 @@ def main() -> None:
         action="store_true",
         help="One-time copy of legacy data/raw source files into data/months or data/weeks.",
     )
+    parser.add_argument("--import-source", help="Import an external data directory into data/months, data/weeks, and data/reference.")
+    parser.add_argument("--default-year", type=int, default=2026, help="Default year for date ranges without a year.")
+    parser.add_argument("--replace-all", action="store_true", help="Clear current source/runtime data before --import-source.")
+    parser.add_argument("--dry-run", action="store_true", help="Only print the --import-source plan without copying or generating.")
+    parser.add_argument("--ui-only", action="store_true", help="Generate only page data and required cleaned workbooks, without download artifacts or DeepSeek calls.")
     args = parser.parse_args()
 
     if args.purge_history:
@@ -49,6 +56,36 @@ def main() -> None:
     if args.migrate_legacy_raw:
         results = migrate_legacy_raw_to_source_layout(Path(args.data_root))
         print(f"Migrated {len(results)} legacy raw directories.")
+        return
+
+    if args.import_source:
+        try:
+            plan = build_source_import_plan(Path(args.import_source), Path(args.data_root), default_year=args.default_year)
+        except PermissionError as exc:
+            parser.exit(2, f"{exc}\n")
+        frame = plan.to_frame()
+        if frame.empty:
+            print("No importable files found.")
+        else:
+            print(frame.to_string(index=False))
+        if args.dry_run:
+            return
+        result = execute_source_import_plan(plan, project_root=Path("."), replace_all=args.replace_all)
+        print(f"Copied {result.copied_count} files; skipped {result.skipped_count} files.")
+        sync_results = sync_raw_periods(
+            Path(args.data_root),
+            db_path=Path(args.db),
+            output_root=Path(args.output),
+            processed_root=Path(args.processed_root),
+            category_rules_path=Path(args.category_rules),
+            env_path=Path(args.env),
+            reference_root=Path(args.data_root) / "reference",
+            output_mode="ui_only" if args.ui_only else "full",
+            enable_deepseek=not args.ui_only,
+            enable_external_context=not args.ui_only,
+        )
+        for item in sync_results:
+            print(f"{item.period_name}: {item.status} {item.batch_id} {item.message}")
         return
 
     missing = [flag for flag, value in [("--input", args.input)] if not value]
@@ -86,13 +123,20 @@ def main() -> None:
             category_rules_path=Path(args.category_rules),
             env_path=Path(args.env),
             reference_root=Path(args.data_root) / "reference",
+            output_mode="ui_only" if args.ui_only else "full",
+            enable_deepseek=not args.ui_only,
+            enable_external_context=not args.ui_only,
         )
         print(f"Period stored as {result.batch_id}")
         print(f"Processed artifacts written to {result.archive_dir}")
-    print(f"Report written to {result.report_html}")
-    print(f"Workbook written to {result.analysis_xlsx}")
-    print(f"Canonical CSV written to {result.canonical_csv}")
-    print(f"Total summary written to {result.total_summary_xlsx}")
+    if result.report_html is not None:
+        print(f"Report written to {result.report_html}")
+    if result.analysis_xlsx is not None:
+        print(f"Workbook written to {result.analysis_xlsx}")
+    if result.canonical_csv is not None:
+        print(f"Canonical CSV written to {result.canonical_csv}")
+    if result.total_summary_xlsx is not None:
+        print(f"Total summary written to {result.total_summary_xlsx}")
 
 
 if __name__ == "__main__":

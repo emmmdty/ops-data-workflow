@@ -50,7 +50,7 @@ COLUMN_LABELS = {
     "source_time": "时间",
     "duration": "时长",
     "category_l2": "栏目",
-    "category_l3": "三级题材",
+    "category_l3": "题材",
     "category_source": "分类来源",
     "category_l2_source": "栏目来源",
     "category_confidence": "分类置信度",
@@ -664,7 +664,6 @@ IMPORTANT_COLUMNS_ORDER = [
     "first_pay_rate",    # 付费率
     # 分类字段
     "category_l2",       # 栏目
-    "category_l3",       # 三级题材
     "category_source",   # 分类来源
     "category_l2_source",  # 栏目来源
     "content_category",  # 最终内容类别

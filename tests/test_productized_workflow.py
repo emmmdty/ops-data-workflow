@@ -460,6 +460,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
     def test_tag_mapping_uses_exact_user_defined_hashtags(self):
         self.assertEqual(CATEGORY_TAG_MAP["#同花顺资讯"], "资讯")
         self.assertEqual(CATEGORY_TAG_MAP["#同顺图解"], "图文")
+        self.assertEqual(CATEGORY_TAG_MAP["#问财问句"], "问财问句")
         self.assertEqual(CATEGORY_TAG_MAP["#同花顺股民话题"], "社区话题")
 
         self.assertEqual(category_from_tags("今天的内容 #同顺图解 #财经"), "图文")
@@ -641,9 +642,9 @@ class ProductizedWorkflowTests(unittest.TestCase):
 
             self.assertIn("正在整理清洗产物", messages)
             self.assertIn("正在读取渠道数据并标准化", messages)
-            self.assertIn("正在校验数据质量与题材分类", messages)
-            self.assertIn("正在写入周期库并生成当前下载文件", messages)
-            self.assertEqual(messages[-1], "报告生成完成")
+            self.assertIn("正在校验字段完整性与内容类型", messages)
+            self.assertIn("正在写入周期库", messages)
+            self.assertEqual(messages[-1], "页面数据生成完成")
 
     def test_archived_workflow_adds_new_columns_to_existing_sqlite_tables(self):
         with TemporaryDirectory() as tmp:

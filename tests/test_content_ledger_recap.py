@@ -227,7 +227,7 @@ class ContentLedgerTests(unittest.TestCase):
             self.assertEqual(row["ledger_match_source"], "唯一标题")
             self.assertEqual(row["match_risk_reason"], "")
 
-    def test_douyin_duplicate_tagless_title_requires_review_without_autofill(self):
+    def test_douyin_duplicate_tagless_title_selects_by_period_date(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_xlsx(
@@ -237,12 +237,14 @@ class ContentLedgerTests(unittest.TestCase):
                         [
                             {
                                 "编号": 1,
+                                "投稿时间": "05 14",
                                 "内容链接": "同一个标题 # 投资 https://v.douyin.com/abc/",
                                 "账号": "投资号",
                                 "内容类型": "股友说",
                             },
                             {
                                 "编号": 2,
+                                "投稿时间": "05 20",
                                 "内容链接": "同一个标题 # 理财 https://v.douyin.com/def/",
                                 "账号": "理财",
                                 "内容类型": "图文",
@@ -257,9 +259,11 @@ class ContentLedgerTests(unittest.TestCase):
                     {
                         "platform": "抖音",
                         "channel": "抖音商业化",
+                        "period_end": "2026-05-21",
                         "title": "同一个标题 #未知tag",
                         "account": "",
                         "manual_category": "",
+                        "content_url": "",
                     }
                 ]
             )
@@ -267,11 +271,58 @@ class ContentLedgerTests(unittest.TestCase):
             enriched = apply_content_ledger(canonical, ledger)
 
             row = enriched.iloc[0]
-            self.assertEqual(row["account"], "")
-            self.assertEqual(row["manual_category"], "")
+            self.assertEqual(row["account"], "理财")
+            self.assertEqual(row["manual_category"], "图文")
+            self.assertEqual(row["content_url"], "https://v.douyin.com/def/")
             self.assertEqual(row["ledger_match_source"], "唯一标题")
-            self.assertEqual(row["match_risk_level"], "需复核")
-            self.assertIn("投稿台账存在 2 条同标题记录", row["match_risk_reason"])
+            self.assertIn("同标题多链接按日期选择", row["match_risk_reason"])
+
+    def test_douyin_same_link_duplicate_keeps_earliest_content_type(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_xlsx(
+                root / "原生内容投稿.xlsx",
+                {
+                    "抖音渠道": pd.DataFrame(
+                        [
+                            {
+                                "编号": 1,
+                                "投稿时间": "05 23",
+                                "内容链接": "同一链接标题 https://v.douyin.com/same/",
+                                "账号": "投资号",
+                                "内容类型": "晚类型",
+                            },
+                            {
+                                "编号": 2,
+                                "投稿时间": "05 20",
+                                "内容链接": "同一链接标题 https://v.douyin.com/same/",
+                                "账号": "投资号",
+                                "内容类型": "早类型",
+                            },
+                        ]
+                    )
+                },
+            )
+            ledger = load_content_ledger(root, default_year=2026)
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "title": "同一链接标题",
+                        "account": "",
+                        "manual_category": "",
+                        "content_url": "",
+                    }
+                ]
+            )
+
+            enriched = apply_content_ledger(canonical, ledger)
+
+            row = enriched.iloc[0]
+            self.assertEqual(row["manual_category"], "早类型")
+            self.assertEqual(row["content_url"], "https://v.douyin.com/same/")
+            self.assertEqual(row["ledger_match_source"], "唯一标题")
 
     def test_douyin_share_prefix_cleaning_allows_unique_title_autofill(self):
         with TemporaryDirectory() as tmp:
@@ -313,6 +364,46 @@ class ContentLedgerTests(unittest.TestCase):
             self.assertEqual(row["manual_category"], "资讯")
             self.assertEqual(row["ledger_match_source"], "唯一标题")
             self.assertEqual(row["match_risk_reason"], "")
+
+    def test_douyin_share_prefix_with_date_and_time_noise_autofills_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_xlsx(
+                root / "原生内容投稿.xlsx",
+                {
+                    "抖音渠道": pd.DataFrame(
+                        [
+                            {
+                                "编号": 1,
+                                "投稿时间": "05 14",
+                                "内容链接": "6.97 10/04 J@V.yT :9pm sre:/ 当你是家族里第一个打开K线图的人 https://v.douyin.com/abc/",
+                                "账号": "投资号",
+                                "内容类型": "股友说",
+                            }
+                        ]
+                    )
+                },
+            )
+            ledger = load_content_ledger(root, default_year=2026)
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "title": "当你是家族里第一个 打开K线图的人 #财经 #投资",
+                        "account": "",
+                        "manual_category": "",
+                        "content_url": "",
+                    }
+                ]
+            )
+
+            enriched = apply_content_ledger(canonical, ledger)
+
+            row = enriched.iloc[0]
+            self.assertEqual(row["manual_category"], "股友说")
+            self.assertEqual(row["content_url"], "https://v.douyin.com/abc/")
+            self.assertEqual(row["ledger_match_source"], "唯一标题")
 
     def test_douyin_fuzzy_title_autofills_and_marks_review(self):
         with TemporaryDirectory() as tmp:
@@ -492,7 +583,7 @@ class ContentLedgerTests(unittest.TestCase):
             self.assertEqual(row["manual_category"], "股友说")
             self.assertEqual(row["content_url"], "https://v.douyin.com/early/")
             self.assertEqual(row["ledger_match_source"], "唯一标题")
-            self.assertEqual(row["match_risk_reason"], "")
+            self.assertIn("同标题多链接按日期选择", row["match_risk_reason"])
 
     def test_xiaohongshu_duplicate_id_prefers_earliest_published_date(self):
         with TemporaryDirectory() as tmp:

@@ -8,16 +8,15 @@ class StreamlitCompatibilityTests(unittest.TestCase):
 
         self.assertNotIn("use_container_width", app_source)
 
-    def test_app_uses_navigation_pages_and_markdown_recommendations(self):
+    def test_app_uses_navigation_pages_without_standalone_recommendations(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
 
         self.assertIn("st.navigation", app_source)
         self.assertIn("st.Page", app_source)
         self.assertIn("title=\"总览\"", app_source)
         self.assertNotIn("总览与推荐", app_source)
-        self.assertIn("内容类型统计", app_source)
         self.assertIn("历史趋势", app_source)
-        self.assertIn("st.markdown(recommendations", app_source)
+        self.assertNotIn("st.markdown(recommendations", app_source)
 
     def test_app_supports_directory_upload_and_segmented_controls(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -65,8 +64,8 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("正在整理源文件周期目录", app_source)
         self.assertIn("正在整理清洗产物", app_source)
         self.assertIn("正在读取渠道数据并标准化", app_source)
-        self.assertIn("正在校验数据质量与题材分类", app_source)
-        self.assertIn("正在写入周期库并生成当前下载文件", app_source)
+        self.assertIn("正在校验字段完整性与内容类型", app_source)
+        self.assertIn("正在写入周期库", app_source)
 
     def test_app_no_longer_hardcodes_legacy_generate_period_defaults(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -89,7 +88,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
 
     def test_generate_page_no_longer_exposes_history_reports(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
-        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _page_content_types")]
+        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _page_trends")]
 
         self.assertNotIn("_render_historical_reports()", generate_source)
         self.assertNotIn("历史报告", app_source)
@@ -219,18 +218,23 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("secondary_y=True", platform_chart_source)
         self.assertIn("yaxis2", platform_chart_source)
 
-    def test_overview_platform_chart_normalizes_bars_for_growth_analysis(self):
+    def test_overview_platform_chart_uses_actual_metric_bars_without_relative_index(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         platform_chart_source = app_source[
             app_source.index("def _build_platform_chart_figure") : app_source.index("def _content_filter_panel")
         ]
 
-        self.assertIn("__bar_scale", platform_chart_source)
-        self.assertIn("__current_index", platform_chart_source)
-        self.assertIn("__previous_index", platform_chart_source)
-        self.assertIn("渠道内相对指数", platform_chart_source)
+        self.assertNotIn("__bar_scale", platform_chart_source)
+        self.assertNotIn("__current_index", platform_chart_source)
+        self.assertNotIn("__previous_index", platform_chart_source)
+        self.assertNotIn("渠道内相对指数", platform_chart_source)
+        self.assertIn("分渠道{y_label}对比", platform_chart_source)
+        self.assertIn("本期实际{y_label}", platform_chart_source)
+        self.assertIn("上期实际{y_label}", platform_chart_source)
+        self.assertIn("yaxis.title.text", platform_chart_source)
+        self.assertIn("str(meta[\"y_label\"])", platform_chart_source)
         self.assertIn("sort_values(", platform_chart_source)
-        self.assertIn('["__growth_sort", y_metric]', platform_chart_source)
+        self.assertIn("[y_metric]", platform_chart_source)
         self.assertIn("本期实际", platform_chart_source)
         self.assertIn("上期实际", platform_chart_source)
 
@@ -268,13 +272,19 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertNotIn("number_input", channel_source)
         self.assertIn("_selected_or_latest_batch_id()", channel_source)
         self.assertNotIn("_get_common_period_selector", channel_source)
-        self.assertIn("重点题材分析", channel_source)
-        self.assertIn("重点题材分析结论", channel_source)
+        self.assertIn("重点内容类型贡献", channel_source)
+        self.assertIn("重点内容类型贡献结论", channel_source)
         self.assertIn("st.markdown(topic_insights", channel_source)
-        self.assertIn("页面只读取入库题材", channel_source)
+        self.assertIn("页面只读取入库结果", channel_source)
+        self.assertNotIn("重点题材消耗", channel_source)
+        self.assertNotIn('st.subheader("重点题材分析")', channel_source)
+        self.assertNotIn('"页面只读取入库题材"', channel_source)
         self.assertNotIn("group_topic_labels", channel_source)
         self.assertIn('st.subheader("栏目汇总")', channel_source)
+        self.assertNotIn('f"{channel_name} 栏目消耗"', channel_source)
         self.assertNotIn('st.subheader("二级栏目汇总")', channel_source)
+        self.assertNotIn("异常数据检测", channel_source)
+        self.assertNotIn("_detect_and_display_anomalies", app_source)
 
     def test_channel_category_summary_is_single_table_with_category_first(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -296,7 +306,6 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("previous_items", channel_source)
         self.assertIn("channel_comparison", channel_source)
         self.assertIn("_render_channel_summary_metrics(channel_summary, channel_growth_row)", channel_source)
-        self.assertIn("summarize_channel_category_comparison", channel_source)
         self.assertIn("_render_period_comparison_bar_chart(", channel_source)
         self.assertIn("PERIOD_COMPARISON_CHART_HEIGHT", app_source)
         self.assertIn('__current_index"] = 100.0', app_source)
@@ -306,6 +315,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("uniformtext", app_source)
         self.assertNotIn('"activations",\n            "激活数"', channel_source)
         self.assertIn("compare_channel_topics", channel_source)
+        self.assertIn('"content_type"', channel_source)
 
     def test_channel_pages_show_top_content_links_only_for_supported_channels(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -313,9 +323,10 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         channel_source = app_source[app_source.index("def _render_channel_page") : app_source.index("def _render_channel_summary_metrics")]
 
         self.assertIn("summarize_channel_top_content_links", app_source)
-        self.assertIn('st.subheader("消耗 Top 内容链接")', channel_source)
-        self.assertIn("_top_content_links_display(top_content_links)", channel_source)
+        self.assertIn('st.subheader("消耗 Top5 素材案例")', channel_source)
+        self.assertIn("_render_material_case_cards(top_content_links, channel_name)", channel_source)
         self.assertIn("笔记/视频链接", app_source)
+        self.assertIn("封面/素材链接", app_source)
         self.assertIn("抖音", dashboard_source)
         self.assertIn("小红书", dashboard_source)
         self.assertIn("B站", dashboard_source)
@@ -325,39 +336,217 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         topic_display_source = app_source[
             app_source.index("def _topic_table_display") : app_source.index("def _topic_material_detail")
         ]
+        detail_source = app_source[
+            app_source.index("def _topic_material_detail") : app_source.index("def _render_short_table_blocks")
+        ]
+        short_table_source = app_source[
+            app_source.index("def _render_short_table_blocks") : app_source.index("def _display_generation_results")
+        ]
 
-        self.assertLess(topic_display_source.index('"topic_name"'), topic_display_source.index('"spend"'))
-        self.assertLess(topic_display_source.index('"content_types"'), topic_display_source.index('"spend"'))
+        self.assertLess(topic_display_source.index('"content_type"'), topic_display_source.index('"spend_share"'))
+        for column in [
+            '"topic_name"',
+            '"content_types"',
+            '"item_count"',
+            '"material_count"',
+            '"spend_previous"',
+            '"clicks"',
+            '"ctr"',
+            '"material_id"',
+        ]:
+            self.assertNotIn(column, topic_display_source)
         self.assertNotIn('"rank_position"', topic_display_source)
+        self.assertNotIn('"material_id"', detail_source)
+        self.assertIn("hide_index=True", short_table_source)
         self.assertIn("preserve_order=True", app_source)
 
-    def test_data_review_prioritizes_conflict_summary_before_editor(self):
+    def test_conflict_priority_review_helper_remains_available_for_review_flows(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
-        review_source = app_source[app_source.index("def _page_data_review") : app_source.index("def _page_reference_tables")]
+        review_helper_source = app_source[
+            app_source.index("def _render_conflict_priority_review") : app_source.index("def _page_reference_tables")
+        ]
 
-        self.assertIn("_render_conflict_priority_review(review_items)", review_source)
-        self.assertIn('st.subheader("冲突优先审核")', app_source)
-        self.assertIn('"影响消耗"', app_source)
-        self.assertLess(review_source.index("_render_conflict_priority_review(review_items)"), review_source.index("st.data_editor("))
+        self.assertIn('st.subheader("冲突优先审核")', review_helper_source)
+        self.assertIn('"影响消耗"', review_helper_source)
+        self.assertIn("def _review_issue_priority", review_helper_source)
 
     def test_navigation_uses_dynamic_channel_page_factory(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         navigation_source = app_source[app_source.index("def _build_navigation_pages") : app_source.rindex("_inject_theme()")]
 
-        self.assertIn("st.Page(_page_overview, title=\"总览\", default=True)", navigation_source)
-        self.assertIn("st.Page(_page_generate, title=\"生成报告\")", navigation_source)
-        self.assertIn("_make_channel_page(channel)", navigation_source)
-        self.assertIn("title=channel", navigation_source)
+        self.assertIn("def _overview_page()", app_source)
+        self.assertIn("st.Page(_page_overview, title=\"总览\", default=True)", app_source)
+        self.assertIn("def _generate_page()", app_source)
+        self.assertIn("st.Page(_page_generate, title=\"生成页面数据\")", app_source)
+        self.assertIn("_make_channel_page(channel)", app_source)
+        self.assertIn("title=channel", app_source)
+        self.assertIn("_channel_pages_for_current_period()", navigation_source)
         self.assertIn("page = st.navigation(_build_navigation_pages()", app_source)
 
-    def test_short_table_blocks_use_static_tables_for_screenshots(self):
+    def test_overview_channel_links_use_current_page_navigation(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        links_source = app_source[app_source.index("def _render_channel_links") : app_source.index("def _top_content_cases_for_report")]
+
+        self.assertIn("st.page_link", links_source)
+        self.assertIn("_channel_pages_for_current_period()", links_source)
+        self.assertNotIn("<a href=", links_source)
+        self.assertNotIn("_channel_page_href(channel, batch_id)", links_source)
+
+    def test_short_table_blocks_hide_dataframe_index(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         table_source = app_source[
             app_source.index("def _render_short_table_blocks") : app_source.index("def _display_generation_results")
         ]
 
-        self.assertIn("st.table", table_source)
-        self.assertNotIn("st.dataframe", table_source)
+        self.assertIn("st.dataframe", table_source)
+        self.assertIn("hide_index=True", table_source)
+        self.assertNotIn("st.table", table_source)
+
+    def test_generate_page_uses_ui_only_mode_without_download_exports(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        run_source = app_source[app_source.index("def _run_with_generation_progress") : app_source.index("def _render_rollup_generator")]
+        display_source = app_source[app_source.index("def _display_generation_results") : app_source.index("def _render_kpis")]
+        overview_source = app_source[app_source.index("def _page_overview") : app_source.index("def _render_overview_summary_table")]
+
+        self.assertIn('output_mode="ui_only"', run_source)
+        self.assertIn("enable_deepseek=True", run_source)
+        self.assertIn("enable_external_context=False", run_source)
+        self.assertIn("AI 初审", app_source)
+        self.assertIn("数据清洗并入库完成", display_source)
+        self.assertIn("AI 复盘报告请到“总览”页手动生成", display_source)
+        self.assertNotIn('st.markdown(st.session_state["ai_summary"])', display_source)
+        self.assertIn("手动生成/更新 AI 复盘", overview_source)
+        self.assertIn("load_manual_recap_report", app_source)
+        self.assertIn("persist_manual_recap_report", app_source)
+        self.assertNotIn("下载 HTML 报告", display_source)
+        self.assertNotIn("下载 Excel 明细", display_source)
+        self.assertNotIn("下载标准 CSV", display_source)
+        self.assertNotIn("下载总结果表", display_source)
+
+    def test_manual_ai_recap_generation_has_stepwise_progress(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        recap_source = app_source[app_source.index("def _render_manual_recap_controls") : app_source.index("def _render_manual_recap_overview")]
+        progress_source = app_source[
+            app_source.index("MANUAL_RECAP_PROGRESS_STEPS") : app_source.index("def _render_manual_recap_overview")
+        ]
+
+        self.assertIn("MANUAL_RECAP_PROGRESS_STEPS", app_source)
+        self.assertIn("MANUAL_RECAP_PROGRESS_VALUES", app_source)
+        self.assertIn("_run_manual_recap_generation_with_progress(", recap_source)
+        self.assertIn("st.status", progress_source)
+        self.assertIn("st.progress", progress_source)
+        self.assertIn("正在整理复盘证据", progress_source)
+        self.assertIn("正在请求 AI 生成结构化复盘", progress_source)
+        self.assertIn("正在保存 AI 复盘报告", progress_source)
+        self.assertIn("AI 复盘报告生成完成", progress_source)
+
+    def test_overview_keeps_data_evidence_before_single_manual_recap(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        overview_source = app_source[app_source.index("def _page_overview") : app_source.index("def _render_manual_recap_controls")]
+        recap_source = app_source[app_source.index("def _render_manual_recap_controls") : app_source.index("def _render_channel_links")]
+
+        self.assertIn('st.subheader("本周期数据总览")', overview_source)
+        self.assertIn("_render_overview_summary_table(summary, platform_summary, channel_comparison)", overview_source)
+        self.assertIn('st.subheader("分渠道图")', overview_source)
+        self.assertIn("_render_platform_chart(platform_summary, channel_comparison)", overview_source)
+        self.assertIn("_render_manual_recap_controls(", overview_source)
+        self.assertLess(overview_source.index('st.subheader("本周期数据总览")'), overview_source.index("_render_manual_recap_controls("))
+        self.assertLess(overview_source.index('st.subheader("分渠道图")'), overview_source.index("_render_manual_recap_controls("))
+        self.assertNotIn('st.subheader("内容题材建议摘要")', overview_source)
+        self.assertNotIn("st.markdown(recommendations)", overview_source)
+        self.assertIn("下周期总体方向", recap_source)
+        self.assertIn("_render_manual_recap_overview(saved.get(\"report\", {}))", recap_source)
+        self.assertIn("_render_manual_recap_sections(overview.get(\"sections\", []))", recap_source)
+        self.assertIn("整体结论", recap_source)
+        self.assertIn("_manual_recap_should_render_direction(overview.get(\"sections\", []))", recap_source)
+
+    def test_manual_recap_uses_structured_section_renderer_with_legacy_fallback(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        overview_source = app_source[app_source.index("def _render_manual_recap_overview") : app_source.index("def _render_channel_links")]
+        channel_source = app_source[app_source.index("def _render_manual_recap_channel") : app_source.index("def _render_material_case_cards")]
+        helper_source = app_source[
+            app_source.index("def _render_manual_recap_sections") : app_source.index("def _manual_recap_paragraph_html")
+        ]
+        direction_helper_source = app_source[
+            app_source.index("def _manual_recap_should_render_direction") : app_source.index("def _render_channel_links")
+        ]
+
+        self.assertIn("_render_manual_recap_sections(overview.get(\"sections\", []))", overview_source)
+        self.assertIn("_manual_recap_paragraph_html(\"整体结论\"", overview_source)
+        self.assertIn("_render_manual_recap_sections(match.get(\"sections\", []))", channel_source)
+        self.assertIn("_manual_recap_paragraph_html(\"表现判断 / 有效素材 / 原因判断\"", channel_source)
+        self.assertIn("_manual_recap_should_render_direction(match.get(\"sections\", []))", channel_source)
+        self.assertIn("manual-recap-sections", helper_source)
+        self.assertIn("manual-recap-section", helper_source)
+        self.assertIn("<ul>", helper_source)
+        self.assertIn("<li>", helper_source)
+        self.assertIn("html.escape", helper_source)
+        self.assertIn("下周期动作", direction_helper_source)
+        self.assertIn("下一周期执行动作", direction_helper_source)
+        self.assertIn("return False", direction_helper_source)
+
+    def test_channel_pages_render_clickable_top5_material_cards(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        channel_source = app_source[app_source.index("def _render_channel_page") : app_source.index("def _render_channel_summary_metrics")]
+        cards_source = app_source[app_source.index("def _render_material_case_cards") : app_source.index("def _topic_material_detail")]
+
+        self.assertIn("返回总览", channel_source)
+        self.assertIn("消耗 Top5 素材案例", channel_source)
+        self.assertIn("_render_material_case_cards(top_content_links, channel_name)", channel_source)
+        self.assertIn("_render_channel_links(platform_summary)", app_source)
+        self.assertIn("st.query_params.get(\"batch_id\"", app_source)
+        self.assertIn("quote(str(batch_id), safe='')", app_source)
+        self.assertNotIn('href="#channel-', app_source)
+        self.assertIn('target="_blank"', cards_source)
+        self.assertIn("cover-toggle", app_source)
+        self.assertIn("cover-preview-backdrop", app_source)
+        self.assertIn("cover-preview-dialog", app_source)
+
+    def test_manual_recap_receives_topic_context_as_evidence_input(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        overview_source = app_source[app_source.index("def _page_overview") : app_source.index("def _render_manual_recap_controls")]
+        recap_source = app_source[app_source.index("def _render_manual_recap_controls") : app_source.index("def _render_manual_recap_overview")]
+
+        self.assertIn("_channel_topic_context_for_report(selected_batch_id, platform_summary)", overview_source)
+        self.assertIn("recommendations", recap_source)
+        self.assertIn("channel_topic_context", recap_source)
+        self.assertIn("overview_recommendations=recommendations", recap_source)
+        self.assertIn("channel_topic_context=channel_topic_context", recap_source)
+        self.assertIn("period_level=", recap_source)
+
+    def test_channel_topic_context_is_evidence_not_overview_copy(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        context_source = app_source[
+            app_source.index("def _channel_topic_context_for_report") : app_source.index("def _top_content_cases_for_report")
+        ]
+
+        self.assertIn("topic_insights", context_source)
+        self.assertIn("top_topics", context_source)
+        self.assertNotIn("overview_topic_line", context_source)
+        self.assertNotIn("重点题材联动", context_source)
+
+    def test_channel_pages_show_ai_analysis_before_evidence_sections(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        channel_source = app_source[app_source.index("def _render_channel_page") : app_source.index("def _render_channel_summary_metrics")]
+        recap_channel_source = app_source[app_source.index("def _render_manual_recap_channel") : app_source.index("def _render_material_case_cards")]
+
+        self.assertLess(channel_source.index("_render_manual_recap_channel"), channel_source.index('st.subheader("渠道核心指标")'))
+        self.assertIn("AI 渠道复盘建议", recap_channel_source)
+        self.assertNotIn("渠道深度分析", recap_channel_source)
+        self.assertIn("表现判断 / 有效素材 / 原因判断", recap_channel_source)
+        self.assertNotIn("素材表现 / 题材表现 / 内容类型表现 / 归因分析", recap_channel_source)
+        self.assertIn("_render_manual_recap_sections(match.get(\"sections\", []))", recap_channel_source)
+        self.assertIn("下一周期执行方向", recap_channel_source)
+
+    def test_channel_ai_recap_filters_legacy_topic_sections_before_rendering(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        helper_source = app_source[
+            app_source.index("def _render_manual_recap_sections") : app_source.index("def _manual_recap_paragraph_html")
+        ]
+
+        self.assertIn("_manual_recap_visible_section", helper_source)
+        self.assertIn("题材/内容类型", helper_source)
+        self.assertIn("return False", helper_source)
 
     def test_app_imports_batch_scoped_auxiliary_loaders(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
@@ -365,7 +554,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
             app_source.index("from ops_data_workflow.dashboard import (") : app_source.index("from ops_data_workflow.reporting")
         ]
 
-        self.assertIn("load_data_quality_for_batch", dashboard_imports)
+        self.assertNotIn("load_data_quality_for_batch", dashboard_imports)
         self.assertIn("load_review_queue_for_batch", dashboard_imports)
         self.assertIn("build_period_comparison_for_batch", dashboard_imports)
         self.assertIn("build_overview_table_rows", dashboard_imports)
@@ -395,7 +584,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
     def test_session_state_widgets_do_not_pass_duplicate_defaults(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _page_trends")]
-        trend_source = app_source[app_source.index("def _page_trends") : app_source.index("def _page_content_details")]
+        trend_source = app_source[app_source.index("def _page_trends") : app_source.index("def _render_conflict_priority_review")]
 
         self.assertNotIn('value=st.session_state["generate_period_start"]', generate_source)
         self.assertNotIn('value=st.session_state["generate_period_end"]', generate_source)
@@ -405,7 +594,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
 
     def test_historical_trends_render_period_metric_grid_instead_of_content_type_trends(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
-        trend_source = app_source[app_source.index("def _page_trends") : app_source.index("def _page_content_details")]
+        trend_source = app_source[app_source.index("def _page_trends") : app_source.index("def _render_conflict_priority_review")]
 
         self.assertIn("summarize_period_metric_trends", app_source)
         self.assertNotIn("summarize_content_type_trends", app_source)
@@ -421,38 +610,65 @@ class StreamlitCompatibilityTests(unittest.TestCase):
 
     def test_historical_trends_use_selected_period_level_and_compact_axis_codes(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
-        trend_source = app_source[app_source.index("def _page_trends") : app_source.index("def _page_content_details")]
+        trend_source = app_source[app_source.index("def _page_trends") : app_source.index("def _render_conflict_priority_review")]
         axis_source = app_source[
             app_source.index("def _trend_axis_label") : app_source.index("def _trend_available_period_count")
         ]
 
         self.assertIn("summarize_period_metric_trends(", trend_source)
         self.assertIn("selected_level,", trend_source)
-        self.assertIn("week_storage_key", app_source)
+        self.assertNotIn("week_storage_key", app_source)
         self.assertIn('strftime("%Y%m")', axis_source)
         self.assertNotIn('strftime("%Y-%m")', axis_source)
-        self.assertNotIn("%m/%d", axis_source)
+        self.assertIn('strftime("%Y%m%d")', axis_source)
 
     def test_app_renders_single_item_category_review_flow(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
+        review_source = app_source[app_source.index("def _page_category_review") : app_source.index("def _render_channel_page")]
 
-        self.assertIn("当前待审核", app_source)
-        self.assertIn("审核原因", app_source)
-        self.assertIn("上一条", app_source)
-        self.assertIn("下一条", app_source)
-        self.assertIn("确认并保存当前审核", app_source)
+        self.assertIn("内容审核", app_source)
+        self.assertIn("build_top_content_review_queue", app_source)
+        self.assertIn("AI 初审", review_source)
+        self.assertIn("人工异常队列", review_source)
+        self.assertIn("AI 已通过", review_source)
+        self.assertIn("缺链接", app_source)
+        self.assertIn("内容链接", app_source)
+        self.assertIn("打开校验", review_source)
+        self.assertIn("快捷内容类型", review_source)
+        self.assertIn("保存并下一条", review_source)
+        self.assertIn("apply_review_resolutions_and_regenerate", app_source)
         self.assertIn("category_confidence", app_source)
+        self.assertNotIn('("账号"', review_source)
+        self.assertNotIn("三级题材", review_source)
+        self.assertNotIn('"category_l3"', review_source)
 
-    def test_app_exposes_data_review_page_with_realtime_cleaned_excel_sync(self):
+    def test_app_hides_removed_pages_and_tertiary_topic_ui(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        reporting_source = Path("ops_data_workflow/reporting.py").read_text(encoding="utf-8")
+        navigation_source = app_source[app_source.index("def _build_navigation_pages") : app_source.rindex("_inject_theme()")]
+
+        self.assertNotIn("内容类型统计", navigation_source)
+        self.assertNotIn("数据审核", navigation_source)
+        self.assertNotIn("内容明细", navigation_source)
+        self.assertNotIn("数据质量", navigation_source)
+        self.assertNotIn("_page_content_types", navigation_source)
+        self.assertNotIn("_page_data_review", navigation_source)
+        self.assertNotIn("_page_content_details", navigation_source)
+        self.assertNotIn("_page_data_quality", navigation_source)
+        self.assertNotIn("def _page_content_types", app_source)
+        self.assertNotIn("def _page_data_review", app_source)
+        self.assertNotIn("三级题材", app_source)
+        self.assertNotIn("三级题材", reporting_source)
+
+    def test_app_keeps_data_review_backend_sync_available_without_page(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         navigation_source = app_source[app_source.index("def _build_navigation_pages") : app_source.rindex("_inject_theme()")]
 
         self.assertIn("review_resolutions", app_source)
-        self.assertIn("数据审核", app_source)
-        self.assertIn("st.data_editor", app_source)
-        self.assertIn("保存审核并同步 Excel", app_source)
         self.assertIn("apply_review_resolutions_and_regenerate", app_source)
-        self.assertIn('st.Page(_page_data_review, title="数据审核")', navigation_source)
+        self.assertIn("save_review_resolutions", app_source)
+        self.assertNotIn("数据审核", navigation_source)
+        self.assertNotIn('st.Page(_page_data_review, title="数据审核")', navigation_source)
 
 
 if __name__ == "__main__":

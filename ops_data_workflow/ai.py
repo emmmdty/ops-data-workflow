@@ -17,6 +17,8 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OVERVIEW_RECAP_SECTION_TITLES = ("核心判断", "数据证据", "原因判断", "下周期动作")
+CHANNEL_RECAP_SECTION_TITLES = ("表现判断", "有效素材", "原因判断", "下一周期执行动作")
 
 
 @dataclass(frozen=True)
@@ -95,11 +97,96 @@ def generate_ai_summary(
         return f"DeepSeek 结论生成失败：{type(exc).__name__}: {exc}"
 
 
+def generate_local_summary(
+    total_summary: pd.DataFrame,
+    platform_summary: Optional[pd.DataFrame] = None,
+    channel_comparison: Optional[pd.DataFrame] = None,
+    external_context: Optional[object] = None,
+) -> str:
+    """Build the deterministic page summary without calling DeepSeek."""
+    return _build_local_summary(
+        total_summary,
+        platform_summary,
+        channel_comparison if channel_comparison is not None else pd.DataFrame(),
+        external_context,
+    )
+
+
+def generate_manual_recap_report(
+    total_summary: pd.DataFrame,
+    platform_summary: pd.DataFrame,
+    channel_comparison: pd.DataFrame,
+    top_content_cases: pd.DataFrame,
+    overview_recommendations: str = "",
+    channel_topic_context: Optional[pd.DataFrame] = None,
+    period_level: str = "week",
+    env_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Generate the manually refreshed period recap as structured JSON."""
+    settings = resolve_deepseek_settings(env_path)
+    if not settings.configured:
+        raise RuntimeError(settings.public_status)
+
+    payload = {
+        "total_summary": _records(total_summary),
+        "channel_summary": _records(platform_summary),
+        "channel_comparison": _records(channel_comparison),
+        "top_content_cases": _records(top_content_cases),
+        "overview_recommendations": str(overview_recommendations or "").strip(),
+        "channel_topic_context": _records(channel_topic_context if channel_topic_context is not None else pd.DataFrame()),
+        "period_level": str(period_level or "").strip() or "week",
+    }
+    prompt = (
+        "你是原生内容投放的周期复盘助手。请根据给定 JSON 写一份适合同事执行和对齐的周期复盘，"
+        "重点不是展示文字写得多完整，而是清楚传递哪些素材的数据好、为什么好、下个周期可以向哪些方向调整。"
+        "必须从数据中进行复盘，正文要引用 JSON 中的消耗、激活、成本、付费、环比、素材案例和内容类型证据；"
+        "不要机械复述数据，禁止编造 JSON 之外的数据、封面或链接。"
+        "返回内容必须分模块，overview.sections 固定为：核心判断、数据证据、原因判断、下周期动作；"
+        "channels[].sections 固定为：表现判断、有效素材、原因判断、下一周期执行动作。"
+        "渠道页 AI 只负责执行建议，不要单独输出题材或内容类型分析模块；内容类型数据只作为证据嵌入表现、素材、原因或动作中。"
+        "每个模块输出 2-4 条短要点；每条短要点必须引用输入 JSON 里的指标、素材或内容类型证据；"
+        "证据不足时写“当前数据未提供足够证据”。"
+        "总览只写一份整体结论和下周期总体方向，不要逐渠道展开，也不要把多个渠道写成竞争关系或排名关系。"
+        "分渠道必须逐个渠道单独给出执行建议，覆盖表现判断、有效素材、原因判断、下一周期执行方向或调整。"
+        "多个渠道之间不要写成竞争关系；每个渠道只分析本渠道内部哪些素材或内容类型证据支持继续、暂停、复测或调整。"
+        "周周期建议要偏执行的内容，例如下周期具体补哪些素材方向、复测哪些内容、暂停哪些低效方向；"
+        "月周期、季度、年度建议要偏策略、方案或预算结构调整，例如内容结构、渠道机制、投放方案、资源分配。"
+        "overview_recommendations 和 channel_topic_context 只作为证据输入；不要把它们改写成独立的内容类型建议模块。"
+        "返回严格 JSON，不要 Markdown，不要代码块。格式："
+        "{\"overview\":{\"report\":\"一篇总览复盘正文...\",\"next_cycle_direction\":\"下周期总体方向...\","
+        "\"sections\":[{\"title\":\"核心判断\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"数据证据\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"原因判断\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"下周期动作\",\"items\":[\"要点1\",\"要点2\"]}]},"
+        "\"channels\":[{\"channel\":\"渠道名\",\"analysis\":\"AI 渠道复盘建议...\",\"next_cycle_direction\":\"下一周期执行方向...\","
+        "\"sections\":[{\"title\":\"表现判断\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"有效素材\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"原因判断\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"下一周期执行动作\",\"items\":[\"要点1\",\"要点2\"]}]}]}。"
+        f"\n\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=settings.api_key, base_url=settings.base_url, timeout=DEFAULT_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=settings.model,
+            messages=[
+                {"role": "system", "content": "你只输出严格 JSON，用中文写周期复盘。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        return _normalize_manual_recap_report(_parse_json_object(response.choices[0].message.content or ""))
+    except Exception as exc:
+        raise RuntimeError(f"手动复盘报告生成失败：{type(exc).__name__}: {exc}") from exc
+
+
 def match_missing_categories(
     items: pd.DataFrame,
     category_library: list[str],
     env_path: Optional[Path] = None,
-) -> Mapping[int, str]:
+) -> Mapping[int, object]:
     settings = resolve_deepseek_settings(env_path)
     if not settings.configured or items.empty or not category_library:
         return {}
@@ -119,7 +206,8 @@ def match_missing_categories(
     }
     prompt = (
         "请为缺失内容类别的投放内容匹配类别。只能从 category_library 中选择，不能新增类别。"
-        "返回严格 JSON 对象，格式为 {\"matches\":[{\"index\":0,\"category\":\"类别\"}]}。"
+        "请同时给出 0 到 1 的 confidence 和简短 reason。"
+        "返回严格 JSON 对象，格式为 {\"matches\":[{\"index\":0,\"category\":\"类别\",\"confidence\":0.86,\"reason\":\"依据\"}]}。"
         f"\n\n{json.dumps(payload, ensure_ascii=False)}"
     )
     try:
@@ -140,7 +228,7 @@ def match_missing_categories(
         return {}
 
     allowed = set(category_library)
-    matches: dict[int, str] = {}
+    matches: dict[int, object] = {}
     for item in data.get("matches", []):
         if not isinstance(item, dict):
             continue
@@ -150,7 +238,9 @@ def match_missing_categories(
             continue
         category = str(item.get("category", "")).strip()
         if category in allowed:
-            matches[index] = category
+            confidence = _json_confidence(item.get("confidence"))
+            reason = str(item.get("reason", "") or "").strip()[:80]
+            matches[index] = {"category": category, "confidence": confidence, "reason": reason}
     return matches
 
 
@@ -361,6 +451,13 @@ def _json_number(value: object) -> float:
     return 0.0 if pd.isna(number) else float(number)
 
 
+def _json_confidence(value: object) -> float:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(number):
+        return 0.65
+    return float(max(0.0, min(1.0, number)))
+
+
 def _candidate_env_paths(env_path: Optional[Path]) -> list[Path]:
     candidates: list[Path] = []
     if env_path:
@@ -410,6 +507,101 @@ def _parse_json_object(content: str) -> dict[str, Any]:
         text = text[start : end + 1]
     data = json.loads(text)
     return data if isinstance(data, dict) else {}
+
+
+def _normalize_manual_recap_report(data: Mapping[str, Any]) -> dict[str, Any]:
+    overview = data.get("overview", {}) if isinstance(data, Mapping) else {}
+    if not isinstance(overview, Mapping):
+        overview = {}
+    channels = data.get("channels", []) if isinstance(data, Mapping) else []
+    if not isinstance(channels, list):
+        channels = []
+    overview_report = str(overview.get("report", "") or "").strip()
+    if not overview_report:
+        overview_parts = [
+            str(overview.get("summary", "") or "").strip(),
+            str(overview.get("cause", "") or "").strip(),
+        ]
+        overview_report = "\n\n".join(part for part in overview_parts if part)
+    overview_direction = _strip_manual_recap_direction_label(overview.get("next_cycle_direction", ""))
+    if not overview_direction:
+        overview_direction = _strip_manual_recap_direction_label(overview.get("action", ""))
+    return {
+        "overview": {
+            "report": overview_report,
+            "next_cycle_direction": overview_direction,
+            "sections": _normalize_manual_recap_sections(overview.get("sections", []), OVERVIEW_RECAP_SECTION_TITLES),
+            "summary": str(overview.get("summary", "") or "").strip(),
+            "cause": str(overview.get("cause", "") or "").strip(),
+            "action": str(overview.get("action", "") or "").strip(),
+        },
+        "channels": [
+            {
+                "channel": str(item.get("channel", "") or "").strip(),
+                "analysis": _channel_analysis_text(item),
+                "next_cycle_direction": _strip_manual_recap_direction_label(
+                    item.get("next_cycle_direction", "") or item.get("action", "")
+                ),
+                "sections": _normalize_manual_recap_sections(item.get("sections", []), CHANNEL_RECAP_SECTION_TITLES),
+                "summary": str(item.get("summary", "") or "").strip(),
+                "cause": str(item.get("cause", "") or "").strip(),
+                "action": str(item.get("action", "") or "").strip(),
+            }
+            for item in channels
+            if isinstance(item, Mapping)
+        ],
+    }
+
+
+def _normalize_manual_recap_sections(value: object, allowed_titles: tuple[str, ...]) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+
+    by_title: dict[str, list[str]] = {}
+    for section in value:
+        if not isinstance(section, Mapping):
+            continue
+        title = str(section.get("title", "") or "").strip()
+        if title not in allowed_titles:
+            continue
+        items = _normalize_manual_recap_items(section.get("items", []))
+        if items:
+            by_title[title] = items
+
+    return [{"title": title, "items": by_title[title]} for title in allowed_titles if title in by_title]
+
+
+def _strip_manual_recap_direction_label(value: object) -> str:
+    text = str(value or "").strip()
+    for prefix in ("下一周期执行方向", "下周期总体方向", "下一周期方向", "下周期方向"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :].lstrip("：: ").strip()
+            break
+    return text
+
+
+def _normalize_manual_recap_items(value: object) -> list[str]:
+    if isinstance(value, list):
+        candidates = value
+    else:
+        candidates = str(value or "").splitlines()
+    items = []
+    for item in candidates:
+        text = str(item or "").strip()
+        if text:
+            items.append(text)
+    return items[:6]
+
+
+def _channel_analysis_text(item: Mapping[str, Any]) -> str:
+    analysis = str(item.get("analysis", "") or "").strip()
+    if analysis:
+        return analysis
+    parts = [
+        str(item.get("summary", "") or "").strip(),
+        str(item.get("cause", "") or "").strip(),
+    ]
+    return "\n\n".join(part for part in parts if part)
 
 
 def _load_env(env_path: Optional[Path]) -> dict[str, str]:

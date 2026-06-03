@@ -433,8 +433,8 @@ def _rebuild_target_period(
 def _source_dir_for_target(data_root: Path, period_key: str) -> Path:
     key = str(period_key or "").strip()
     compact = key.replace("-", "")
-    if "w" in compact.lower():
-        return data_root / "weeks" / compact.lower()
+    if len(compact) == 16 and compact.isdigit():
+        return data_root / "weeks" / f"{compact[:8]}-{compact[8:]}"
     if len(compact) == 6 and compact.isdigit():
         return data_root / "months" / compact
     raise ValueError(f"无法从目标周期定位源文件目录：{period_key}")

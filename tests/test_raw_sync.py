@@ -35,15 +35,16 @@ class RawSyncTests(unittest.TestCase):
     def test_discover_raw_periods_scans_months_and_weeks_only(self):
         with TemporaryDirectory() as tmp:
             data_root = Path(tmp) / "data"
-            _write_xiaohongshu_file(data_root / "weeks" / "202605w2" / "小红书.xlsx", "note-new", 10.0)
+            _write_xiaohongshu_file(data_root / "weeks" / "20260508-20260514" / "小红书.xlsx", "note-new", 10.0)
             _write_xiaohongshu_file(data_root / "months" / "202605" / "小红书.xlsx", "note-month", 20.0)
+            _write_xiaohongshu_file(data_root / "weeks" / "202605w2" / "旧周目录.xlsx", "skip-week", 30.0)
             _write_xiaohongshu_file(data_root / "raw" / "20260508-20260514" / "旧路径.xlsx", "skip", 30.0)
             _write_xiaohongshu_file(data_root / "reference" / "原生内容投稿-20260527.xlsx", "reference", 40.0)
             (data_root / "not-a-period").mkdir()
 
             periods = discover_raw_periods(data_root)
 
-            self.assertEqual([period.name for period in periods], ["202605", "202605w2"])
+            self.assertEqual([period.name for period in periods], ["202605", "20260508-20260514"])
             self.assertEqual([period.period_level for period in periods], ["month", "week"])
             self.assertEqual([period.period_key for period in periods], ["2026-05", "20260508-20260514"])
 
@@ -51,8 +52,8 @@ class RawSyncTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             data_root = tmp_path / "data"
-            _write_xiaohongshu_file(data_root / "weeks" / "202605w1" / "小红书账号投放数据.xlsx", "note-old", 20.0)
-            _write_xiaohongshu_file(data_root / "weeks" / "202605w2" / "小红书账号投放数据.xlsx", "note-new", 10.0)
+            _write_xiaohongshu_file(data_root / "weeks" / "20260501-20260507" / "小红书账号投放数据.xlsx", "note-old", 20.0)
+            _write_xiaohongshu_file(data_root / "weeks" / "20260508-20260514" / "小红书账号投放数据.xlsx", "note-new", 10.0)
 
             first = sync_raw_periods(
                 data_root,
@@ -70,7 +71,7 @@ class RawSyncTests(unittest.TestCase):
                 env_path=tmp_path / "missing.env",
                 category_matcher=lambda items, category_library, env_path: {},
             )
-            _write_xiaohongshu_file(data_root / "weeks" / "202605w2" / "小红书账号投放数据.xlsx", "note-newer", 99.0)
+            _write_xiaohongshu_file(data_root / "weeks" / "20260508-20260514" / "小红书账号投放数据.xlsx", "note-newer", 99.0)
             third = sync_raw_periods(
                 data_root,
                 db_path=tmp_path / ".runtime" / "workflow.sqlite3",
@@ -86,8 +87,8 @@ class RawSyncTests(unittest.TestCase):
             self.assertTrue(first[0].batch_id)
             self.assertTrue(third[1].batch_id)
             self.assertEqual(first[1].batch_id, third[1].batch_id)
-            self.assertFalse((data_root / "weeks" / "202605w2" / "cleaned.xlsx").exists())
-            self.assertTrue((tmp_path / "processed" / "202605w2" / third[1].batch_id / "cleaned.xlsx").exists())
+            self.assertFalse((data_root / "weeks" / "20260508-20260514" / "cleaned.xlsx").exists())
+            self.assertTrue((tmp_path / "processed" / "20260508-20260514" / third[1].batch_id / "cleaned.xlsx").exists())
             with closing(sqlite3.connect(tmp_path / ".runtime" / "workflow.sqlite3")) as conn:
                 periods = conn.execute(
                     """
@@ -118,7 +119,7 @@ class RawSyncTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             data_root = tmp_path / "data"
-            period_dir = data_root / "weeks" / "202605w2"
+            period_dir = data_root / "weeks" / "20260508-20260514"
             _write_xiaohongshu_file(period_dir / "小红书账号投放数据.xlsx", "note-new", 10.0)
 
             first = sync_raw_periods(
@@ -129,7 +130,7 @@ class RawSyncTests(unittest.TestCase):
                 env_path=tmp_path / "missing.env",
                 category_matcher=lambda items, category_library, env_path: {},
             )
-            (tmp_path / "processed" / "202605w2" / first[0].batch_id / "channel_clean").mkdir(parents=True, exist_ok=True)
+            (tmp_path / "processed" / "20260508-20260514" / first[0].batch_id / "channel_clean").mkdir(parents=True, exist_ok=True)
             second = sync_raw_periods(
                 data_root,
                 db_path=tmp_path / ".runtime" / "workflow.sqlite3",

@@ -90,9 +90,9 @@ class PeriodInferenceTests(unittest.TestCase):
             ])
             self.assertTrue(all(bucket.review_period.period_level == PERIOD_LEVEL_WEEK for bucket in result))
             self.assertEqual([len(bucket.files) for bucket in result], [1, 1, 1])
-            self.assertEqual(result[0].raw_dir, data_root / "weeks" / "202604w1")
-            self.assertEqual(result[1].raw_dir, data_root / "weeks" / "202604w2")
-            self.assertEqual(result[2].raw_dir, data_root / "weeks" / "202604w3")
+            self.assertEqual(result[0].raw_dir, data_root / "weeks" / "20260403-20260409")
+            self.assertEqual(result[1].raw_dir, data_root / "weeks" / "20260410-20260416")
+            self.assertEqual(result[2].raw_dir, data_root / "weeks" / "20260417-20260423")
             self.assertFalse((result[2].raw_dir / "period_manifest.json").exists())
             self.assertEqual(result[2].ignored_file_count, 1)
 

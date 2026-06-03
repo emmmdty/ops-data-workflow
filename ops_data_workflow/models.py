@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -32,10 +33,10 @@ class WorkflowResult:
     channel_comparison: pd.DataFrame
     comparison_note: str
     ai_summary: str
-    report_html: Path
-    analysis_xlsx: Path
-    canonical_csv: Path
-    total_summary_xlsx: Path
+    report_html: Optional[Path]
+    analysis_xlsx: Optional[Path]
+    canonical_csv: Optional[Path]
+    total_summary_xlsx: Optional[Path]
     archive_dir: Path
     channel_clean_workbooks: list[Path] = field(default_factory=list)
     account_filter_rules: pd.DataFrame = field(default_factory=pd.DataFrame)

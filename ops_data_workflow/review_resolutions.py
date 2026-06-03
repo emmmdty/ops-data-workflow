@@ -190,6 +190,9 @@ def apply_review_resolutions_and_regenerate(
     processed_root: Path,
     category_rules_path: Path,
     env_path: Path,
+    output_mode: str = "full",
+    enable_deepseek: bool = True,
+    enable_external_context: bool = True,
 ):
     """Apply saved decisions to cleaned.xlsx, then regenerate the selected period."""
     record = read_batch_record(db_path, batch_id)
@@ -217,6 +220,9 @@ def apply_review_resolutions_and_regenerate(
         data_start=record.get("data_start", ""),
         data_end=record.get("data_end", ""),
         source_type=record.get("source_type", ""),
+        output_mode=output_mode,
+        enable_deepseek=enable_deepseek,
+        enable_external_context=enable_external_context,
     )
 
 

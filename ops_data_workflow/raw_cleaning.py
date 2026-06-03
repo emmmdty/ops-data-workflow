@@ -226,6 +226,7 @@ def clean_raw_period_dir(
     default_year: int,
     output_dir: Path | None = None,
     reference_root: Path | None = None,
+    write_channel_clean: bool = True,
 ) -> CleanedPeriodBucket:
     """Clean an already-materialized raw source directory into an output dir."""
     raw_dir = Path(raw_dir)
@@ -276,13 +277,14 @@ def clean_raw_period_dir(
     cleaned["review_action"] = cleaned["needs_manual_review"].map(
         lambda value: REVIEW_ACTION_PENDING if bool(value) else REVIEW_ACTION_KEEP
     )
-    write_channel_clean_workbooks(
-        cleaned,
-        clean_dir,
-        period_label=period.period_label,
-        period_start=period.period_start,
-        period_end=period.period_end,
-    )
+    if write_channel_clean:
+        write_channel_clean_workbooks(
+            cleaned,
+            clean_dir,
+            period_label=period.period_label,
+            period_start=period.period_start,
+            period_end=period.period_end,
+        )
     duplicate_file_frame = pd.DataFrame(
         duplicate_files,
         columns=["original_file", "duplicate_file", "sha256", "period_key", "note"],

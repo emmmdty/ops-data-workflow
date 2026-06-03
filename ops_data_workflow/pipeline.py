@@ -134,7 +134,7 @@ EXPECTED_ACCOUNTS: Dict[str, List[str]] = {
     "B站": ["同花顺投资"],
 }
 
-CategoryMatcher = Callable[[pd.DataFrame, list[str], Optional[Path]], Mapping[int, str]]
+CategoryMatcher = Callable[[pd.DataFrame, list[str], Optional[Path]], Mapping[int, object]]
 CategoryMappings = Mapping[str, Mapping[str, str]]
 
 
@@ -1010,18 +1010,9 @@ def _complete_categories(
 
     _apply_account_content_type_mappings(canonical, references.account_content_type)
 
-    tag_category = canonical["title"].map(category_from_tags)
+    tag_category = canonical.apply(lambda row: category_from_tags(_tag_match_text_for_row(row)), axis=1)
     has_tag_category = tag_category.astype(str).str.strip().ne("")
     _apply_tag_categories(canonical, tag_category, has_tag_category)
-
-    unmatched_tag_category = has_tag_category & canonical["content_category"].map(_is_blank)
-    canonical.loc[unmatched_tag_category, "ai_category"] = tag_category.loc[unmatched_tag_category]
-    canonical.loc[unmatched_tag_category, "content_category"] = tag_category.loc[unmatched_tag_category]
-    canonical.loc[unmatched_tag_category, "category_status"] = "TAG匹配"
-    canonical.loc[unmatched_tag_category, "category_confidence"] = 0.95
-
-    blank_tag_ai = has_tag_category & canonical["ai_category"].map(_is_blank)
-    canonical.loc[blank_tag_ai, "ai_category"] = tag_category.loc[blank_tag_ai]
 
     keyword_category = canonical["title"].map(lambda title: suggest_category(title, rules))
     has_keyword_category = keyword_category.astype(str).str.strip().ne("") & canonical["content_category"].map(_is_blank)
@@ -1030,23 +1021,23 @@ def _complete_categories(
     canonical.loc[has_keyword_category, "category_status"] = "标题关键词匹配"
     canonical.loc[has_keyword_category, "category_confidence"] = 0.75
 
-    category_library = _build_category_library(raw_category, tag_category, keyword_category, canonical["content_category"])
+    category_library = _build_category_library(raw_category, keyword_category, canonical["content_category"])
     pending = canonical[canonical["content_category"].map(_is_blank)]
     if category_library and not pending.empty:
         matcher = category_matcher or _default_category_matcher
         for channel, group in pending.groupby("channel", dropna=False):
             scoped_library = _category_library_for_channel(canonical, str(channel), category_library)
             matched = matcher(group.copy(), scoped_library, env_path)
-            for index, category in matched.items():
+            for index, match in matched.items():
                 if index not in canonical.index:
                     continue
-                normalized = str(category).strip()
+                normalized, confidence = _category_match_payload(match)
                 if normalized not in scoped_library:
                     continue
                 canonical.at[index, "ai_category"] = normalized
                 canonical.at[index, "content_category"] = normalized
                 canonical.at[index, "category_status"] = "DeepSeek匹配"
-                canonical.at[index, "category_confidence"] = 0.65
+                canonical.at[index, "category_confidence"] = confidence
 
     _fill_missing_secondary_categories(canonical)
 
@@ -1076,6 +1067,16 @@ def _apply_fixed_channel_categories(canonical: pd.DataFrame) -> None:
         return
     if "content_form" in canonical.columns:
         canonical.loc[bilibili & canonical["content_form"].map(_is_blank), "content_form"] = "视频"
+
+
+def _category_match_payload(value: object) -> tuple[str, float]:
+    if isinstance(value, Mapping):
+        category = str(value.get("category", "") or "").strip()
+        confidence = parse_number(value.get("confidence"))
+        if pd.isna(confidence):
+            confidence = 0.65
+        return category, float(max(0.0, min(1.0, confidence)))
+    return str(value or "").strip(), 0.65
 
 
 def _fill_missing_secondary_categories(canonical: pd.DataFrame) -> None:
@@ -1157,25 +1158,30 @@ def _apply_tag_categories(canonical: pd.DataFrame, tag_category: pd.Series, has_
     channel = canonical["channel"].fillna("").astype(str)
     tag_scoped = has_tag_category & (
         channel.str.contains("小红书", na=False) | channel.str.contains("抖音", na=False)
-    )
+    ) & canonical["content_category"].map(_is_blank)
     if not tag_scoped.any():
         return
 
-    for index in canonical.index[tag_scoped]:
-        tag_value = str(tag_category.loc[index]).strip()
-        current = "" if _is_blank(canonical.at[index, "content_category"]) else str(canonical.at[index, "content_category"]).strip()
-        if current and current != tag_value:
-            reasons = _split_reasons(canonical.at[index, "review_reasons"])
-            reasons.append(f"TAG分类与原始分类冲突：{tag_value} / {current}")
-            canonical.at[index, "review_reasons"] = "；".join(dict.fromkeys(reason for reason in reasons if reason))
-            canonical.at[index, "needs_manual_review"] = True
-            canonical.at[index, "conflict_details"] = _join_non_blank(
-                [canonical.at[index, "conflict_details"], f"TAG分类={tag_value}; 原始分类={current}"]
-            )
-        canonical.at[index, "ai_category"] = tag_value
-        canonical.at[index, "content_category"] = tag_value
-        canonical.at[index, "category_status"] = "TAG匹配"
-        canonical.at[index, "category_confidence"] = 0.95
+    canonical.loc[tag_scoped, "ai_category"] = tag_category.loc[tag_scoped].astype(str).str.strip()
+    canonical.loc[tag_scoped, "content_category"] = tag_category.loc[tag_scoped].astype(str).str.strip()
+    canonical.loc[tag_scoped, "category_status"] = "TAG匹配"
+    canonical.loc[tag_scoped, "category_confidence"] = 0.95
+
+
+def _tag_match_text_for_row(row: pd.Series) -> str:
+    values: list[str] = []
+    for column, value in row.items():
+        column_text = str(column)
+        if column_text == "title" or column_text in {"tag词", "TAG词", "标签", "话题"}:
+            if not _is_blank(value):
+                values.append(str(value))
+            continue
+        if not column_text.startswith("raw__"):
+            continue
+        raw_name = column_text.rsplit("__", 1)[-1]
+        if raw_name in {"tag词", "TAG词", "标签", "话题"} and not _is_blank(value):
+            values.append(str(value))
+    return " ".join(values)
 
 
 def _apply_account_content_type_mappings(canonical: pd.DataFrame, account_content_type: pd.DataFrame) -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 import json
 import re
@@ -47,7 +47,10 @@ def source_dir_for_period(data_root: Path, period: ReviewPeriod) -> Path:
         start = date.fromisoformat(period.period_start)
         return data_root / MONTHS_DIR_NAME / f"{start.year:04d}{start.month:02d}"
     if period.period_level == PERIOD_LEVEL_WEEK:
-        return data_root / WEEKS_DIR_NAME / week_storage_key(date.fromisoformat(period.period_start))
+        return data_root / WEEKS_DIR_NAME / week_date_storage_key(
+            date.fromisoformat(period.period_start),
+            date.fromisoformat(period.period_end),
+        )
     raise ValueError(f"原始数据只支持月度或周度目录：{period.period_level}")
 
 
@@ -120,21 +123,27 @@ def latest_reference_workbook(reference_dir: Path) -> Path | None:
     return max(candidates, key=lambda item: item[:3])[3]
 
 
-def week_storage_key(start: date) -> str:
-    first = _first_friday(start.year, start.month)
-    week_number = 1 if start < first else ((start - first).days // 7) + 1
-    return f"{start.year:04d}{start.month:02d}w{week_number}"
+def week_date_storage_key(start: date, end: date) -> str:
+    return f"{start:%Y%m%d}-{end:%Y%m%d}"
 
 
 def week_period_from_key(key: str) -> ReviewPeriod:
-    match = re.fullmatch(r"(20\d{2})(0[1-9]|1[0-2])[wW]([1-9]\d*)", str(key).strip())
+    match = re.fullmatch(r"(20\d{2})(0[1-9]|1[0-2])([0-3]\d)-(20\d{2})(0[1-9]|1[0-2])([0-3]\d)", str(key).strip())
     if not match:
         raise ValueError(f"无法识别周度原始数据目录：{key}")
     year = int(match.group(1))
     month = int(match.group(2))
-    week_number = int(match.group(3))
-    start = _first_friday(year, month) + timedelta(days=(week_number - 1) * 7)
-    end = start + timedelta(days=6)
+    day = int(match.group(3))
+    end_year = int(match.group(4))
+    end_month = int(match.group(5))
+    end_day = int(match.group(6))
+    try:
+        start = date(year, month, day)
+        end = date(end_year, end_month, end_day)
+    except ValueError as exc:
+        raise ValueError(f"无法识别周度原始数据目录：{key}") from exc
+    if end < start:
+        raise ValueError(f"无法识别周度原始数据目录：{key}")
     return review_period_from_dates(start, end, PERIOD_LEVEL_WEEK)
 
 
@@ -213,11 +222,6 @@ def _is_generated_artifact(path: Path, root: Path | None = None) -> bool:
     if item.stem.lower().endswith("_clean"):
         return True
     return "channel_clean" in relative.parts
-
-
-def _first_friday(year: int, month: int) -> date:
-    current = date(year, month, 1)
-    return current + timedelta(days=(4 - current.weekday()) % 7)
 
 
 def _latest_date_token(name: str) -> str:

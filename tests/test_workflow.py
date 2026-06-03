@@ -1,11 +1,14 @@
 from pathlib import Path
+from contextlib import closing
+import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 from openpyxl import load_workbook
 
-from ops_data_workflow.workflow import run_workflow
+from ops_data_workflow.workflow import run_archived_workflow, run_workflow
 from ops_data_workflow.pipeline import analyze_canonical_frame, analyze_input_dir
 from ops_data_workflow.reference_tables import account_mapping_lookup, load_reference_tables, parse_period_from_raw_dir
 
@@ -760,6 +763,123 @@ xiaohongshu:
             self.assertEqual(manual["content_category"], "热点行情")
             self.assertEqual(manual["category_status"], "人工标记")
 
+    def test_ai_category_matcher_can_return_confidence(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            raw_dir.mkdir()
+            pd.DataFrame(
+                [
+                    {
+                        "视频标题": "已有内容类型样本",
+                        "视频id": "dy-known-confidence",
+                        "素材ID": "mat-known-confidence",
+                        "消耗": 10.0,
+                        "内容类型": "热点行情",
+                    },
+                    {
+                        "视频标题": "完全陌生内容",
+                        "视频id": "dy-ai-confidence",
+                        "素材ID": "mat-ai-confidence",
+                        "消耗": 9.0,
+                        "内容类型": "",
+                    },
+                ]
+            ).to_csv(raw_dir / "抖音商业化.csv", index=False, encoding="utf-8-sig")
+
+            def matcher(items, category_library, env_path):
+                self.assertIn("热点行情", category_library)
+                return {int(index): {"category": "热点行情", "confidence": 0.84} for index in items.index}
+
+            result = analyze_input_dir(
+                raw_dir,
+                "2026-04-01",
+                "2026-04-27",
+                category_matcher=matcher,
+                env_path=Path(tmp) / ".env",
+            )
+
+            inferred = result.canonical[result.canonical["content_id"].eq("dy-ai-confidence")].iloc[0]
+            self.assertEqual(inferred["content_category"], "热点行情")
+            self.assertEqual(inferred["ai_category"], "热点行情")
+            self.assertEqual(inferred["category_status"], "DeepSeek匹配")
+            self.assertAlmostEqual(float(inferred["category_confidence"]), 0.84)
+
+    def test_user_defined_hashtag_completes_missing_xhs_and_douyin_categories_only(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-tag-title",
+                    "title": "盘中热点 #同顺图解",
+                    "spend": 10.0,
+                    "manual_category": "",
+                },
+                {
+                    "platform": "小红书",
+                    "channel": "小红书商业化",
+                    "content_id": "xhs-tag-column",
+                    "title": "财商小课堂",
+                    "spend": 9.0,
+                    "manual_category": "",
+                    "raw__小红书商业化__tag词": "#同顺财商 #投教",
+                },
+                {
+                    "platform": "B站",
+                    "channel": "B站",
+                    "content_id": "bv-tag-title",
+                    "title": "深度财经 #同顺深度财经",
+                    "spend": 8.0,
+                    "manual_category": "",
+                },
+            ]
+        )
+
+        result = analyze_canonical_frame(
+            frame,
+            "2026-04-01",
+            "2026-04-27",
+            category_matcher=lambda items, category_library, env_path: {},
+        )
+
+        canonical = result.canonical.set_index("content_id")
+        self.assertEqual(canonical.loc["dy-tag-title", "content_category"], "图文")
+        self.assertEqual(canonical.loc["dy-tag-title", "category_status"], "TAG匹配")
+        self.assertAlmostEqual(float(canonical.loc["dy-tag-title", "category_confidence"]), 0.95)
+        self.assertEqual(canonical.loc["xhs-tag-column", "content_category"], "财商动画")
+        self.assertEqual(canonical.loc["xhs-tag-column", "category_status"], "TAG匹配")
+        self.assertEqual(canonical.loc["bv-tag-title", "content_category"], "")
+        self.assertNotEqual(canonical.loc["bv-tag-title", "category_status"], "TAG匹配")
+
+    def test_user_defined_hashtag_does_not_override_existing_manual_category(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-manual-tag-conflict",
+                    "title": "图解走势 #同顺图解",
+                    "spend": 10.0,
+                    "manual_category": "资讯",
+                }
+            ]
+        )
+
+        result = analyze_canonical_frame(
+            frame,
+            "2026-04-01",
+            "2026-04-27",
+            category_matcher=lambda items, category_library, env_path: {},
+        )
+
+        item = result.canonical.iloc[0]
+        self.assertEqual(item["manual_category"], "资讯")
+        self.assertEqual(item["content_category"], "资讯")
+        self.assertEqual(item["ai_category"], "")
+        self.assertEqual(item["category_status"], "人工标记")
+        self.assertFalse(bool(item["needs_manual_review"]))
+        self.assertEqual(item["conflict_details"], "")
+
     def test_title_keyword_rules_complete_missing_category_before_ai_matcher(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -1508,6 +1628,94 @@ xiaohongshu:
             workbook.close()
             self.assertTrue(result.total_summary_xlsx.exists())
 
+    def test_archived_workflow_ui_only_runs_ai_review_without_report_api_calls(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            _write_raw_fixture(raw_dir)
+            pd.DataFrame(
+                [
+                    {
+                        "视频标题": "已知类型样本",
+                        "视频id": "dy-known-ui-only",
+                        "素材ID": "mat-known-ui-only",
+                        "消耗": 10.0,
+                        "内容类型": "资讯",
+                    },
+                    {
+                        "视频标题": "完全陌生主题",
+                        "视频id": "dy-pending-ui-only",
+                        "素材ID": "mat-pending-ui-only",
+                        "消耗": 9.0,
+                        "内容类型": "",
+                    },
+                ]
+            ).to_csv(raw_dir / "抖音市场部.csv", index=False, encoding="utf-8-sig")
+            env_path = tmp_path / ".env"
+            env_path.write_text(
+                "DEEPSEEK_API_KEY=test-key\nDEEPSEEK_BASE_URL=https://api.deepseek.com\n",
+                encoding="utf-8",
+            )
+            reviewed_batches = []
+
+            def category_matcher(items, category_library, env_path_arg):
+                reviewed_batches.append((len(items), tuple(category_library)))
+                return {}
+
+            with patch(
+                "ops_data_workflow.topic_analysis.group_topic_labels",
+                side_effect=AssertionError("DeepSeek topic call"),
+            ), patch(
+                "ops_data_workflow.workflow.fetch_external_context",
+                side_effect=AssertionError("external context call"),
+            ), patch(
+                "ops_data_workflow.workflow.generate_ai_summary",
+                side_effect=AssertionError("DeepSeek summary call"),
+            ):
+                result = run_archived_workflow(
+                    raw_dir,
+                    "2026-04-01",
+                    "2026-04-27",
+                    output_root=tmp_path / "outputs",
+                    processed_root=tmp_path / "processed",
+                    db_path=tmp_path / ".runtime" / "workflow.sqlite3",
+                    env_path=env_path,
+                    category_matcher=category_matcher,
+                    output_mode="ui_only",
+                    enable_deepseek=True,
+                    enable_external_context=False,
+                )
+
+            self.assertTrue(reviewed_batches)
+            self.assertTrue((result.archive_dir / "cleaned.xlsx").exists())
+            self.assertIsNone(result.report_html)
+            self.assertIsNone(result.analysis_xlsx)
+            self.assertIsNone(result.canonical_csv)
+            self.assertIsNone(result.total_summary_xlsx)
+            self.assertEqual(result.channel_clean_workbooks, [])
+            self.assertFalse((tmp_path / "outputs" / result.batch_id).exists())
+            self.assertEqual(result.ai_summary, "")
+            with closing(sqlite3.connect(tmp_path / ".runtime" / "workflow.sqlite3")) as conn:
+                canonical_count = conn.execute(
+                    "select count(*) from canonical_items where batch_id = ?",
+                    (result.batch_id,),
+                ).fetchone()[0]
+                topic_providers = [
+                    row[0]
+                    for row in conn.execute(
+                        "select distinct provider from topic_label_items where batch_id = ?",
+                        (result.batch_id,),
+                    ).fetchall()
+                ]
+                ai_count = conn.execute(
+                    "select count(*) from ai_reports where batch_id = ?",
+                    (result.batch_id,),
+                ).fetchone()[0]
+            self.assertGreater(canonical_count, 0)
+            self.assertNotIn("deepseek", topic_providers)
+            self.assertEqual(ai_count, 0)
+
     def test_workflow_writes_report_when_category_spend_is_blank(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -1634,7 +1842,7 @@ xiaohongshu:
             self.assertEqual(bilibili["AI生成内容类别"], "大佬采访")
             self.assertEqual(bilibili["最终内容类别"], "大佬采访")
             self.assertEqual(bilibili["栏目"], "大佬采访")
-            self.assertEqual(bilibili["三级题材"], "实盘大赛冠军孙辉--370万到2000万的传奇交易之路")
+            self.assertEqual(bilibili["题材"], "实盘大赛冠军孙辉--370万到2000万的传奇交易之路")
             self.assertEqual(bilibili["内容类别来源"], "标题关键词匹配")
             self.assertNotIn("一级内容分类", exported.columns)
             self.assertNotIn("一级类型", exported.columns)

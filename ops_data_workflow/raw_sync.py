@@ -78,6 +78,9 @@ def sync_raw_periods(
     env_path: Optional[Path] = None,
     reference_root: Optional[Path] = None,
     category_matcher: Optional[Callable] = None,
+    output_mode: str = "full",
+    enable_deepseek: bool = True,
+    enable_external_context: bool = True,
 ) -> list[RawSyncResult]:
     results: list[RawSyncResult] = []
     for period in _canonical_raw_periods(discover_raw_periods(data_root)):
@@ -114,6 +117,9 @@ def sync_raw_periods(
                 data_start=period.data_start,
                 data_end=period.data_end,
                 source_type=period.source_type,
+                output_mode=output_mode,
+                enable_deepseek=enable_deepseek,
+                enable_external_context=enable_external_context,
             )
             results.append(
                 RawSyncResult(

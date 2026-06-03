@@ -47,8 +47,13 @@ def clean_douyin_share_title(value: object) -> str:
         return ""
     if ":/" in text:
         prefix, suffix = text.rsplit(":/", 1)
-        if re.search(r"(?:^|\s)\d+(?:\.\d+)?\s+[A-Za-z0-9]{1,12}$", prefix.strip()):
+        prefix_text = prefix.strip()
+        suffix_text = suffix.strip()
+        prefix_has_chinese = bool(re.search(r"[\u4e00-\u9fff]", prefix_text))
+        if re.search(r"(?:^|\s)\d+(?:\.\d+)?\s+[A-Za-z0-9]{1,12}$", prefix_text):
             text = suffix.strip()
+        elif suffix_text and not prefix_has_chinese and re.search(r"[\u4e00-\u9fff]", suffix_text):
+            text = suffix_text
 
     for _ in range(4):
         previous = text

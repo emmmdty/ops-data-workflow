@@ -4,11 +4,11 @@
 
 工具当前重点能力：
 
-- 上传一个周期的原始投放数据，自动标准化、入库并生成报告。
+- 上传一个周期的原始投放数据，自动标准化、入库并生成页面数据。
 - 每个页面都可以选择分析周期，周期选择会跨页面联动。
-- 总览展示核心 KPI、环比增长、分平台结果、分渠道图表和渠道栏目分析。
-- 渠道下钻支持渠道 -> 二级栏目 -> 题材 Top N 分析，B站未命中分类时保留空栏目并进入题材分析。
-- 支持 DeepSeek 做题材归纳和报告结论；未配置 API Key 时会自动使用本地规则兜底。
+- 总览展示本周期数据总览、手动 AI 复盘报告、渠道跳转、内容题材建议和分渠道图表。
+- 渠道页支持栏目、重点题材、消耗 Top5 素材案例分析；素材链接可直接打开，封面缩略图可点击放大。
+- 上传后只执行数据清洗、入库和页面展示，不自动生成任何 AI 报告；AI 复盘报告必须在总览页手动生成，生成后固定到下次手动更新。
 - 支持分类审核，人工确认后的分类会沉淀为历史映射。
 
 ## 1. 启动工具
@@ -33,7 +33,7 @@ http://localhost:8501
 
 ## 2. 配置 DeepSeek，可选
 
-在项目根目录创建 `.env`：
+页面数据模式不会自动调用 DeepSeek。需要在总览页手动生成 AI 复盘报告时，可在项目根目录创建 `.env`：
 
 ```env
 DEEPSEEK_API_KEY=你的key
@@ -41,21 +41,21 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-没有 `DEEPSEEK_API_KEY` 时，工具仍可正常生成数据报告；题材归纳和结论会使用本地规则兜底或跳过 DeepSeek 结论。
+没有 `DEEPSEEK_API_KEY` 时，工具仍可正常完成上传清洗、入库和页面展示；手动 AI 复盘按钮会提示未配置。
 
 ## 3. 准备原始数据
 
 推荐每个周期准备一个文件夹，里面放各渠道导出的原始文件：
 
 ```text
-data/weeks/202605w4/
+data/weeks/20260518-20260524/
   B站.xlsx
   小红书商业化.xlsx
   抖音商业化.xlsx
   抖音市场部.xlsx
 ```
 
-月度原始数据放在 `data/months/YYYYMM/`，例如 `data/months/202605/`。周度原始数据放在 `data/weeks/YYYYMMwN/`，例如 `data/weeks/202604w1/`。人工维护的投稿台账和映射表放在 `data/reference/`。
+月度原始数据放在 `data/months/YYYYMM/`，例如 `data/months/202605/`。周度原始数据放在 `data/weeks/YYYYMMDD-YYYYMMDD/`，例如 `data/weeks/20260403-20260409/`。人工维护的投稿台账和映射表放在 `data/reference/`。
 
 也可以直接在网页上传：
 
@@ -65,9 +65,9 @@ data/weeks/202605w4/
 
 文件名会优先作为渠道名。B站、小红书、抖音有专门的字段读取规则，其他渠道会按通用字段候选读取。源文件会先在 `processed/` 中清洗为 `cleaned.xlsx`，再进入统计分析；每个 workbook 的 sheet 会记录在 `导入日志` 或 `忽略sheet` 中，避免静默跳过。`data/` 只放原始输入，不写清洗产物。
 
-## 4. 生成报告
+## 4. 生成页面数据
 
-进入左侧导航的“生成报告”。
+进入左侧导航的“生成页面数据”。
 
 1. 在“上传原始数据”中选择目录，或把多个 CSV / Excel / ZIP 拖入上传区。
 2. 确认原始数据已上传。
@@ -76,13 +76,10 @@ data/weeks/202605w4/
 
 生成成功后，工具会写入这些位置：
 
-- `data/months/{YYYYMM}/` 或 `data/weeks/{YYYYMMwN}/`：页面上传后的原始源文件目录。
+- `data/months/{YYYYMM}/` 或 `data/weeks/{YYYYMMDD-YYYYMMDD}/`：页面上传后的原始源文件目录。
 - `processed/{period_key}/{batch_id}/`：清洗产物目录，包含 `cleaned.xlsx`、`period_manifest.json` 和 `channel_clean/`。
-- `outputs/{batch_id}/report.html`：HTML 报告。
-- `outputs/{batch_id}/analysis.xlsx`：分析明细。
-- `outputs/{batch_id}/canonical.csv`：标准化明细。
-- `outputs/{batch_id}/total_summary.xlsx`：总结果表。
-- `.runtime/workflow.sqlite3`：历史批次、标准化明细、分类、质量检查和对比数据。
+- 页面数据模式默认不生成 `outputs/{batch_id}/report.html`、`analysis.xlsx`、`canonical.csv`、`total_summary.xlsx` 等下载产物。
+- `.runtime/workflow.sqlite3`：历史批次、标准化明细、分类、质量检查、对比数据和手动 AI 复盘报告。
 
 `processed/{period_key}/{batch_id}/` 中还会生成：
 
@@ -101,12 +98,11 @@ data/weeks/202605w4/
 
 用于快速看当前周期整体表现。
 
-- `总体核心指标`：总消耗、激活数、激活成本、付费数、付费成本、付费率。
-- `环比增长`：按周期日期查找上一个更早成功周期，展示消耗、激活、付费和成本变化；不按入库时间决定上一期。
-- `分平台核心结果`：按渠道展示核心指标。
-- `直接建议`：基于题材、渠道和成本的文本建议。
+- `手动 AI 复盘报告`：点击按钮后调用兼容 OpenAI 风格的接口生成；不点击则只展示数据。
+- `本周期数据总览`：汇总和分渠道的消耗、曝光、激活、付费与成本环比。
+- `内容题材建议摘要`：基于题材、渠道和成本的文本建议。
 - `分渠道表现`：可切换消耗、激活数、付费数、激活成本、付费成本、付费率。
-- `渠道栏目分析`：选择渠道后查看该渠道下二级栏目的图表。
+- 渠道跳转：总览可跳到各渠道；渠道页提供返回总览入口。
 
 页面顶部的周期选择使用北京时间显示，格式为：
 
@@ -220,23 +216,43 @@ uv run python main.py --migrate-legacy-raw --data-root data
 
 ```bash
 uv run python main.py \
-  --input data/weeks/202605w4 \
+  --input data/weeks/20260518-20260524 \
   --period-start 2026-05-18 \
   --period-end 2026-05-24 \
   --output outputs \
   --processed-root processed \
-  --db .runtime/workflow.sqlite3
+  --db .runtime/workflow.sqlite3 \
+  --ui-only
 ```
 
 只生成文件、不写数据库：
 
 ```bash
 uv run python main.py \
-  --input data/weeks/202605w4 \
+  --input data/weeks/20260518-20260524 \
   --period-start 2026-05-18 \
   --period-end 2026-05-24 \
   --output outputs/manual \
   --legacy-output-only
+```
+
+从外部目录全量重建页面数据：
+
+```bash
+uv run python main.py \
+  --import-source ../data \
+  --replace-all \
+  --ui-only \
+  --data-root data \
+  --output outputs \
+  --processed-root processed \
+  --db .runtime/workflow.sqlite3
+```
+
+先看导入计划、不复制也不生成：
+
+```bash
+uv run python main.py --import-source ../data --dry-run --data-root data
 ```
 
 ## 10. 测试
@@ -257,7 +273,7 @@ python -m pytest -q
 
 ### 没有 DeepSeek Key 能不能用？
 
-可以。工具会继续生成数据报告，DeepSeek 相关能力会降级为本地规则。
+可以。工具会继续完成上传清洗、入库和页面展示；手动 AI 复盘报告需要配置 Key 后再生成。
 
 ### 重新生成同一周期会重复出很多周期吗？
 
@@ -271,6 +287,6 @@ python -m pytest -q
 
 B站只默认内容形式为视频，不再写入固定内容类型；没有明确分类时会留空，渠道下钻仍会进入题材分析。
 
-### 上传后标题缺失但数据很高怎么办？
+### 上传后标题缺失怎么办？
 
-渠道下钻和异常检测会标记标题缺失但消耗、激活或付费较高的记录，便于后续回查原始数据。
+建议回到源文件补齐标题或内容链接后重新生成；系统会保留原始导入日志和内容审核队列，便于回查来源。

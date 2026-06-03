@@ -15,6 +15,7 @@ from ops_data_workflow.dashboard import (
     build_period_comparison_for_batch,
     build_content_recommendations,
     build_dashboard_summary,
+    build_top_content_review_queue,
     compare_channel_topics,
     detect_high_metric_anomalies,
     filter_dashboard_items,
@@ -39,7 +40,7 @@ from ops_data_workflow.dashboard import (
 )
 from ops_data_workflow.reporting import format_display_number, localize_and_sort_columns
 from ops_data_workflow.periods import PERIOD_LEVEL_MONTH, PERIOD_LEVEL_WEEK, SOURCE_TYPE_ROLLUP, SOURCE_TYPE_UPLOAD
-from ops_data_workflow.storage import init_db, previous_successful_batch_id_for_period
+from ops_data_workflow.storage import init_db, load_manual_recap_report, persist_manual_recap_report, previous_successful_batch_id_for_period
 
 
 def _append_frame(conn: sqlite3.Connection, table_name: str, batch_id: str, frame: pd.DataFrame) -> None:
@@ -248,6 +249,66 @@ def _seed_dashboard_db(db_path: Path) -> None:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_overview_platform_chart_bars_use_actual_metric_values(self):
+        from app import _build_platform_chart_figure
+
+        platform_summary = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "spend": 120.0, "activations": 12.0},
+                {"channel": "小红书商业化", "spend": 80.0, "activations": 10.0},
+            ]
+        )
+        channel_comparison = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "spend_previous": 60.0,
+                    "spend_change_rate": 1.0,
+                    "activations_previous": 6.0,
+                    "activations_change_rate": 1.0,
+                },
+                {
+                    "channel": "小红书商业化",
+                    "spend_previous": 100.0,
+                    "spend_change_rate": -0.2,
+                    "activations_previous": 20.0,
+                    "activations_change_rate": -0.5,
+                },
+            ]
+        )
+
+        fig = _build_platform_chart_figure(platform_summary, channel_comparison)
+
+        self.assertIsNotNone(fig)
+        current_spend = next(trace for trace in fig.data if trace.name == "总消耗 本期")
+        previous_spend = next(trace for trace in fig.data if trace.name == "总消耗 上期")
+        self.assertEqual(list(current_spend.y), [120.0, 80.0])
+        self.assertEqual(list(previous_spend.y), [60.0, 100.0])
+        self.assertNotIn("渠道内相对指数", str(fig.to_plotly_json()))
+        self.assertEqual(fig.layout.yaxis.title.text, "总消耗")
+        self.assertEqual(fig.layout.yaxis2.title.text, "环比")
+
+    def test_manual_recap_report_persists_separately_from_upload_reports(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+
+            persist_manual_recap_report(
+                db_path,
+                "batch-1",
+                provider="deepseek",
+                model="deepseek-chat",
+                report={
+                    "overview": {"summary": "整体承压", "cause": "行情波动", "action": "补齐图文"},
+                    "channels": [{"channel": "抖音商业化", "summary": "达人下架", "cause": "审核", "action": "补授权"}],
+                },
+            )
+            loaded = load_manual_recap_report(db_path, "batch-1")
+
+            self.assertEqual(loaded["provider"], "deepseek")
+            self.assertEqual(loaded["report"]["overview"]["summary"], "整体承压")
+            self.assertEqual(loaded["report"]["channels"][0]["channel"], "抖音商业化")
+
     def test_load_dashboard_items_reads_only_successful_batches(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "workflow.sqlite3"
@@ -1294,6 +1355,7 @@ class DashboardTests(unittest.TestCase):
                     "channel": "抖音商业化",
                     "title": f"抖音标题{i:02d}",
                     "content_id": f"dy-{i:02d}",
+                    "cover_url": f"https://img.example/douyin/{i:02d}.jpg",
                     "content_url": f"https://douyin.example/{i:02d}",
                     "spend": float(100 - i),
                     "activations": 1.0,
@@ -1306,6 +1368,7 @@ class DashboardTests(unittest.TestCase):
                     "channel": "小红书商业化",
                     "title": f"小红书标题{i:02d}",
                     "content_id": f"note-{i:02d}",
+                    "cover_url": "",
                     "content_url": f"https://xhs.example/{i:02d}",
                     "spend": float(50 - i),
                     "activations": 1.0,
@@ -1318,6 +1381,7 @@ class DashboardTests(unittest.TestCase):
                     "channel": "B站",
                     "title": f"B站标题{i:02d}",
                     "content_id": f"bv-{i:02d}",
+                    "cover_url": f"https://img.example/bilibili/{i:02d}.jpg",
                     "content_url": f"https://bilibili.example/{i:02d}",
                     "spend": float(20 - i),
                     "activations": 1.0,
@@ -1330,6 +1394,7 @@ class DashboardTests(unittest.TestCase):
                     "channel": "其他渠道",
                     "title": "其他标题",
                     "content_id": "other-1",
+                    "cover_url": "",
                     "content_url": "https://other.example/1",
                     "spend": 999.0,
                     "activations": 1.0,
@@ -1343,12 +1408,165 @@ class DashboardTests(unittest.TestCase):
         bilibili = summarize_channel_top_content_links(frame, "B站")
         other = summarize_channel_top_content_links(frame, "其他渠道")
 
-        self.assertEqual(len(douyin), 20)
-        self.assertEqual(len(xhs), 10)
+        self.assertEqual(len(douyin), 5)
+        self.assertEqual(len(xhs), 5)
         self.assertEqual(len(bilibili), 5)
-        self.assertTrue(other.empty)
+        self.assertEqual(len(other), 1)
         self.assertEqual(douyin.iloc[0]["title"], "抖音标题00")
         self.assertEqual(douyin.iloc[0]["content_url"], "https://douyin.example/00")
+        self.assertEqual(douyin.iloc[0]["cover_url"], "https://img.example/douyin/00.jpg")
+        self.assertIn("cover_url", xhs.columns)
+
+    def test_build_top_content_review_queue_uses_period_channel_limits_and_flags_missing_links(self):
+        rows = []
+        for batch_id in ["upload:week:20260515-20260521", "upload:month:2026-05"]:
+            for channel, total in [
+                ("抖音商业化", 25),
+                ("抖音市场部", 24),
+                ("小红书商业化", 12),
+                ("小红书市场部", 11),
+                ("B站", 7),
+                ("其他渠道", 12),
+            ]:
+                for index in range(total):
+                    rows.append(
+                        {
+                            "batch_id": batch_id,
+                            "period_start": "2026-05-15",
+                            "period_end": "2026-05-21",
+                            "batch_period_start": "2026-05-15",
+                            "batch_period_end": "2026-05-21",
+                            "platform_group": channel.replace("商业化", "").replace("市场部", ""),
+                            "platform": channel,
+                            "channel": channel,
+                            "title": f"{channel}标题{index:02d}",
+                            "content_id": f"{batch_id}:{channel}:{index}",
+                            "material_id": "",
+                            "content_url": "" if index == 0 else f"https://example.com/{batch_id}/{channel}/{index}",
+                            "manual_category": "" if index == 1 else "资讯",
+                            "content_category": "" if index == 2 else "资讯",
+                            "spend": float(1000 - index),
+                            "activations": 1.0,
+                            "first_pay_count": 0.0,
+                        }
+                    )
+        queue = build_top_content_review_queue(pd.DataFrame(rows), include_auto_passed=True)
+
+        counts = queue.groupby(["batch_id", "channel"]).size().to_dict()
+        for batch_id in ["upload:week:20260515-20260521", "upload:month:2026-05"]:
+            self.assertEqual(counts[(batch_id, "抖音商业化")], 20)
+            self.assertEqual(counts[(batch_id, "抖音市场部")], 20)
+            self.assertEqual(counts[(batch_id, "小红书商业化")], 10)
+            self.assertEqual(counts[(batch_id, "小红书市场部")], 10)
+            self.assertEqual(counts[(batch_id, "B站")], 5)
+            self.assertEqual(counts[(batch_id, "其他渠道")], 10)
+
+        missing_link = queue[queue["title"].eq("抖音商业化标题00")].iloc[0]
+        self.assertTrue(bool(missing_link["missing_content_url"]))
+        self.assertIn("缺链接", missing_link["audit_flags"])
+        self.assertEqual(int(missing_link["rank_in_channel"]), 1)
+
+    def test_build_top_content_review_queue_defaults_to_ai_review_exceptions(self):
+        rows = [
+            {
+                "batch_id": "upload:week:20260515-20260521",
+                "batch_period_start": "2026-05-15",
+                "batch_period_end": "2026-05-21",
+                "platform_group": "抖音",
+                "platform": "抖音商业化",
+                "channel": "抖音商业化",
+                "title": "自动通过素材",
+                "content_id": "auto-pass",
+                "content_url": "https://example.com/auto",
+                "content_category": "资讯",
+                "category_l2": "资讯",
+                "category_confidence": 0.95,
+                "spend": 1000.0,
+                "activations": 10.0,
+            },
+            {
+                "batch_id": "upload:week:20260515-20260521",
+                "batch_period_start": "2026-05-15",
+                "batch_period_end": "2026-05-21",
+                "platform_group": "抖音",
+                "platform": "抖音商业化",
+                "channel": "抖音商业化",
+                "title": "低置信素材",
+                "content_id": "low-confidence",
+                "content_url": "https://example.com/low",
+                "content_category": "资讯",
+                "category_l2": "资讯",
+                "category_confidence": 0.62,
+                "spend": 900.0,
+                "activations": 9.0,
+            },
+            {
+                "batch_id": "upload:week:20260515-20260521",
+                "batch_period_start": "2026-05-15",
+                "batch_period_end": "2026-05-21",
+                "platform_group": "抖音",
+                "platform": "抖音商业化",
+                "channel": "抖音商业化",
+                "title": "缺链接素材",
+                "content_id": "missing-url",
+                "content_url": "",
+                "content_category": "资讯",
+                "category_l2": "资讯",
+                "category_confidence": 0.95,
+                "spend": 800.0,
+                "activations": 8.0,
+            },
+            {
+                "batch_id": "upload:week:20260515-20260521",
+                "batch_period_start": "2026-05-15",
+                "batch_period_end": "2026-05-21",
+                "platform_group": "抖音",
+                "platform": "抖音商业化",
+                "channel": "抖音商业化",
+                "title": "链接格式异常素材",
+                "content_id": "invalid-url",
+                "content_url": "not-a-url",
+                "content_category": "资讯",
+                "category_l2": "资讯",
+                "category_confidence": 0.95,
+                "spend": 700.0,
+                "activations": 7.0,
+            },
+            {
+                "batch_id": "upload:week:20260515-20260521",
+                "batch_period_start": "2026-05-15",
+                "batch_period_end": "2026-05-21",
+                "platform_group": "抖音",
+                "platform": "抖音商业化",
+                "channel": "抖音商业化",
+                "title": "类型冲突素材",
+                "content_id": "type-risk",
+                "content_url": "https://example.com/risk",
+                "content_category": "资讯",
+                "category_l2": "资讯",
+                "category_confidence": 0.95,
+                "match_risk_reason": "投稿台账内容类型不一致",
+                "spend": 600.0,
+                "activations": 6.0,
+            },
+        ]
+
+        queue = build_top_content_review_queue(pd.DataFrame(rows))
+        titles = set(queue["title"])
+
+        self.assertNotIn("自动通过素材", titles)
+        self.assertEqual(titles, {"低置信素材", "缺链接素材", "链接格式异常素材", "类型冲突素材"})
+        self.assertTrue(queue["needs_review"].astype(bool).all())
+        self.assertTrue(queue["ai_review_status"].eq("需人工确认").all())
+        self.assertIn("低置信", queue[queue["title"].eq("低置信素材")]["ai_review_reason"].iloc[0])
+        self.assertIn("缺链接", queue[queue["title"].eq("缺链接素材")]["audit_flags"].iloc[0])
+        self.assertIn("链接格式异常", queue[queue["title"].eq("链接格式异常素材")]["audit_flags"].iloc[0])
+        self.assertIn("类型/台账冲突", queue[queue["title"].eq("类型冲突素材")]["audit_flags"].iloc[0])
+
+        all_top = build_top_content_review_queue(pd.DataFrame(rows), include_auto_passed=True)
+        passed = all_top[all_top["title"].eq("自动通过素材")].iloc[0]
+        self.assertEqual(passed["ai_review_status"], "自动通过")
+        self.assertIn("置信度达标", passed["ai_review_reason"])
 
     def test_summarize_topics_for_selection_keeps_blank_bilibili_category_unmatched(self):
         frame = pd.DataFrame(

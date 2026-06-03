@@ -427,6 +427,8 @@ def _match_row(
     for source, key_platform, key_account, key_type, key_value in keys:
         matches = lookup.get((key_platform, key_account, key_type, key_value))
         if matches:
+            if key_type == "title_no_tags":
+                return _select_title_match(row, matches, source, f"{key_platform}:{key_account}:{key_type}:{key_value}")
             reason = _ambiguous_match_reason(matches, "同键")
             if reason:
                 return LedgerMatch(
@@ -443,16 +445,7 @@ def _match_row(
             matches = lookup.get((platform, "", "title_no_tags", title_key))
             if matches:
                 key = f"{platform}::title_no_tags::{title_key}"
-                if len(matches) == 1:
-                    return LedgerMatch(matches[0], "唯一标题", key, 1)
-                return LedgerMatch(
-                    matches[0],
-                    "唯一标题",
-                    key,
-                    len(matches),
-                    fill_allowed=False,
-                    risk_reason=f"投稿台账存在 {len(matches)} 条同标题记录",
-                )
+                return _select_title_match(row, matches, "唯一标题", key)
         fuzzy_match = _match_fuzzy_title(row, fuzzy_rows)
         if fuzzy_match is not None:
             return fuzzy_match
@@ -497,12 +490,46 @@ def _douyin_url_key(value: object) -> str:
     return text
 
 
+def _select_title_match(row: pd.Series, matches: list[pd.Series], source: str, key: str) -> LedgerMatch:
+    if len(matches) <= 1:
+        return LedgerMatch(matches[0], source, key, len(matches))
+    selected = _choose_title_match_by_date(row, matches)
+    reason = "同标题多链接按日期选择"
+    return LedgerMatch(selected, source, key, len(matches), fill_allowed=True, risk_reason=reason)
+
+
+def _choose_title_match_by_date(row: pd.Series, matches: list[pd.Series]) -> pd.Series:
+    period_end = _parse_period_end(row)
+    dated: list[tuple[date, pd.Series]] = []
+    for candidate in matches:
+        parsed = _parse_published_date(candidate.get("published_date", ""), 2026)
+        if parsed is not None:
+            dated.append((parsed, candidate))
+    if not dated:
+        return matches[0]
+    if period_end is not None:
+        eligible = [(parsed, candidate) for parsed, candidate in dated if parsed <= period_end]
+        if eligible:
+            latest = max(parsed for parsed, _ in eligible)
+            return next(candidate for parsed, candidate in eligible if parsed == latest)
+    earliest = min(parsed for parsed, _ in dated)
+    return next(candidate for parsed, candidate in dated if parsed == earliest)
+
+
+def _parse_period_end(row: pd.Series) -> date | None:
+    for column in ["period_end", "batch_period_end", "data_end"]:
+        parsed = _parse_published_date(row.get(column, ""), 2026)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _match_fuzzy_title(row: pd.Series, ledger_rows: list[pd.Series]) -> LedgerMatch | None:
     title_key = _normalized_tagless_title_key(row.get("title", ""))
     if len(title_key) < 6:
         return None
     account = account_match_label("抖音", row.get("account", ""))
-    matches: list[pd.Series] = []
+    matches: list[tuple[float, pd.Series]] = []
     for candidate in ledger_rows:
         candidate_account = account_match_label("抖音", candidate.get("account", ""))
         if account and candidate_account and account != candidate_account:
@@ -512,29 +539,39 @@ def _match_fuzzy_title(row: pd.Series, ledger_rows: list[pd.Series]) -> LedgerMa
         )
         if not candidate_key or candidate_key == title_key:
             continue
-        if _is_fuzzy_title_match(title_key, candidate_key):
-            matches.append(candidate)
-    if len(matches) != 1:
+        score = _fuzzy_title_score(title_key, candidate_key)
+        if score >= 0.86:
+            matches.append((score, candidate))
+    if not matches:
         return None
-    candidate = matches[0]
+    best_score = max(score for score, _ in matches)
+    best_matches = [candidate for score, candidate in matches if score == best_score]
+    candidate = _choose_title_match_by_date(row, best_matches)
     candidate_key = _clean_text(candidate.get("title_key_no_tags", "")) or _normalized_tagless_title_key(
         candidate.get("title", "")
     )
+    reason = "标题近似匹配，需确认"
+    if len(best_matches) > 1:
+        reason = _append_text(reason, "同标题多链接按日期选择")
     return LedgerMatch(
         candidate,
         "模糊标题",
         f"抖音::fuzzy_title::{title_key}->{candidate_key}",
-        1,
+        len(best_matches),
         fill_allowed=True,
-        risk_reason="标题近似匹配，需确认",
+        risk_reason=reason,
     )
 
 
 def _is_fuzzy_title_match(left: str, right: str) -> bool:
+    return _fuzzy_title_score(left, right) >= 0.86
+
+
+def _fuzzy_title_score(left: str, right: str) -> float:
     shorter, longer = sorted([left, right], key=len)
     if len(shorter) >= 6 and shorter in longer:
-        return True
-    return SequenceMatcher(None, left, right).ratio() >= 0.86
+        return 1.0
+    return SequenceMatcher(None, left, right).ratio()
 
 
 def _dedupe_ledger_by_earliest_date(ledger: pd.DataFrame, *, default_year: int) -> pd.DataFrame:
@@ -571,8 +608,13 @@ def _dedupe_ledger_by_earliest_date(ledger: pd.DataFrame, *, default_year: int) 
 def _ledger_duplicate_key(row: pd.Series) -> tuple[str, str, str] | None:
     platform = platform_match_label(row.get("platform", ""))
     content_id = _clean_text(row.get("content_id", ""))
+    content_url = _clean_text(row.get("content_url", ""))
+    if platform == "抖音" and content_url:
+        return platform, "url", content_url
     if content_id:
         return platform, "id", content_id
+    if content_url:
+        return platform, "url", content_url
     if platform == "抖音":
         title_key = _clean_text(row.get("title_key_no_tags", "")) or _normalized_tagless_title_key(row.get("title", ""))
         if title_key:

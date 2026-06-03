@@ -92,6 +92,7 @@ OVERVIEW_TABLE_COLUMNS = [
 ]
 
 COST_METRICS = {"activation_cost", "first_pay_cost"}
+AI_REVIEW_AUTO_PASS_THRESHOLD = 0.80
 BILIBILI_CHANNEL = "B站"
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 BATCH_COLUMNS = [
@@ -133,7 +134,6 @@ DETAIL_COLUMNS = [
     "author",
     "content_url",
     "category_l2",
-    "category_l3",
     "category_source",
     "review_status",
     "content_category",
@@ -152,6 +152,51 @@ DETAIL_COLUMNS = [
     "source_file_hash",
     "duplicate_group_id",
     "review_action",
+]
+
+TOP_CONTENT_REVIEW_COLUMNS = [
+    "batch_id",
+    "batch_period_start",
+    "batch_period_end",
+    "platform_group",
+    "platform",
+    "channel",
+    "rank_in_channel",
+    "ai_review_status",
+    "ai_review_reason",
+    "audit_flags",
+    "needs_review",
+    "missing_content_url",
+    "invalid_content_url",
+    "missing_manual_category",
+    "missing_content_category",
+    "low_category_confidence",
+    "type_conflict",
+    "title",
+    "content_id",
+    "material_id",
+    "account",
+    "content_url",
+    "manual_category",
+    "ai_category",
+    "content_category",
+    "category_l2",
+    "category_source",
+    "category_confidence",
+    "review_status",
+    "review_reasons",
+    "ledger_match_source",
+    "ledger_content_type",
+    "ledger_source_file",
+    "ledger_source_sheet",
+    "ledger_source_row",
+    "match_risk_level",
+    "match_risk_reason",
+    "spend",
+    "activations",
+    "activation_cost",
+    "source_file",
+    "source_sheet",
 ]
 
 NUMERIC_SOURCE_COLUMNS = [
@@ -851,8 +896,8 @@ def compare_channel_topics(current_topics: pd.DataFrame, previous_topics: pd.Dat
 def summarize_channel_top_content_links(items: pd.DataFrame, channel: str) -> pd.DataFrame:
     """Return channel-specific spend Top content rows with visible content links."""
     channel_name = str(channel or "").strip()
-    limit = _channel_top_content_limit(channel_name)
-    columns = ["title", "spend", "content_url"]
+    limit = 5 if channel_name else 0
+    columns = ["title", "spend", "cover_url", "content_url"]
     if limit <= 0:
         return pd.DataFrame(columns=columns)
     normalized = _normalize_items(items)
@@ -873,6 +918,61 @@ def summarize_channel_top_content_links(items: pd.DataFrame, channel: str) -> pd
         .head(limit)[columns]
         .reset_index(drop=True)
     )
+
+
+def build_top_content_review_queue(
+    items: pd.DataFrame,
+    *,
+    include_auto_passed: bool = False,
+    confidence_threshold: float = AI_REVIEW_AUTO_PASS_THRESHOLD,
+) -> pd.DataFrame:
+    """Return per-period, per-channel Top rows that need human content review."""
+    if items.empty:
+        return pd.DataFrame(columns=TOP_CONTENT_REVIEW_COLUMNS)
+    normalized = _normalize_items(items)
+    for column in TOP_CONTENT_REVIEW_COLUMNS:
+        if column not in normalized.columns:
+            normalized[column] = ""
+    normalized["spend"] = pd.to_numeric(normalized["spend"], errors="coerce").fillna(0.0)
+    normalized["category_confidence"] = pd.to_numeric(normalized["category_confidence"], errors="coerce").fillna(0.0)
+    group_columns = ["batch_id", "batch_period_start", "batch_period_end", "platform_group", "channel"]
+    groups: list[pd.DataFrame] = []
+    for _, group in normalized.groupby(group_columns, dropna=False, sort=True):
+        channel = str(group["channel"].iloc[0] or "")
+        limit = _channel_top_content_limit(channel)
+        if limit <= 0:
+            continue
+        top = group.sort_values("spend", ascending=False, na_position="last").head(limit).copy()
+        top["rank_in_channel"] = range(1, len(top) + 1)
+        top["missing_content_url"] = top["content_url"].map(_is_blank_text)
+        top["invalid_content_url"] = ~top["missing_content_url"] & ~top["content_url"].map(_is_valid_content_url)
+        top["missing_manual_category"] = top["manual_category"].map(_is_blank_text)
+        top["missing_content_category"] = top["content_category"].map(_is_blank_text)
+        top["low_category_confidence"] = ~top["missing_content_category"] & top["category_confidence"].lt(confidence_threshold)
+        top["type_conflict"] = top["match_risk_level"].astype(str).str.strip().ne("") | top["match_risk_reason"].astype(str).str.strip().ne("")
+        top["needs_review"] = (
+            top["missing_content_url"]
+            | top["invalid_content_url"]
+            | top["missing_content_category"]
+            | top["low_category_confidence"]
+            | top["type_conflict"]
+        )
+        top["ai_review_status"] = top["needs_review"].map(lambda value: "需人工确认" if bool(value) else "自动通过")
+        top["audit_flags"] = top.apply(_content_review_flags, axis=1)
+        top["ai_review_reason"] = top.apply(_ai_review_reason, axis=1)
+        if not include_auto_passed:
+            top = top[top["needs_review"]].copy()
+        if top.empty:
+            continue
+        groups.append(top)
+    if not groups:
+        return pd.DataFrame(columns=TOP_CONTENT_REVIEW_COLUMNS)
+    result = pd.concat(groups, ignore_index=True)
+    result = result.sort_values(
+        ["batch_period_end", "batch_period_start", "platform_group", "channel", "rank_in_channel"],
+        ascending=[False, False, True, True, True],
+    )
+    return result[TOP_CONTENT_REVIEW_COLUMNS].reset_index(drop=True)
 
 
 def summarize_channel_top_topics(
@@ -1316,7 +1416,19 @@ def _normalize_items(items: pd.DataFrame) -> pd.DataFrame:
         "account_id",
         "author",
         "content_url",
+        "manual_category",
+        "ai_category",
+        "review_reasons",
+        "ledger_match_source",
+        "ledger_content_type",
+        "ledger_source_file",
+        "ledger_source_sheet",
+        "ledger_source_row",
+        "match_risk_level",
+        "match_risk_reason",
     ]:
+        if column not in normalized.columns:
+            normalized[column] = ""
         normalized[column] = normalized[column].fillna("").astype(str)
     if "channel" in normalized.columns:
         missing_channel = normalized["channel"].str.strip().eq("")
@@ -1603,7 +1715,42 @@ def _channel_top_content_limit(channel: str) -> int:
         return 10
     if "B站" in name:
         return 5
-    return 0
+    return 10
+
+
+def _is_blank_text(value: object) -> bool:
+    text = "" if value is None or pd.isna(value) else str(value).strip()
+    return text.lower() in {"", "nan", "none", "null", "<na>"}
+
+
+def _is_valid_content_url(value: object) -> bool:
+    text = "" if value is None or pd.isna(value) else str(value).strip().lower()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def _content_review_flags(row: pd.Series) -> str:
+    flags = []
+    if bool(row.get("missing_content_url", False)):
+        flags.append("缺链接")
+    if bool(row.get("invalid_content_url", False)):
+        flags.append("链接格式异常")
+    if bool(row.get("missing_content_category", False)):
+        flags.append("缺内容类型")
+    if bool(row.get("low_category_confidence", False)):
+        flags.append("低置信")
+    if bool(row.get("type_conflict", False)):
+        flags.append("类型/台账冲突")
+    return "；".join(flags) if flags else "AI自动通过"
+
+
+def _ai_review_reason(row: pd.Series) -> str:
+    flags = str(row.get("audit_flags", "") or "").strip()
+    if flags and flags != "AI自动通过":
+        return flags
+    confidence = pd.to_numeric(pd.Series([row.get("category_confidence", 0.0)]), errors="coerce").iloc[0]
+    if pd.isna(confidence):
+        confidence = 0.0
+    return f"置信度达标（{float(confidence):.2f}）且链接完整"
 
 
 def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -1709,11 +1856,21 @@ def _empty_items() -> pd.DataFrame:
             "account",
             "author",
             "content_url",
+            "manual_category",
+            "ai_category",
             "category_l2",
-            "category_l3",
             "category_source",
+            "category_confidence",
             "review_status",
+            "review_reasons",
             "content_category",
+            "ledger_match_source",
+            "ledger_content_type",
+            "ledger_source_file",
+            "ledger_source_sheet",
+            "ledger_source_row",
+            "match_risk_level",
+            "match_risk_reason",
             "spend",
             "impressions",
             "clicks",

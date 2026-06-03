@@ -58,6 +58,21 @@ PERSISTED_TOPIC_SUMMARY_COLUMNS = [
     "first_pay_rate",
 ]
 
+PERSISTED_CONTENT_TYPE_SUMMARY_COLUMNS = [
+    "channel",
+    "content_type",
+    "spend_share",
+    "spend",
+    "impressions",
+    "clicks",
+    "ctr",
+    "activations",
+    "activation_cost",
+    "first_pay_count",
+    "first_pay_cost",
+    "first_pay_rate",
+]
+
 TopicLabeler = Callable[[pd.DataFrame, Optional[Path]], Mapping[int, str]]
 
 INVALID_TEXT_VALUES = {"", "nan", "none", "null", "nat", "<na>"}
@@ -210,6 +225,44 @@ def summarize_persisted_topic_labels(topic_labels: pd.DataFrame, channel: object
     grouped["first_pay_rate"] = _safe_divide(grouped["first_pay_count"], grouped["activations"])
     return grouped.sort_values(["spend", "activations"], ascending=[False, False])[
         PERSISTED_TOPIC_SUMMARY_COLUMNS
+    ].reset_index(drop=True)
+
+
+def summarize_persisted_content_types(topic_labels: pd.DataFrame, channel: object) -> pd.DataFrame:
+    channel_name = str(channel or "").strip()
+    if topic_labels.empty or not channel_name:
+        return pd.DataFrame(columns=PERSISTED_CONTENT_TYPE_SUMMARY_COLUMNS)
+    labels = topic_labels[topic_labels["channel"].astype(str).eq(channel_name)].copy()
+    if labels.empty:
+        return pd.DataFrame(columns=PERSISTED_CONTENT_TYPE_SUMMARY_COLUMNS)
+    for column in ["spend", "impressions", "clicks", "activations", "first_pay_count"]:
+        if column not in labels.columns:
+            labels[column] = 0.0
+        labels[column] = pd.to_numeric(labels[column], errors="coerce").fillna(0.0)
+    if "content_type" not in labels.columns:
+        labels["content_type"] = ""
+    labels["content_type"] = labels["content_type"].fillna("").astype(str).str.strip()
+    labels.loc[labels["content_type"].eq(""), "content_type"] = UNMATCHED_CONTENT_TYPE
+
+    grouped = (
+        labels.groupby(["channel", "content_type"], dropna=False)
+        .agg(
+            spend=("spend", "sum"),
+            impressions=("impressions", "sum"),
+            clicks=("clicks", "sum"),
+            activations=("activations", "sum"),
+            first_pay_count=("first_pay_count", "sum"),
+        )
+        .reset_index()
+    )
+    total_spend = float(grouped["spend"].sum()) if not grouped.empty else 0.0
+    grouped["spend_share"] = grouped["spend"].map(lambda value: float(value) / total_spend if total_spend else 0.0)
+    grouped["ctr"] = _safe_divide(grouped["clicks"], grouped["impressions"])
+    grouped["activation_cost"] = _safe_divide(grouped["spend"], grouped["activations"])
+    grouped["first_pay_cost"] = _safe_divide(grouped["spend"], grouped["first_pay_count"])
+    grouped["first_pay_rate"] = _safe_divide(grouped["first_pay_count"], grouped["activations"])
+    return grouped.sort_values(["spend", "activations"], ascending=[False, False])[
+        PERSISTED_CONTENT_TYPE_SUMMARY_COLUMNS
     ].reset_index(drop=True)
 
 

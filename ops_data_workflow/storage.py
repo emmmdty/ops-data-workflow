@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from contextlib import closing
+import json
 from pathlib import Path
 import hashlib
 import re
@@ -105,14 +106,18 @@ def init_db(db_path: Path) -> None:
         conn.execute(
             """
             create table if not exists ai_reports (
-                batch_id text primary key,
+                batch_id text not null,
                 provider text not null,
                 model text not null,
                 summary text not null,
-                created_at text not null
+                created_at text not null,
+                report_type text not null default 'auto_summary',
+                report_json text not null default '',
+                primary key (batch_id, report_type)
             )
             """
         )
+        _ensure_ai_report_columns(conn)
         conn.execute(
             """
             create table if not exists category_mappings (
@@ -451,6 +456,59 @@ def read_total_summary(db_path: Path, batch_id: str) -> pd.DataFrame:
             ).drop(columns=["batch_id"], errors="ignore")
         except Exception:
             return pd.DataFrame()
+
+
+def persist_manual_recap_report(
+    db_path: Path,
+    batch_id: str,
+    *,
+    provider: str,
+    model: str,
+    report: dict[str, object],
+) -> None:
+    init_db(db_path)
+    created_at = datetime.now(timezone.utc).isoformat()
+    report_json = json.dumps(report, ensure_ascii=False)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            insert or replace into ai_reports (
+                batch_id, provider, model, summary, created_at, report_type, report_json
+            )
+            values (?, ?, ?, ?, ?, 'manual_recap', ?)
+            """,
+            (batch_id, provider, model, report_json, created_at, report_json),
+        )
+        conn.commit()
+
+
+def load_manual_recap_report(db_path: Path, batch_id: str) -> dict[str, object]:
+    if not batch_id or not Path(db_path).exists():
+        return {}
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            select provider, model, summary, report_json, created_at
+            from ai_reports
+            where batch_id = ? and report_type = 'manual_recap'
+            """,
+            (batch_id,),
+        ).fetchone()
+    if row is None:
+        return {}
+    provider, model, summary, report_json, created_at = row
+    raw = str(report_json or summary or "{}")
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError:
+        report = {"overview": {"summary": str(summary or ""), "cause": "", "action": ""}, "channels": []}
+    return {
+        "provider": str(provider or ""),
+        "model": str(model or ""),
+        "created_at": str(created_at or ""),
+        "report": report if isinstance(report, dict) else {},
+    }
 
 
 def list_recent_batches(db_path: Path, limit: int = 20) -> pd.DataFrame:
@@ -1041,6 +1099,8 @@ def persist_workflow_result(
     ai_summary: str,
     comparison_batch_id: Optional[str],
     comparison_note: str,
+    ai_provider: str = "deepseek",
+    ai_model: str = "",
     period_level: str = "",
     period_key: str = "",
     period_label: str = "",
@@ -1123,13 +1183,14 @@ def persist_workflow_result(
         _append_frame(conn, "missing_value_items", batch_id, missing_value_details)
         _append_frame(conn, "channel_comparison_items", batch_id, channel_comparison)
         _append_frame(conn, "topic_label_items", batch_id, topic_label_items if topic_label_items is not None else pd.DataFrame())
-        conn.execute(
-            """
-            insert or replace into ai_reports (batch_id, provider, model, summary, created_at)
-            values (?, 'deepseek', '', ?, ?)
-            """,
-            (batch_id, ai_summary, created_at),
-        )
+        if str(ai_summary or "").strip():
+            conn.execute(
+                """
+                insert or replace into ai_reports (batch_id, provider, model, summary, created_at, report_type, report_json)
+                values (?, ?, ?, ?, ?, 'auto_summary', '')
+                """,
+                (batch_id, ai_provider, ai_model, ai_summary, created_at),
+            )
         conn.commit()
 
 
@@ -1216,7 +1277,6 @@ def _upsert_period_state(
 def _delete_batch_scoped_rows(conn: sqlite3.Connection, batch_id: str) -> None:
     for table_name in [
         "uploaded_files",
-        "ai_reports",
         "canonical_items",
         "channel_summary_items",
         "total_summary_items",
@@ -1248,6 +1308,18 @@ def _delete_batch_scoped_rows(conn: sqlite3.Connection, batch_id: str) -> None:
         if "batch_id" not in columns:
             continue
         conn.execute(f'delete from "{_sqlite_identifier(table_name)}" where batch_id = ?', (batch_id,))
+
+    if conn.execute(
+        "select 1 from sqlite_master where type = 'table' and name = 'ai_reports'",
+    ).fetchone():
+        columns = {row[1] for row in conn.execute('pragma table_info("ai_reports")').fetchall()}
+        if "report_type" in columns:
+            conn.execute(
+                "delete from ai_reports where batch_id = ? and coalesce(report_type, 'auto_summary') != 'manual_recap'",
+                (batch_id,),
+            )
+        else:
+            conn.execute("delete from ai_reports where batch_id = ?", (batch_id,))
 
 
 def _delete_period_scoped_rows(
@@ -1338,6 +1410,19 @@ def _ensure_upload_batch_metadata_columns(conn: sqlite3.Connection) -> None:
     for column in ["period_level", "period_key", "period_label", "data_start", "data_end", "source_type"]:
         if column not in existing:
             conn.execute(f'alter table "upload_batches" add column "{column}" text not null default ""')
+
+
+def _ensure_ai_report_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        row[1]
+        for row in conn.execute('pragma table_info("ai_reports")').fetchall()
+    }
+    for column in ["report_type", "report_json"]:
+        if column not in existing:
+            conn.execute(f'alter table "ai_reports" add column "{column}" text not null default ""')
+    conn.execute(
+        "update ai_reports set report_type = 'auto_summary' where coalesce(report_type, '') = ''"
+    )
 
 
 def _sqlite_identifier(value: str) -> str:

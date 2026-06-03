@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import pandas as pd
 
-from .ai import generate_ai_summary, resolve_deepseek_settings
+from .ai import generate_ai_summary, generate_local_summary, resolve_deepseek_settings
 from .channel_clean import write_channel_clean_workbooks
 from .comparison import build_channel_comparison
 from .external_context import fetch_external_context
@@ -137,6 +137,10 @@ def run_archived_workflow(
     data_end: str = "",
     source_type: str = SOURCE_TYPE_UPLOAD,
     progress_callback: Optional[Callable[[str], None]] = None,
+    output_mode: str = "full",
+    enable_deepseek: bool = True,
+    enable_external_context: bool = True,
+    write_channel_clean: bool = True,
 ) -> WorkflowResult:
     def progress(message: str) -> None:
         if progress_callback is not None:
@@ -157,6 +161,7 @@ def run_archived_workflow(
     period_start = period.period_start
     period_end = period.period_end
     batch_id = period_result_id(period)
+    ui_only = output_mode == "ui_only"
     input_dir = Path(input_dir)
     processed_dir = Path(processed_root) / source_storage_key(period) / batch_id
     progress("正在整理清洗产物")
@@ -173,6 +178,7 @@ def run_archived_workflow(
             default_year=date.fromisoformat(period.data_start).year,
             output_dir=processed_dir,
             reference_root=reference_root,
+            write_channel_clean=write_channel_clean and not ui_only,
         )
         cleaned_workbook = cleaned_bucket.cleaned_workbook
         archived_files = _source_file_records(input_dir)
@@ -196,11 +202,11 @@ def run_archived_workflow(
         period_end,
         category_rules_path,
         env_path=env_path,
-        category_matcher=category_matcher,
+        category_matcher=category_matcher if enable_deepseek else _no_category_matches,
         category_mappings=category_mappings,
         douyin_id_bridge=douyin_id_bridge,
     )
-    progress("正在校验数据质量与题材分类")
+    progress("正在校验字段完整性与内容类型")
     if previous_summary.empty:
         channel_comparison = _empty_frame()
         comparison_note = "无历史对比数据：数据库中没有早于当前周期的成功周期。"
@@ -208,60 +214,86 @@ def run_archived_workflow(
         channel_comparison = build_channel_comparison(analysis.total_summary, previous_summary)
         comparison_note = ""
 
-    external_context = fetch_external_context(period.data_start, period.data_end) if resolve_deepseek_settings(env_path).configured else None
-    ai_summary = generate_ai_summary(
-        analysis.total_summary,
-        analysis.category_summary,
-        analysis.top_content_items,
-        analysis.account_audit,
-        channel_comparison,
-        comparison_note,
-        env_path=env_path,
-        platform_summary=analysis.platform_summary,
-        platform_category_summary=analysis.platform_category_summary,
-        external_context=external_context,
+    settings = resolve_deepseek_settings(env_path)
+    external_context = (
+        fetch_external_context(period.data_start, period.data_end)
+        if enable_deepseek and enable_external_context and settings.configured
+        else None
     )
+    if ui_only:
+        ai_summary = ""
+    elif enable_deepseek:
+        ai_summary = generate_ai_summary(
+            analysis.total_summary,
+            analysis.category_summary,
+            analysis.top_content_items,
+            analysis.account_audit,
+            channel_comparison,
+            comparison_note,
+            env_path=env_path,
+            platform_summary=analysis.platform_summary,
+            platform_category_summary=analysis.platform_category_summary,
+            external_context=external_context,
+        )
+    else:
+        ai_summary = generate_local_summary(
+            analysis.total_summary,
+            analysis.platform_summary,
+            channel_comparison,
+            external_context,
+        )
+    ai_provider = "deepseek" if enable_deepseek and settings.configured and not ui_only else "local"
+    ai_model = settings.model if ai_provider == "deepseek" else ""
     progress("正在固化重点题材")
-    topic_label_items = build_topic_label_frame(analysis.canonical, env_path=env_path)
+    topic_label_items = build_topic_label_frame(
+        analysis.canonical,
+        env_path=env_path,
+        topic_labeler=_no_topic_labels if ui_only or not enable_deepseek else None,
+    )
 
     output_dir = Path(output_root) / batch_id
-    _replace_directory(output_dir)
-    progress("正在写入周期库并生成当前下载文件")
-    report_html, analysis_xlsx, canonical_csv, total_summary_xlsx = write_outputs(
-        output_dir,
-        period_start,
-        period_end,
-        analysis.canonical,
-        analysis.category_summary,
-        analysis.channel_summary,
-        analysis.platform_summary,
-        analysis.platform_category_summary,
-        analysis.total_summary,
-        analysis.raw_category_stats,
-        analysis.pending_categories,
-        analysis.account_audit,
-        analysis.top_content_items,
-        analysis.cover_metrics,
-        analysis.data_quality,
-        analysis.review_queue,
-        analysis.preprocessing_report,
-        analysis.duplicate_merge_details,
-        analysis.conflict_retention_details,
-        analysis.missing_value_details,
-        analysis.reference_tables.tables,
-        channel_comparison,
-        comparison_note,
-        ai_summary,
-        account_filter_rules=analysis.account_filter_rules,
-        account_filter_details=analysis.account_filter_details,
-    )
-    channel_clean_workbooks = write_channel_clean_workbooks(
-        analysis.canonical,
-        output_dir,
-        period_label=period.period_label,
-        period_start=period.period_start,
-        period_end=period.period_end,
-    )
+    if ui_only:
+        progress("正在写入周期库")
+        report_html = analysis_xlsx = canonical_csv = total_summary_xlsx = None
+        channel_clean_workbooks = []
+    else:
+        _replace_directory(output_dir)
+        progress("正在写入周期库")
+        report_html, analysis_xlsx, canonical_csv, total_summary_xlsx = write_outputs(
+            output_dir,
+            period_start,
+            period_end,
+            analysis.canonical,
+            analysis.category_summary,
+            analysis.channel_summary,
+            analysis.platform_summary,
+            analysis.platform_category_summary,
+            analysis.total_summary,
+            analysis.raw_category_stats,
+            analysis.pending_categories,
+            analysis.account_audit,
+            analysis.top_content_items,
+            analysis.cover_metrics,
+            analysis.data_quality,
+            analysis.review_queue,
+            analysis.preprocessing_report,
+            analysis.duplicate_merge_details,
+            analysis.conflict_retention_details,
+            analysis.missing_value_details,
+            analysis.reference_tables.tables,
+            channel_comparison,
+            comparison_note,
+            ai_summary,
+            account_filter_rules=analysis.account_filter_rules,
+            account_filter_details=analysis.account_filter_details,
+        )
+        channel_clean_workbooks = write_channel_clean_workbooks(
+            analysis.canonical,
+            output_dir,
+            period_label=period.period_label,
+            period_start=period.period_start,
+            period_end=period.period_end,
+        )
     persist_workflow_result(
         db_path,
         batch_id,
@@ -290,6 +322,8 @@ def run_archived_workflow(
         ai_summary,
         previous_batch_id,
         comparison_note,
+        ai_provider=ai_provider,
+        ai_model=ai_model,
         period_level=period.period_level,
         period_key=period.period_key,
         period_label=period.period_label,
@@ -298,7 +332,7 @@ def run_archived_workflow(
         source_type=period.source_type,
     )
     persist_douyin_id_bridge(db_path, batch_id, analysis.canonical)
-    progress("报告生成完成")
+    progress("页面数据生成完成")
     return WorkflowResult(
         batch_id=batch_id,
         canonical=analysis.canonical,
@@ -343,6 +377,9 @@ def run_rollup_workflow(
     category_rules_path: Optional[Path] = None,
     env_path: Optional[Path] = None,
     category_matcher=None,
+    output_mode: str = "full",
+    enable_deepseek: bool = True,
+    enable_external_context: bool = True,
 ) -> WorkflowResult:
     from .dashboard import load_dashboard_items_for_batch
 
@@ -356,6 +393,7 @@ def run_rollup_workflow(
     canonical = canonical.drop(columns=[column for column in canonical.columns if column.startswith("batch_")], errors="ignore")
 
     batch_id = period_result_id(period)
+    ui_only = output_mode == "ui_only"
     processed_dir = Path(processed_root) / source_storage_key(period) / batch_id
     _replace_directory(processed_dir)
     (processed_dir / "rollup_manifest.json").write_text(
@@ -386,7 +424,7 @@ def run_rollup_workflow(
         period.period_end,
         category_rules_path,
         env_path=env_path,
-        category_matcher=category_matcher,
+        category_matcher=category_matcher if enable_deepseek else _no_category_matches,
         category_mappings=category_mappings,
         douyin_id_bridge=douyin_id_bridge,
     )
@@ -397,57 +435,80 @@ def run_rollup_workflow(
         channel_comparison = build_channel_comparison(analysis.total_summary, previous_summary)
         comparison_note = ""
 
-    external_context = fetch_external_context(period.data_start, period.data_end) if resolve_deepseek_settings(env_path).configured else None
-    ai_summary = generate_ai_summary(
-        analysis.total_summary,
-        analysis.category_summary,
-        analysis.top_content_items,
-        analysis.account_audit,
-        channel_comparison,
-        comparison_note,
+    settings = resolve_deepseek_settings(env_path)
+    external_context = (
+        fetch_external_context(period.data_start, period.data_end)
+        if enable_deepseek and enable_external_context and settings.configured
+        else None
+    )
+    if enable_deepseek:
+        ai_summary = generate_ai_summary(
+            analysis.total_summary,
+            analysis.category_summary,
+            analysis.top_content_items,
+            analysis.account_audit,
+            channel_comparison,
+            comparison_note,
+            env_path=env_path,
+            platform_summary=analysis.platform_summary,
+            platform_category_summary=analysis.platform_category_summary,
+            external_context=external_context,
+        )
+    else:
+        ai_summary = generate_local_summary(
+            analysis.total_summary,
+            analysis.platform_summary,
+            channel_comparison,
+            external_context,
+        )
+    ai_provider = "deepseek" if enable_deepseek and settings.configured else "local"
+    ai_model = settings.model if ai_provider == "deepseek" else ""
+    topic_label_items = build_topic_label_frame(
+        analysis.canonical,
         env_path=env_path,
-        platform_summary=analysis.platform_summary,
-        platform_category_summary=analysis.platform_category_summary,
-        external_context=external_context,
+        topic_labeler=_no_topic_labels if not enable_deepseek else None,
     )
-    topic_label_items = build_topic_label_frame(analysis.canonical, env_path=env_path)
     output_dir = Path(output_root) / batch_id
-    _replace_directory(output_dir)
-    report_html, analysis_xlsx, canonical_csv, total_summary_xlsx = write_outputs(
-        output_dir,
-        period.period_start,
-        period.period_end,
-        analysis.canonical,
-        analysis.category_summary,
-        analysis.channel_summary,
-        analysis.platform_summary,
-        analysis.platform_category_summary,
-        analysis.total_summary,
-        analysis.raw_category_stats,
-        analysis.pending_categories,
-        analysis.account_audit,
-        analysis.top_content_items,
-        analysis.cover_metrics,
-        analysis.data_quality,
-        analysis.review_queue,
-        analysis.preprocessing_report,
-        analysis.duplicate_merge_details,
-        analysis.conflict_retention_details,
-        analysis.missing_value_details,
-        analysis.reference_tables.tables,
-        channel_comparison,
-        comparison_note,
-        ai_summary,
-        account_filter_rules=analysis.account_filter_rules,
-        account_filter_details=analysis.account_filter_details,
-    )
-    channel_clean_workbooks = write_channel_clean_workbooks(
-        analysis.canonical,
-        output_dir,
-        period_label=period.period_label,
-        period_start=period.period_start,
-        period_end=period.period_end,
-    )
+    if ui_only:
+        report_html = analysis_xlsx = canonical_csv = total_summary_xlsx = None
+        channel_clean_workbooks = []
+    else:
+        _replace_directory(output_dir)
+        report_html, analysis_xlsx, canonical_csv, total_summary_xlsx = write_outputs(
+            output_dir,
+            period.period_start,
+            period.period_end,
+            analysis.canonical,
+            analysis.category_summary,
+            analysis.channel_summary,
+            analysis.platform_summary,
+            analysis.platform_category_summary,
+            analysis.total_summary,
+            analysis.raw_category_stats,
+            analysis.pending_categories,
+            analysis.account_audit,
+            analysis.top_content_items,
+            analysis.cover_metrics,
+            analysis.data_quality,
+            analysis.review_queue,
+            analysis.preprocessing_report,
+            analysis.duplicate_merge_details,
+            analysis.conflict_retention_details,
+            analysis.missing_value_details,
+            analysis.reference_tables.tables,
+            channel_comparison,
+            comparison_note,
+            ai_summary,
+            account_filter_rules=analysis.account_filter_rules,
+            account_filter_details=analysis.account_filter_details,
+        )
+        channel_clean_workbooks = write_channel_clean_workbooks(
+            analysis.canonical,
+            output_dir,
+            period_label=period.period_label,
+            period_start=period.period_start,
+            period_end=period.period_end,
+        )
     persist_workflow_result(
         db_path,
         batch_id,
@@ -476,6 +537,8 @@ def run_rollup_workflow(
         ai_summary,
         previous_batch_id,
         comparison_note,
+        ai_provider=ai_provider,
+        ai_model=ai_model,
         period_level=period.period_level,
         period_key=period.period_key,
         period_label=period.period_label,
@@ -565,6 +628,14 @@ def _replace_directory(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _no_category_matches(items, category_library, env_path):
+    return {}
+
+
+def _no_topic_labels(items, env_path):
+    return {}
 
 
 def _empty_frame():

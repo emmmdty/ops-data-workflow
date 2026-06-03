@@ -29,13 +29,14 @@ class SourceStorageTests(unittest.TestCase):
             week = review_period_from_dates(date(2026, 4, 3), date(2026, 4, 9), PERIOD_LEVEL_WEEK)
 
             self.assertEqual(source_dir_for_period(data_root, month), data_root / "months" / "202605")
-            self.assertEqual(source_dir_for_period(data_root, week), data_root / "weeks" / "202604w1")
+            self.assertEqual(source_dir_for_period(data_root, week), data_root / "weeks" / "20260403-20260409")
 
     def test_source_period_from_path_parses_internal_layout_without_raw_compatibility(self):
         with TemporaryDirectory() as tmp:
             data_root = Path(tmp) / "data"
             month_dir = data_root / "months" / "202605"
-            week_dir = data_root / "weeks" / "202604w1"
+            week_dir = data_root / "weeks" / "20260403-20260409"
+            legacy_week_dir = data_root / "weeks" / "202604w1"
             raw_dir = data_root / "raw" / "20260403-20260409"
 
             month = source_period_from_path(month_dir)
@@ -50,20 +51,23 @@ class SourceStorageTests(unittest.TestCase):
             self.assertEqual(week.period_start, "2026-04-03")
             self.assertEqual(week.period_end, "2026-04-09")
             with self.assertRaises(ValueError):
+                source_period_from_path(legacy_week_dir)
+            with self.assertRaises(ValueError):
                 source_period_from_path(raw_dir)
 
     def test_discover_source_period_dirs_only_scans_raw_input_layout(self):
         with TemporaryDirectory() as tmp:
             data_root = Path(tmp) / "data"
             _write_source_file(data_root / "months" / "202605" / "小红书.xlsx")
-            _write_source_file(data_root / "weeks" / "202604w1" / "B站.xlsx")
+            _write_source_file(data_root / "weeks" / "20260403-20260409" / "B站.xlsx")
+            _write_source_file(data_root / "weeks" / "202604w1" / "旧周目录.xlsx")
             _write_source_file(data_root / "raw" / "20260403-20260409" / "旧路径.xlsx")
             _write_source_file(data_root / "reference" / "原生内容投稿-20260527.xlsx")
 
             periods = discover_source_period_dirs(data_root)
 
             self.assertEqual([period.path for period in periods], [
-                data_root / "weeks" / "202604w1",
+                data_root / "weeks" / "20260403-20260409",
                 data_root / "months" / "202605",
             ])
 
