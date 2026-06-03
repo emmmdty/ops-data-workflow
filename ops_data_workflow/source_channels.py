@@ -53,12 +53,12 @@ def social_channel_from_name(value: object, *, profiles: ChannelProfileConfig | 
 
 def social_platform_from_name(value: object, *, profiles: ChannelProfileConfig | None = None) -> str:
     compact = _compact_source_name(value)
-    configured = (profiles or load_channel_profiles()).platform_from_name(compact)
-    if configured:
-        return configured
     for platform in SOCIAL_PLATFORM_KEYWORDS:
         if platform in compact:
             return platform
+    configured_channel = (profiles or load_channel_profiles()).infer_channel_from_name(compact)
+    if configured_channel in {SOCIAL_MARKET_CHANNEL, SOCIAL_COMMERCIAL_CHANNEL}:
+        return SOCIAL_PLATFORM_GROUP
     return ""
 
 

@@ -5,7 +5,7 @@ import unittest
 import yaml
 
 from ops_data_workflow.channel_profiles import load_channel_profiles, render_channel_profiles_table
-from ops_data_workflow.source_channels import infer_channel_from_path, social_platform_from_name
+from ops_data_workflow.source_channels import infer_channel_from_path
 
 
 class ChannelProfileConfigTests(unittest.TestCase):
@@ -82,7 +82,7 @@ class ChannelProfileConfigTests(unittest.TestCase):
             profiles = load_channel_profiles(config_path)
 
             self.assertEqual(infer_channel_from_path("KS市场-周报.xlsx", config_path=config_path), "快手市场部")
-            self.assertEqual(social_platform_from_name("快手投放", profiles=profiles), "快手")
+            self.assertEqual(profiles.field_aliases_for_channel("快手市场部"), {"标题": ["作品标题"], "消耗": ["花费"]})
 
     def test_disabled_profiles_do_not_match_filenames(self):
         with TemporaryDirectory() as tmp:
