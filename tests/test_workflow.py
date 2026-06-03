@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pandas as pd
 from openpyxl import load_workbook
 
+from ops_data_workflow.channel_clean import write_unified_channel_clean_workbook
 from ops_data_workflow.workflow import refresh_historical_source_periods, run_archived_workflow, run_workflow
 from ops_data_workflow.pipeline import analyze_canonical_frame, analyze_input_dir
 from ops_data_workflow.reference_tables import account_mapping_lookup, load_reference_tables, parse_period_from_raw_dir
@@ -142,6 +143,127 @@ def _looks_like_english_field_name(value: object) -> bool:
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_unified_channel_clean_workbook_writes_channel_and_system_sheets(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "processed"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-07",
+                        "channel": "小红书商业化",
+                        "platform": "小红书",
+                        "platform_group": "小红书",
+                        "account": "同花顺投资",
+                        "account_raw": "同花顺投资原始",
+                        "content_form": "图文",
+                        "content_category": "热点行情",
+                        "title": "小红书内容",
+                        "content_id": "note-1",
+                        "material_id": "mat-xhs",
+                        "content_url": "https://xhs.example/note-1",
+                        "source_time": "2026-04-02",
+                        "spend": 100,
+                        "impressions": 1000,
+                        "clicks": 100,
+                        "activations": 10,
+                        "first_pay_count": 2,
+                        "activation_cost": 10,
+                        "first_pay_cost": 50,
+                        "metadata_source": "xhs_public",
+                        "metadata_confidence": 0.8,
+                        "review_status": "待审核",
+                        "review_reasons": "内容类型缺失",
+                        "raw__小红书商业化__7日付费率": 0.2,
+                    },
+                    {
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-07",
+                        "channel": "B站",
+                        "platform": "B站",
+                        "platform_group": "B站",
+                        "account": "同花顺投资",
+                        "content_form": "视频",
+                        "manual_category": "投教",
+                        "title": "B站内容",
+                        "content_id": "BV1abc",
+                        "content_url": "https://www.bilibili.com/video/BV1abc/",
+                        "spend": 80,
+                        "raw__B站__播放完成率": 0.61,
+                    },
+                ]
+            )
+
+            workbook_path = write_unified_channel_clean_workbook(
+                canonical,
+                output_dir,
+                period_label="2026-04-01 至 2026-04-07",
+                batch_id="batch-a",
+                import_log=pd.DataFrame([{"source_file": "小红书商业化.xlsx", "status": "imported"}]),
+                duplicate_content=pd.DataFrame([{"dedupe_key": "note-1", "rows": 2}]),
+                conflicts=pd.DataFrame([{"issue_type": "同ID标题冲突", "content_id": "note-1"}]),
+                fill_sources=pd.DataFrame(
+                    [
+                        {
+                            "batch_id": "batch-a",
+                            "channel": "小红书商业化",
+                            "content_id": "note-1",
+                            "field_name": "title",
+                            "source": "xhs_public",
+                            "confidence": 0.8,
+                            "status": "filled",
+                        }
+                    ]
+                ),
+                review_records=pd.DataFrame([{"content_id": "note-1", "action": "待审核"}]),
+            )
+
+            self.assertEqual(workbook_path, output_dir / "cleaned_channels.xlsx")
+            workbook = load_workbook(workbook_path, read_only=True)
+            self.assertEqual(
+                workbook.sheetnames,
+                ["小红书商业化", "B站", "导入日志", "重复内容", "冲突项", "补齐来源", "审核记录"],
+            )
+            workbook.close()
+
+            xhs = pd.read_excel(workbook_path, sheet_name="小红书商业化")
+            self.assertEqual(
+                list(xhs.columns[:24]),
+                [
+                    "周期",
+                    "渠道",
+                    "平台",
+                    "账号",
+                    "原始账号",
+                    "内容形式",
+                    "内容类型",
+                    "标题",
+                    "内容ID",
+                    "素材ID",
+                    "唯一标识",
+                    "内容链接",
+                    "发布时间",
+                    "消耗",
+                    "曝光量",
+                    "点击量",
+                    "激活数",
+                    "付费数",
+                    "激活成本",
+                    "付费成本",
+                    "补齐来源",
+                    "补齐置信度",
+                    "复核状态",
+                    "复核原因",
+                ],
+            )
+            self.assertIn("原始字段__7日付费率", xhs.columns)
+            self.assertEqual(xhs.iloc[0]["周期"], "2026-04-01 至 2026-04-07")
+            self.assertEqual(xhs.iloc[0]["唯一标识"], "note-1")
+            self.assertAlmostEqual(float(xhs.iloc[0]["原始字段__7日付费率"]), 0.2)
+
+            fill_sources = pd.read_excel(workbook_path, sheet_name="补齐来源")
+            self.assertEqual(list(fill_sources["batch_id"]), ["batch-a"])
+
     def test_workflow_writes_channel_clean_workbooks_with_required_columns(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -1723,6 +1845,8 @@ xiaohongshu:
 
             self.assertTrue(reviewed_batches)
             self.assertTrue((result.archive_dir / "cleaned.xlsx").exists())
+            self.assertEqual(result.cleaned_channels_workbook, result.archive_dir / "cleaned_channels.xlsx")
+            self.assertTrue(result.cleaned_channels_workbook.exists())
             self.assertIsNone(result.report_html)
             self.assertIsNone(result.analysis_xlsx)
             self.assertIsNone(result.canonical_csv)
