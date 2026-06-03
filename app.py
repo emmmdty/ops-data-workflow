@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import html
+import json
 from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -75,7 +76,7 @@ from ops_data_workflow.topic_analysis import (
     summarize_persisted_topic_labels,
 )
 from ops_data_workflow.upload_input import detect_upload_channel_conflicts, infer_period_from_upload_names, materialize_uploaded_files
-from ops_data_workflow.workflow import run_archived_workflow, run_rollup_workflow
+from ops_data_workflow.workflow import refresh_historical_source_periods, run_archived_workflow, run_rollup_workflow
 
 
 APP_DATA_ROOT = Path("data")
@@ -638,6 +639,17 @@ def _store_artifacts(result) -> None:
     st.session_state["channel_comparison"] = result.channel_comparison
     st.session_state["comparison_note"] = result.comparison_note
     st.session_state["ai_summary"] = result.ai_summary
+    st.session_state["metadata_enrichment_summary"] = _load_metadata_enrichment_summary(result.archive_dir)
+
+
+def _load_metadata_enrichment_summary(archive_dir: Path) -> dict:
+    manifest_path = Path(archive_dir) / "period_manifest.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    summary = payload.get("metadata_enrichment")
+    return summary if isinstance(summary, dict) else {}
 
 
 def _ensure_generate_period_defaults() -> None:
@@ -1676,7 +1688,14 @@ def _page_generate() -> None:
             )
         else:
             st.session_state["overwrite_existing_channels"] = False
+        enable_metadata_enrichment = st.checkbox(
+            "尝试自动补充公开信息",
+            value=False,
+            key="enable_metadata_enrichment",
+            help="仅使用低风险公开信息：B站缓存/公开接口；抖音/小红书链接和ID推导。不会覆盖 Excel 已有字段，仅高消耗冲突或内容ID冲突进入人工复核。",
+        )
         generate = st.button("生成本周期数据", type="primary", width="stretch")
+        refresh_history = st.button("重算历史批次并补充公开信息", width="stretch")
 
     if generate:
         if not uploaded:
@@ -1692,9 +1711,16 @@ def _page_generate() -> None:
                     period_start,
                     period_end,
                     overwrite_existing_channels=overwrite_existing_channels,
+                    metadata_enrichment_mode="safe_public" if enable_metadata_enrichment else "off",
                 )
             except Exception as exc:
                 st.error(f"生成失败：{exc}")
+
+    if refresh_history:
+        try:
+            _run_historical_refresh_with_progress()
+        except Exception as exc:
+            st.error(f"历史批次重算失败：{exc}")
 
     _render_rollup_generator()
 
@@ -1703,12 +1729,35 @@ def _page_generate() -> None:
     else:
         st.info("可点击选择目录，或把多个 CSV / Excel / ZIP 拖入上传区；目录上传会保留子目录结构。")
 
+
+def _run_historical_refresh_with_progress():
+    with st.status("正在重算历史批次", expanded=True) as status:
+        results = refresh_historical_source_periods(
+            data_root=APP_DATA_ROOT,
+            processed_root=APP_PROCESSED,
+            output_root=APP_OUTPUTS,
+            db_path=APP_DB,
+            metadata_cache_dir=APP_DATA_ROOT / "metadata_cache",
+            env_path=ENV_PATH,
+            reference_root=APP_DATA_ROOT / "reference",
+        )
+        if not results:
+            st.session_state["historical_refresh_summary"] = "未找到可重算的历史原始数据目录。"
+            status.update(label="未找到可重算的历史原始数据目录", state="complete", expanded=False)
+            return []
+        latest = results[-1]
+        _store_artifacts(latest)
+        st.session_state["historical_refresh_summary"] = f"已重算 {len(results)} 个历史批次，并启用公开信息补充。"
+        status.update(label=st.session_state["historical_refresh_summary"], state="complete", expanded=False)
+        return results
+
 def _run_with_generation_progress(
     uploaded,
     period_start: date,
     period_end: date,
     *,
     overwrite_existing_channels: bool = False,
+    metadata_enrichment_mode: str = "off",
 ):
     with st.status(GENERATION_PROGRESS_STEPS[0], expanded=True) as status:
         progress_bar = st.progress(0, text=GENERATION_PROGRESS_STEPS[0])
@@ -1755,6 +1804,8 @@ def _run_with_generation_progress(
                         output_mode="ui_only",
                         enable_deepseek=True,
                         enable_external_context=False,
+                        metadata_enrichment_mode=metadata_enrichment_mode,
+                        metadata_cache_dir=APP_DATA_ROOT / "metadata_cache",
                     )
                 assert result is not None
             else:
@@ -1790,6 +1841,8 @@ def _run_with_generation_progress(
                     output_mode="ui_only",
                     enable_deepseek=True,
                     enable_external_context=False,
+                    metadata_enrichment_mode=metadata_enrichment_mode,
+                    metadata_cache_dir=APP_DATA_ROOT / "metadata_cache",
                 )
             _store_artifacts(result)
             progress_bar.progress(100, text="页面数据生成完成")
@@ -2729,6 +2782,9 @@ def _render_short_table_blocks(frame: pd.DataFrame, label: str, rows_per_block: 
 def _display_generation_results() -> None:
     total_summary: pd.DataFrame = st.session_state["total_summary"]
     st.success(f"数据清洗并入库完成，周期标识：{st.session_state['batch_id']}")
+    if st.session_state.get("historical_refresh_summary"):
+        st.success(str(st.session_state["historical_refresh_summary"]))
+    _render_metadata_enrichment_summary(st.session_state.get("metadata_enrichment_summary", {}))
     st.subheader("总体核心指标")
     summary = build_dashboard_summary(st.session_state["platform_summary"])
     _render_kpis(summary)
@@ -2747,6 +2803,23 @@ def _display_generation_results() -> None:
         st.dataframe(localize_columns(st.session_state["platform_summary"]), width="stretch", hide_index=True)
 
     st.info("当前为页面数据模式：已保留清洗核验文件和页面展示数据，未生成下载产物或 AI 报告。")
+
+
+def _render_metadata_enrichment_summary(summary: dict) -> None:
+    if not summary or summary.get("mode") != "safe_public":
+        return
+    hint_rows = int(summary.get("hint_rows") or summary.get("conflict_rows") or 0)
+    metrics = [
+        ("自动补全行数", int(summary.get("filled_rows") or 0)),
+        ("记录提示行数", hint_rows),
+        ("高消耗需复核行数", int(summary.get("review_rows") or 0)),
+        ("公开接口失败行数", int(summary.get("error_rows") or 0)),
+    ]
+    st.caption(
+        "公开信息补充："
+        + "；".join(f"{label} {value}" for label, value in metrics)
+        + f"；缓存命中 {int(summary.get('cache_hits') or 0)}"
+    )
 
 
 def _render_kpis(summary) -> None:

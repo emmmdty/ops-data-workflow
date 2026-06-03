@@ -33,6 +33,7 @@ from .storage import (
     read_total_summary,
 )
 from .topic_analysis import build_topic_label_frame
+from .source_storage import discover_source_period_dirs
 
 
 def run_workflow(
@@ -141,6 +142,10 @@ def run_archived_workflow(
     enable_deepseek: bool = True,
     enable_external_context: bool = True,
     write_channel_clean: bool = True,
+    metadata_enrichment_mode: str = "off",
+    metadata_cache_dir: Path | None = None,
+    force_reclean: bool = False,
+    allow_public_api_metadata: bool = True,
 ) -> WorkflowResult:
     def progress(message: str) -> None:
         if progress_callback is not None:
@@ -165,7 +170,7 @@ def run_archived_workflow(
     input_dir = Path(input_dir)
     processed_dir = Path(processed_root) / source_storage_key(period) / batch_id
     progress("正在整理清洗产物")
-    existing_cleaned = cleaned_workbook_in_dir(input_dir)
+    existing_cleaned = None if force_reclean else cleaned_workbook_in_dir(input_dir)
     if existing_cleaned is not None:
         processed_dir = input_dir
         cleaned_workbook = existing_cleaned
@@ -179,6 +184,9 @@ def run_archived_workflow(
             output_dir=processed_dir,
             reference_root=reference_root,
             write_channel_clean=write_channel_clean and not ui_only,
+            metadata_enrichment_mode=metadata_enrichment_mode,
+            metadata_cache_dir=metadata_cache_dir,
+            allow_public_api_metadata=allow_public_api_metadata,
         )
         cleaned_workbook = cleaned_bucket.cleaned_workbook
         archived_files = _source_file_records(input_dir)
@@ -365,6 +373,47 @@ def run_archived_workflow(
         account_filter_rules=analysis.account_filter_rules,
         account_filter_details=analysis.account_filter_details,
     )
+
+
+def refresh_historical_source_periods(
+    *,
+    data_root: Path = Path("data"),
+    processed_root: Path = Path("processed"),
+    output_root: Path = Path("outputs"),
+    db_path: Path = Path(".runtime/workflow.sqlite3"),
+    metadata_cache_dir: Path | None = None,
+    env_path: Optional[Path] = None,
+    reference_root: Path | None = None,
+) -> list[WorkflowResult]:
+    """Rebuild all discovered source periods from raw Excel/CSV files."""
+    results: list[WorkflowResult] = []
+    for source_period in discover_source_period_dirs(data_root):
+        result = run_archived_workflow(
+            source_period.path,
+            source_period.period.period_start,
+            source_period.period.period_end,
+            output_root=output_root,
+            processed_root=processed_root,
+            db_path=db_path,
+            env_path=env_path,
+            reference_root=reference_root,
+            period_level=source_period.period.period_level,
+            period_key=source_period.period.period_key,
+            period_label=source_period.period.period_label,
+            data_start=source_period.period.data_start,
+            data_end=source_period.period.data_end,
+            source_type=source_period.period.source_type,
+            output_mode="ui_only",
+            enable_deepseek=False,
+            enable_external_context=False,
+            write_channel_clean=False,
+            metadata_enrichment_mode="safe_public",
+            metadata_cache_dir=metadata_cache_dir,
+            force_reclean=True,
+            allow_public_api_metadata=False,
+        )
+        results.append(result)
+    return results
 
 
 def run_rollup_workflow(

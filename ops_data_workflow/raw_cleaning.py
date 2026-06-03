@@ -16,6 +16,7 @@ import pandas as pd
 
 from .channel_clean import write_channel_clean_workbooks
 from .content_ledger import apply_content_ledger, load_content_ledger, load_latest_reference_ledger
+from .content_metadata import enrich_content_metadata
 from .field_mapping import load_field_mapping
 from .periods import ReviewPeriod, infer_review_period_from_text, period_raw_dir_name
 from .pipeline import (
@@ -161,6 +162,7 @@ def clean_source_directory(
         canonical = apply_content_ledger(canonical, ledger)
         preprocessing = _preprocess_canonical(canonical)
         cleaned = _mark_title_conflicts(preprocessing["canonical"])
+        metadata_stats = _empty_metadata_stats()
         cleaned = _ensure_cleaning_columns(cleaned)
         cleaned["review_action"] = cleaned["needs_manual_review"].map(
             lambda value: REVIEW_ACTION_PENDING if bool(value) else REVIEW_ACTION_KEEP
@@ -204,7 +206,15 @@ def clean_source_directory(
             import_log,
         )
         manifest_path = raw_dir / "period_manifest.json"
-        _write_manifest(manifest_path, period, cleaned_workbook, source_paths, ignored_frame, duplicate_file_frame)
+        _write_manifest(
+            manifest_path,
+            period,
+            cleaned_workbook,
+            source_paths,
+            ignored_frame,
+            duplicate_file_frame,
+            metadata_enrichment=metadata_stats,
+        )
         buckets.append(
             CleanedPeriodBucket(
                 review_period=period,
@@ -227,6 +237,11 @@ def clean_raw_period_dir(
     output_dir: Path | None = None,
     reference_root: Path | None = None,
     write_channel_clean: bool = True,
+    metadata_enrichment_mode: str = "off",
+    metadata_cache_dir: Path | None = None,
+    fetch_bilibili_metadata=None,
+    allow_public_api_metadata: bool = True,
+    resolve_douyin_shortlink=None,
 ) -> CleanedPeriodBucket:
     """Clean an already-materialized raw source directory into an output dir."""
     raw_dir = Path(raw_dir)
@@ -271,6 +286,16 @@ def clean_raw_period_dir(
     canonical["period_end"] = period.period_end
     canonical = _ensure_cleaning_columns(canonical)
     canonical = apply_content_ledger(canonical, ledger)
+    metadata_cache_dir = metadata_cache_dir or (clean_dir / ".metadata_cache")
+    canonical, metadata_stats = enrich_content_metadata(
+        canonical,
+        mode=metadata_enrichment_mode,
+        cache_dir=metadata_cache_dir,
+        fetch_bilibili=fetch_bilibili_metadata,
+        allow_public_api=allow_public_api_metadata,
+        resolve_douyin_shortlink=resolve_douyin_shortlink,
+    )
+    metadata_stats = {"mode": metadata_enrichment_mode, **metadata_stats}
     preprocessing = _preprocess_canonical(canonical)
     cleaned = _mark_title_conflicts(preprocessing["canonical"])
     cleaned = _ensure_cleaning_columns(cleaned)
@@ -308,7 +333,15 @@ def clean_raw_period_dir(
         import_log,
     )
     manifest_path = clean_dir / "period_manifest.json"
-    _write_manifest(manifest_path, period, cleaned_workbook, source_paths, ignored_frame, duplicate_file_frame)
+    _write_manifest(
+        manifest_path,
+        period,
+        cleaned_workbook,
+        source_paths,
+        ignored_frame,
+        duplicate_file_frame,
+        metadata_enrichment=metadata_stats,
+    )
     return CleanedPeriodBucket(
         review_period=period,
         raw_dir=raw_dir,
@@ -1132,6 +1165,7 @@ def _write_manifest(
     source_paths: list[str],
     ignored_sheets: pd.DataFrame,
     duplicate_files: pd.DataFrame,
+    metadata_enrichment: dict[str, int] | None = None,
 ) -> None:
     payload = {
         "period_level": period.period_level,
@@ -1148,8 +1182,22 @@ def _write_manifest(
         "source_paths": source_paths,
         "files": [cleaned_workbook.name],
         "cleaned_workbook": cleaned_workbook.name,
+        "metadata_enrichment": metadata_enrichment or _empty_metadata_stats(),
     }
     manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _empty_metadata_stats() -> dict[str, int | str]:
+    return {
+        "mode": "off",
+        "processed_rows": 0,
+        "filled_rows": 0,
+        "hint_rows": 0,
+        "conflict_rows": 0,
+        "review_rows": 0,
+        "error_rows": 0,
+        "cache_hits": 0,
+    }
 
 
 def _combine_period_metadata(periods: list[ReviewPeriod]) -> ReviewPeriod:

@@ -11,7 +11,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional
 import pandas as pd
 
 from .account_filters import apply_account_filters, load_account_filter_config
-from .categories import category_from_tags, load_category_rules, suggest_category
+from .categories import HIGH_SPEND_CATEGORY_RULES, category_from_tags, load_category_rules, suggest_category
 from .content_ledger import account_match_label, apply_content_ledger, load_content_ledger
 from .field_mapping import load_field_mapping, standardize_content_form, standardize_content_type
 from .reference_tables import (
@@ -1044,6 +1044,8 @@ def _complete_categories(
     if category_mappings:
         _apply_category_mappings(canonical, category_mappings)
 
+    _apply_high_spend_category_rules(canonical)
+
     still_missing = canonical["content_category"].map(_is_blank)
     canonical.loc[still_missing, "category_status"] = "未匹配"
     canonical.loc[~still_missing & canonical["category_status"].map(_is_blank), "category_status"] = "人工标记"
@@ -1166,6 +1168,34 @@ def _apply_tag_categories(canonical: pd.DataFrame, tag_category: pd.Series, has_
     canonical.loc[tag_scoped, "content_category"] = tag_category.loc[tag_scoped].astype(str).str.strip()
     canonical.loc[tag_scoped, "category_status"] = "TAG匹配"
     canonical.loc[tag_scoped, "category_confidence"] = 0.95
+
+
+def _apply_high_spend_category_rules(canonical: pd.DataFrame) -> None:
+    if canonical.empty or "channel" not in canonical.columns:
+        return
+    channel = canonical["channel"].fillna("").astype(str)
+    douyin = channel.str.contains("抖音", na=False)
+    missing = canonical["content_category"].map(_is_blank)
+    spend = pd.to_numeric(canonical.get("spend", pd.Series(0.0, index=canonical.index)), errors="coerce").fillna(0.0)
+    top_indexes: set[object] = set()
+    for _, group in canonical[douyin].groupby("channel", dropna=False, sort=False):
+        top_indexes.update(group.sort_values("spend", ascending=False).head(20).index)
+    high_spend = spend.ge(2000.0) | canonical.index.isin(top_indexes)
+    scoped = canonical[douyin & missing & high_spend]
+    if scoped.empty:
+        return
+    for index, row in scoped.iterrows():
+        text = " ".join(
+            str(row.get(column, "") or "")
+            for column in ["title", "metadata_tags", "category_l3", "manual_category", "ai_category"]
+        )
+        category = suggest_category(text, HIGH_SPEND_CATEGORY_RULES)
+        if not category:
+            continue
+        canonical.at[index, "ai_category"] = category
+        canonical.at[index, "content_category"] = category
+        canonical.at[index, "category_status"] = "高消耗规则匹配"
+        canonical.at[index, "category_confidence"] = 0.8
 
 
 def _tag_match_text_for_row(row: pd.Series) -> str:
@@ -1752,6 +1782,8 @@ def _summarize_top_content(canonical: pd.DataFrame) -> pd.DataFrame:
             rows.append(
                 {
                     "channel": channel,
+                    "content_id": item.get("content_id", ""),
+                    "material_id": item.get("material_id", ""),
                     "title": item.get("title", ""),
                     "account_id": item.get("account_id", ""),
                     "account": item.get("account", ""),
@@ -1768,6 +1800,14 @@ def _summarize_top_content(canonical: pd.DataFrame) -> pd.DataFrame:
                     "ctr": item.get("ctr", pd.NA),
                     "cover_url": item.get("cover_url", ""),
                     "content_url": item.get("content_url", ""),
+                    "source_time": item.get("source_time", ""),
+                    "metadata_source": item.get("metadata_source", ""),
+                    "metadata_confidence": item.get("metadata_confidence", pd.NA),
+                    "metadata_fetched_at": item.get("metadata_fetched_at", ""),
+                    "metadata_error": item.get("metadata_error", ""),
+                    "metadata_review_reason": item.get("metadata_review_reason", ""),
+                    "metadata_tags": item.get("metadata_tags", ""),
+                    "metadata_content_type_candidate": item.get("metadata_content_type_candidate", ""),
                     "performance_flag": _content_performance_flag(
                         item, spend_threshold, activation_median, cost_median
                     ),
@@ -1777,6 +1817,8 @@ def _summarize_top_content(canonical: pd.DataFrame) -> pd.DataFrame:
         rows,
         columns=[
             "channel",
+            "content_id",
+            "material_id",
             "title",
             "account_id",
             "account",
@@ -1793,6 +1835,14 @@ def _summarize_top_content(canonical: pd.DataFrame) -> pd.DataFrame:
             "ctr",
             "cover_url",
             "content_url",
+            "source_time",
+            "metadata_source",
+            "metadata_confidence",
+            "metadata_fetched_at",
+            "metadata_error",
+            "metadata_review_reason",
+            "metadata_tags",
+            "metadata_content_type_candidate",
             "performance_flag",
         ],
     )

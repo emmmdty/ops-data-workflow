@@ -105,6 +105,23 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("覆盖已存在渠道", generate_source)
         self.assertIn("overwrite_existing_channels", app_source)
 
+    def test_generate_page_can_enable_safe_public_metadata_enrichment(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_rollup_generator")]
+
+        self.assertIn("尝试自动补充公开信息", generate_source)
+        self.assertIn("enable_metadata_enrichment", generate_source)
+        self.assertIn('"safe_public" if enable_metadata_enrichment else "off"', generate_source)
+        self.assertIn("metadata_enrichment_mode=metadata_enrichment_mode", app_source)
+        self.assertIn("_render_metadata_enrichment_summary", app_source)
+        self.assertIn("自动补全行数", app_source)
+        self.assertIn("记录提示行数", app_source)
+        self.assertIn("高消耗需复核行数", app_source)
+        self.assertIn("公开接口失败行数", app_source)
+        self.assertIn("重算历史批次并补充公开信息", generate_source)
+        self.assertIn("refresh_historical_source_periods", app_source)
+        self.assertIn("historical_refresh_summary", app_source)
+
     def test_app_does_not_run_raw_sync_after_navigation_render(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
 
