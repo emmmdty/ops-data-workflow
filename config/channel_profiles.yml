@@ -1,0 +1,151 @@
+channels:
+  - channel: 小红书商业化
+    platform: 小红书
+    group: 小红书
+    filename_keywords:
+      - 小红书商业化
+      - 小红书投放
+      - 小红书
+    field_aliases:
+      title:
+        - 笔记标题
+      content_id:
+        - 笔记ID
+        - 笔记id
+      content_url:
+        - 笔记链接
+      account:
+        - 账号名称
+      manual_category:
+        - 内容类型
+      content_form:
+        - 内容形式
+    account_filter_enabled: true
+    active: true
+  - channel: 小红书市场部
+    platform: 小红书
+    group: 小红书
+    filename_keywords:
+      - 小红书市场部
+    field_aliases:
+      title:
+        - 笔记标题
+      content_id:
+        - 笔记ID
+        - 笔记id
+      content_url:
+        - 笔记链接
+      account:
+        - 账号名称
+      manual_category:
+        - 内容类型
+      content_form:
+        - 内容形式
+    account_filter_enabled: true
+    active: true
+  - channel: 抖音市场部
+    platform: 抖音
+    group: 抖音
+    filename_keywords:
+      - 抖音市场部
+    field_aliases:
+      title:
+        - 视频标题
+        - 作品标题
+      content_id:
+        - 视频id
+        - 作品ID
+      material_id:
+        - 素材ID
+      account:
+        - 账户名称
+      manual_category:
+        - 内容类型
+      content_form:
+        - 内容形式
+    account_filter_enabled: true
+    active: true
+  - channel: 抖音商业化
+    platform: 抖音
+    group: 抖音
+    filename_keywords:
+      - 抖音商业化
+      - 抖音投放
+      - 抖音
+    field_aliases:
+      title:
+        - 视频标题
+        - 作品标题
+      content_id:
+        - 视频id
+        - 作品ID
+      material_id:
+        - 素材ID
+      account:
+        - 账户名称
+      manual_category:
+        - 内容类型
+      content_form:
+        - 内容形式
+    account_filter_enabled: true
+    active: true
+  - channel: B站
+    platform: B站
+    group: B站
+    filename_keywords:
+      - B站
+      - bilibili
+      - 哔哩哔哩
+    field_aliases:
+      title:
+        - 视频标题
+      content_id:
+        - 视频BVID
+        - BV号
+      account:
+        - UP主
+      manual_category:
+        - 内容类型
+      content_form:
+        - 内容形式
+    account_filter_enabled: false
+    active: true
+  - channel: 微信市场部
+    platform: 微信
+    group: 微信
+    filename_keywords:
+      - 微信市场部
+      - 视频号市场部
+      - 腾讯市场部
+      - 微信
+      - 视频号
+      - 腾讯
+    field_aliases:
+      title:
+        - 创意名称
+      account:
+        - 账号名称
+      manual_category:
+        - 内容类型
+      content_form:
+        - 内容形式
+    account_filter_enabled: false
+    active: true
+  - channel: 微信商业化
+    platform: 微信
+    group: 微信
+    filename_keywords:
+      - 微信商业化
+      - 视频号商业化
+      - 腾讯商业化
+    field_aliases:
+      title:
+        - 创意名称
+      account:
+        - 账号名称
+      manual_category:
+        - 内容类型
+      content_form:
+        - 内容形式
+    account_filter_enabled: false
+    active: true

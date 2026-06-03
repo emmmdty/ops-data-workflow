@@ -47,6 +47,7 @@ from ops_data_workflow.dashboard import (
 )
 from ops_data_workflow.reporting import format_display_number, localize_columns, localize_and_sort_columns
 from ops_data_workflow.account_filters import load_account_filter_config
+from ops_data_workflow.channel_profiles import load_channel_profiles, render_channel_profiles_table
 from ops_data_workflow.reference_tables import load_reference_tables
 from ops_data_workflow.raw_sync import sync_raw_periods
 from ops_data_workflow.periods import PERIOD_LEVEL_LABELS, PERIOD_LEVELS, PERIOD_LEVEL_MONTH, PERIOD_LEVEL_WEEK, SOURCE_TYPE_UPLOAD, review_period_from_dates
@@ -2131,7 +2132,11 @@ def _review_issue_priority(value: object) -> int:
 def _page_reference_tables() -> None:
     _render_section_shell("􀉉", "维护台账", "查看本地映射表和处理规则，确认账号与字段口径。")
     st.title("维护台账")
-    st.caption("查看本地 reference_tables.xlsx 和 account_filters.yml 中的字段、账号映射和统计过滤口径。")
+    st.caption("查看本地 reference_tables.xlsx、channel_profiles.yml 和 account_filters.yml 中的字段、账号映射和统计过滤口径。")
+    channel_profiles = load_channel_profiles(Path("config/channel_profiles.yml"))
+    with st.expander("渠道配置说明", expanded=True):
+        st.markdown("渠道识别来自 config/channel_profiles.yml；文件名关键词用于识别上传渠道，字段别名优先于通用字段映射。")
+        st.dataframe(render_channel_profiles_table(channel_profiles), width="stretch", hide_index=True)
     account_filters = load_account_filter_config(Path("config/account_filters.yml"))
     with st.expander("账号过滤配置", expanded=True):
         st.dataframe(localize_columns(account_filters.to_frame()), width="stretch", hide_index=True)
