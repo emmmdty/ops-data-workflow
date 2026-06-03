@@ -1493,11 +1493,142 @@ xiaohongshu:
             market = result.canonical[result.canonical["channel"].eq("抖音市场部")].iloc[0]
             self.assertEqual(commercial["merged_row_count"], 2)
             self.assertAlmostEqual(commercial["spend"], 220.0)
-            self.assertAlmostEqual(commercial["impressions"], 1000.0)
+            self.assertAlmostEqual(commercial["impressions"], 2005.0)
             self.assertTrue(commercial["needs_manual_review"])
             self.assertIn("数值冲突", commercial["review_reasons"])
             self.assertIn("spend", commercial["conflict_details"])
             self.assertEqual(market["merged_row_count"], 1)
+
+    def test_channel_dedupe_prefers_id_then_url_then_title_and_recomputes_rates(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-stable-1",
+                    "content_url": "https://www.douyin.com/video/dy-stable-1",
+                    "title": "同 ID 原始标题",
+                    "account": "投资号",
+                    "manual_category": "热点行情",
+                    "spend": 100,
+                    "impressions": 1000,
+                    "clicks": 100,
+                    "activations": 10,
+                    "first_pay_count": 2,
+                    "source_file": "a.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-stable-1",
+                    "content_url": "https://www.douyin.com/video/dy-stable-1?share_token=abc",
+                    "title": "同 ID 补充标题 #投教",
+                    "account": "财经号",
+                    "manual_category": "热点行情",
+                    "spend": 100,
+                    "impressions": 1000,
+                    "clicks": 100,
+                    "activations": 10,
+                    "first_pay_count": 2,
+                    "source_file": "b.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "content_url": "https://www.douyin.com/video/7291234567890123456?foo=1",
+                    "title": "链接行标题 A",
+                    "account": "投资号",
+                    "manual_category": "热点行情",
+                    "spend": 30,
+                    "impressions": 300,
+                    "clicks": 30,
+                    "activations": 3,
+                    "first_pay_count": 1,
+                    "source_file": "c.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "content_url": "https://www.douyin.com/video/7291234567890123456/",
+                    "title": "链接行标题 B #补充",
+                    "account": "财经号",
+                    "manual_category": "热点行情",
+                    "spend": 40,
+                    "impressions": 400,
+                    "clicks": 40,
+                    "activations": 4,
+                    "first_pay_count": 1,
+                    "source_file": "d.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "content_url": "",
+                    "title": " 标题  兜底 合并 ",
+                    "account": "投资号",
+                    "manual_category": "热点行情",
+                    "spend": 10,
+                    "impressions": 100,
+                    "clicks": 10,
+                    "activations": 1,
+                    "first_pay_count": 0,
+                    "source_file": "e.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "content_url": "",
+                    "title": "标题兜底合并",
+                    "account": "财经号",
+                    "manual_category": "热点行情",
+                    "spend": 15,
+                    "impressions": 150,
+                    "clicks": 15,
+                    "activations": 2,
+                    "first_pay_count": 1,
+                    "source_file": "f.csv",
+                },
+            ]
+        )
+
+        with TemporaryDirectory() as tmp:
+            result = analyze_canonical_frame(
+                frame,
+                "2026-04-01",
+                "2026-04-27",
+                category_matcher=lambda items, category_library, env_path: {},
+                reference_tables_path=Path(tmp) / "reference_tables.xlsx",
+            )
+
+            self.assertEqual(len(result.canonical), 3)
+            by_key = result.canonical.set_index("dedupe_key")
+            id_row = by_key.loc["抖音商业化::id::dy-stable-1"]
+            self.assertEqual(id_row["merged_row_count"], 2)
+            self.assertEqual(id_row["title"], "同 ID 补充标题 #投教")
+            self.assertAlmostEqual(id_row["spend"], 200.0)
+            self.assertAlmostEqual(id_row["impressions"], 2000.0)
+            self.assertAlmostEqual(id_row["activation_cost"], 10.0)
+            self.assertAlmostEqual(id_row["first_pay_rate"], 0.2)
+            self.assertIn("同ID标题不一致", id_row["review_reasons"])
+            self.assertIn("title", id_row["conflict_details"])
+
+            url_row = by_key.loc["抖音商业化::url::https://www.douyin.com/video/7291234567890123456"]
+            self.assertEqual(url_row["merged_row_count"], 2)
+            self.assertAlmostEqual(url_row["spend"], 70.0)
+
+            title_row = by_key.loc["抖音商业化::title::标题兜底合并"]
+            self.assertEqual(title_row["merged_row_count"], 2)
+            self.assertAlmostEqual(title_row["spend"], 25.0)
 
     def test_generic_excel_is_treated_as_channel_from_file_name(self):
         with TemporaryDirectory() as tmp:

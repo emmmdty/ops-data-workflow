@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 import re
 from typing import Callable, Dict, Iterable, List, Mapping, Optional
+from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 
@@ -619,7 +620,16 @@ def _preprocess_canonical(canonical: pd.DataFrame) -> dict[str, pd.DataFrame]:
         ),
         "conflict_retention_details": pd.DataFrame(
             conflict_rows,
-            columns=["dedupe_key", "channel", "content_id", "column", "values", "action", "relative_difference"],
+            columns=[
+                "dedupe_key",
+                "channel",
+                "content_id",
+                "column",
+                "values",
+                "action",
+                "relative_difference",
+                "issue_type",
+            ],
         ),
         "missing_value_details": missing_details,
     }
@@ -630,16 +640,15 @@ def _dedupe_key(row: pd.Series) -> str:
     content_id = "" if _is_blank(row.get("content_id")) else str(row.get("content_id")).strip()
     if not channel:
         return ""
-    if _uses_content_id_only_dedupe(row):
-        return f"{channel}::id::{content_id}" if content_id else ""
-    account = account_match_label(channel, row.get("account", ""))
-    account_part = f"account::{account}::" if account else ""
     if content_id:
-        return f"{channel}::{account_part}id::{content_id}"
+        return f"{channel}::id::{content_id}"
+    content_url = _normalized_content_url_key(row.get("content_url", ""))
+    if content_url:
+        return f"{channel}::url::{content_url}"
     title = normalized_title_key(row.get("title", ""))
     if not title:
         return ""
-    return f"{channel}::{account_part}title::{title}"
+    return f"{channel}::title::{title}"
 
 
 def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[str, object]]]:
@@ -651,8 +660,8 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
     if len(group) == 1:
         return merged, conflicts
 
-    content_id_only_dedupe = _uses_content_id_only_dedupe(merged)
-    exact_cross_sheet_duplicate = content_id_only_dedupe and _is_exact_cross_sheet_duplicate(group)
+    dedupe_kind = _dedupe_kind(str(merged.get("dedupe_key", "")))
+    exact_cross_sheet_duplicate = _is_exact_cross_sheet_duplicate(group)
     review_conflict_columns: list[str] = []
     for column in NUMERIC_COLUMNS:
         values = pd.to_numeric(group[column], errors="coerce").dropna()
@@ -662,19 +671,14 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
         if exact_cross_sheet_duplicate:
             merged[column] = float(values.iloc[0])
             continue
-        if content_id_only_dedupe:
-            merged[column] = float(values.sum())
-            continue
+        merged[column] = float(values.sum())
         unique_values = list(dict.fromkeys(float(value) for value in values))
         if len(unique_values) <= 1:
-            merged[column] = unique_values[0]
             continue
         relative_difference = _relative_difference(unique_values)
         if relative_difference > 0.05:
-            merged[column] = float(sum(unique_values))
             action = "sum"
         else:
-            merged[column] = unique_values[0]
             action = "first_non_blank"
             review_conflict_columns.append(column)
         conflicts.append(
@@ -694,7 +698,7 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
             continue
         if column == "dedupe_key":
             merged[column] = group[column].iloc[0]
-        elif column == "title" and content_id_only_dedupe:
+        elif column == "title":
             merged[column] = _preferred_content_title(group[column])
         else:
             merged[column] = _first_non_blank_value(group[column])
@@ -706,7 +710,26 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
         for value in group.get("conflict_details", pd.Series(dtype=object)).tolist()
         if not _is_blank(value)
     ]
-    if content_id_only_dedupe and _has_different_base_titles(group.get("title", pd.Series(dtype=object))):
+    text_conflicts = _duplicate_text_conflicts(group, dedupe_kind)
+    if text_conflicts:
+        existing_conflicts.extend(text_conflicts["details"])
+        existing_reasons.extend(text_conflicts["reasons"])
+        merged["needs_manual_review"] = True
+        for detail, reason in zip(text_conflicts["details"], text_conflicts["reasons"]):
+            column, _, values = detail.partition("=")
+            conflicts.append(
+                {
+                    "dedupe_key": merged.get("dedupe_key", ""),
+                    "channel": merged.get("channel", ""),
+                    "content_id": merged.get("content_id", ""),
+                    "column": column,
+                    "values": values,
+                    "action": "manual_review",
+                    "relative_difference": "",
+                    "issue_type": reason,
+                }
+            )
+    if dedupe_kind == "id" and _has_different_base_titles(group.get("title", pd.Series(dtype=object))):
         existing_reasons.append("同ID标题不一致")
     if review_conflict_columns:
         existing_conflicts.extend(f"{item['column']}={item['values']}->{item['action']}" for item in conflicts)
@@ -720,6 +743,71 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
     merged["conflict_details"] = "; ".join(dict.fromkeys(existing_conflicts))
     merged["review_reasons"] = "；".join(dict.fromkeys(reason for reason in existing_reasons if reason))
     return merged, conflicts
+
+
+def _dedupe_kind(dedupe_key: str) -> str:
+    if "::id::" in dedupe_key:
+        return "id"
+    if "::url::" in dedupe_key:
+        return "url"
+    if "::title::" in dedupe_key:
+        return "title"
+    return ""
+
+
+def _normalized_content_url_key(value: object) -> str:
+    text = "" if _is_blank(value) else str(value).strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.netloc:
+        return text.rstrip("/")
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    path = re.sub(r"/+", "/", parsed.path or "").rstrip("/")
+    return urlunparse((scheme, netloc, path, "", "", ""))
+
+
+def _duplicate_text_conflicts(group: pd.DataFrame, dedupe_kind: str) -> dict[str, list[str]]:
+    details: list[str] = []
+    reasons: list[str] = []
+    title_values = _distinct_text_values(group.get("title", pd.Series(dtype=object)), key_func=normalized_title_key)
+    if dedupe_kind == "id" and len(title_values) > 1:
+        details.append(f"title={' | '.join(title_values)}->preferred")
+        reasons.append("同ID标题不一致")
+    url_values = _distinct_text_values(group.get("content_url", pd.Series(dtype=object)), key_func=_normalized_content_url_key)
+    if dedupe_kind == "title" and len(url_values) > 1:
+        details.append(f"content_url={' | '.join(url_values)}->first_non_blank")
+        reasons.append("同标题多链接")
+    content_type_values: list[str] = []
+    for column in ["manual_category", "content_form", "content_category"]:
+        if column not in group.columns:
+            continue
+        values = _distinct_text_values(group[column])
+        if len(values) > 1:
+            details.append(f"{column}={' | '.join(values)}->first_non_blank")
+            content_type_values.extend(values)
+    if content_type_values:
+        reasons.append("内容类型冲突")
+    return {
+        "details": list(dict.fromkeys(details)),
+        "reasons": list(dict.fromkeys(reasons)),
+    }
+
+
+def _distinct_text_values(series: pd.Series, *, key_func: Callable[[object], str] | None = None) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in series.tolist():
+        if _is_blank(value):
+            continue
+        text = str(value).strip()
+        key = key_func(value) if key_func else text
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        values.append(text)
+    return values
 
 
 def _is_exact_cross_sheet_duplicate(group: pd.DataFrame) -> bool:

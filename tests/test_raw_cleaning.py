@@ -463,7 +463,7 @@ class RawCleaningTests(unittest.TestCase):
             self.assertEqual(len(duplicate_content), 2)
             self.assertEqual(set(duplicate_content["merged_row_count"]), {2})
             conflicts = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="冲突项")
-            self.assertTrue(conflicts.empty)
+            self.assertIn("数值冲突", set(conflicts["issue_type"]))
 
     def test_clean_source_directory_sums_bilibili_impression_aliases(self):
         with TemporaryDirectory() as tmp:

@@ -763,7 +763,7 @@ def _record_match_metadata(frame: pd.DataFrame, index: object, match: LedgerMatc
     frame.at[index, "ledger_filter_status"] = item.get("filter_status", "")
     frame.at[index, "ledger_source_file"] = item.get("source_file", "")
     frame.at[index, "ledger_source_sheet"] = item.get("source_sheet", "")
-    frame.at[index, "ledger_source_row"] = item.get("source_row", "")
+    frame.at[index, "ledger_source_row"] = _clean_text(item.get("source_row", ""))
 
 
 def _mark_match_risk(frame: pd.DataFrame, index: object, reason: str) -> None:

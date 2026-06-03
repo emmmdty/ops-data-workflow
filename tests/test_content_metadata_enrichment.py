@@ -419,6 +419,64 @@ class ContentMetadataEnrichmentTests(unittest.TestCase):
         self.assertIn("高消耗B站公开接口失败，可登录态补抓", row["metadata_review_reason"])
         self.assertEqual(stats["error_rows"], 1)
 
+    def test_safe_public_can_return_supplement_source_records_for_failures(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "B站",
+                    "channel": "B站",
+                    "content_id": "BV1failapi1",
+                    "material_id": "mat-bv",
+                    "title": "B站失败",
+                    "spend": 3000,
+                },
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_url": "https://v.douyin.com/fail/",
+                    "title": "抖音短链失败",
+                },
+                {
+                    "platform": "小红书",
+                    "channel": "小红书商业化",
+                    "content_url": "https://www.xiaohongshu.com/explore/",
+                    "title": "小红书缺失笔记ID",
+                },
+            ]
+        )
+
+        enriched, stats, records = enrich_content_metadata(
+            frame,
+            mode="safe_public",
+            fetch_bilibili=lambda bvid: (_ for _ in ()).throw(RuntimeError("api blocked")),
+            resolve_douyin_shortlink=lambda link: "",
+            fetched_at="2026-06-03T12:00:00+08:00",
+            batch_id="batch-1",
+            return_records=True,
+        )
+
+        expected_columns = [
+            "batch",
+            "channel",
+            "content_id",
+            "material_id",
+            "title",
+            "field_name",
+            "old_value",
+            "new_value",
+            "source",
+            "confidence",
+            "status",
+            "reason",
+        ]
+        self.assertEqual(list(records.columns), expected_columns)
+        self.assertEqual(enriched.shape[0], 3)
+        self.assertEqual(stats["error_rows"], 3)
+        failures = records[records["status"].eq("failed")].set_index("channel")
+        self.assertIn("B站公开接口失败", failures.loc["B站", "reason"])
+        self.assertIn("抖音短链未解析", failures.loc["抖音商业化", "reason"])
+        self.assertIn("小红书公开字段缺少笔记ID", failures.loc["小红书商业化", "reason"])
+
     def test_bilibili_public_api_sends_user_agent(self):
         calls: list[dict] = []
 

@@ -24,6 +24,21 @@ METADATA_COLUMNS = [
     "metadata_content_type_candidate",
 ]
 
+SUPPLEMENT_RECORD_COLUMNS = [
+    "batch",
+    "channel",
+    "content_id",
+    "material_id",
+    "title",
+    "field_name",
+    "old_value",
+    "new_value",
+    "source",
+    "confidence",
+    "status",
+    "reason",
+]
+
 DEFAULT_MODE = "off"
 SAFE_PUBLIC_MODE = "safe_public"
 REQUEST_TIMEOUT_SECONDS = 5.0
@@ -63,7 +78,9 @@ def enrich_content_metadata(
     allow_public_api: bool = True,
     resolve_douyin_shortlink: Callable[[str], str] | None = None,
     fetched_at: str | None = None,
-) -> tuple[pd.DataFrame, dict[str, int]]:
+    batch_id: str = "",
+    return_records: bool = False,
+) -> tuple[pd.DataFrame, dict[str, int]] | tuple[pd.DataFrame, dict[str, int], pd.DataFrame]:
     """Backfill safe public content metadata without overwriting Excel values."""
     enriched = canonical.copy()
     _ensure_metadata_columns(enriched)
@@ -78,7 +95,10 @@ def enrich_content_metadata(
         "error_rows": 0,
         "cache_hits": 0,
     }
+    supplement_records: list[dict[str, object]] = []
     if mode != SAFE_PUBLIC_MODE or enriched.empty:
+        if return_records:
+            return enriched, stats, pd.DataFrame(columns=SUPPLEMENT_RECORD_COLUMNS)
         return enriched, stats
 
     fetched_at = fetched_at or datetime.now(timezone.utc).isoformat()
@@ -96,7 +116,14 @@ def enrich_content_metadata(
         if candidate is None:
             continue
         stats["processed_rows"] += 1
-        changed, conflicted, review, hinted = _apply_candidate(enriched, index, candidate, fetched_at)
+        changed, conflicted, review, hinted, records = _apply_candidate(
+            enriched,
+            index,
+            candidate,
+            fetched_at,
+            batch_id=batch_id,
+        )
+        supplement_records.extend(records)
         if changed:
             stats["filled_rows"] += 1
         if hinted:
@@ -109,6 +136,8 @@ def enrich_content_metadata(
             stats["error_rows"] += 1
         if candidate.cache_hit:
             stats["cache_hits"] += 1
+    if return_records:
+        return enriched, stats, pd.DataFrame(supplement_records, columns=SUPPLEMENT_RECORD_COLUMNS)
     return enriched, stats
 
 
@@ -363,7 +392,11 @@ def _xhs_candidate(row: pd.Series) -> MetadataCandidate | None:
     text = _first_non_blank(row, ["content_id", "material_id", "content_url", "dedupe_key"])
     note_id = _extract_xhs_note_id(text) or _clean_text(row.get("content_id"))
     if not note_id:
-        return None
+        return MetadataCandidate(
+            platform="xhs",
+            source="xhs_id_derived",
+            error="小红书公开字段缺少笔记ID或可解析链接",
+        )
     return MetadataCandidate(
         platform="xhs",
         content_id=note_id,
@@ -396,9 +429,12 @@ def _apply_candidate(
     index: object,
     candidate: MetadataCandidate,
     fetched_at: str,
-) -> tuple[bool, bool, bool, bool]:
+    *,
+    batch_id: str = "",
+) -> tuple[bool, bool, bool, bool, list[dict[str, object]]]:
     changed = False
     conflicts: list[str] = []
+    records: list[dict[str, object]] = []
     for column, value in [
         ("content_url", candidate.content_url),
         ("content_id", candidate.content_id),
@@ -413,19 +449,46 @@ def _apply_candidate(
         if not current:
             frame.at[index, column] = value
             changed = True
+            records.append(_supplement_record(frame.loc[index], batch_id, column, current, value, candidate, "filled", "公开信息补齐"))
         elif _can_replace_with_normalized_url(column, current, value):
             frame.at[index, column] = value
             changed = True
+            records.append(_supplement_record(frame.loc[index], batch_id, column, current, value, candidate, "normalized", "公开链接规范化"))
         elif _conflicts(column, current, value):
             conflicts.append(column)
+            records.append(_supplement_record(frame.loc[index], batch_id, column, current, value, candidate, "conflict", "公开信息与Excel字段冲突"))
     if candidate.tags:
         if not _clean_text(frame.at[index, "metadata_tags"]):
             frame.at[index, "metadata_tags"] = candidate.tags
             changed = True
+            records.append(
+                _supplement_record(
+                    frame.loc[index],
+                    batch_id,
+                    "metadata_tags",
+                    "",
+                    candidate.tags,
+                    candidate,
+                    "filled",
+                    "公开标签补齐",
+                )
+            )
     if candidate.content_type_candidate:
         if not _clean_text(frame.at[index, "metadata_content_type_candidate"]):
             frame.at[index, "metadata_content_type_candidate"] = candidate.content_type_candidate
             changed = True
+            records.append(
+                _supplement_record(
+                    frame.loc[index],
+                    batch_id,
+                    "metadata_content_type_candidate",
+                    "",
+                    candidate.content_type_candidate,
+                    candidate,
+                    "filled",
+                    "公开内容类型候选",
+                )
+            )
 
     if candidate.source:
         frame.at[index, "metadata_source"] = candidate.source
@@ -433,6 +496,7 @@ def _apply_candidate(
     frame.at[index, "metadata_fetched_at"] = fetched_at
     if candidate.error:
         frame.at[index, "metadata_error"] = _append_text(frame.at[index, "metadata_error"], candidate.error)
+        records.append(_supplement_record(frame.loc[index], batch_id, "public_metadata", "", "", candidate, "failed", candidate.error))
     reasons: list[str] = []
     if conflicts:
         reasons.append("公开信息与Excel字段冲突")
@@ -449,7 +513,33 @@ def _apply_candidate(
             frame.at[index, "review_reasons"] = _append_text(frame.at[index, "review_reasons"], review_reason)
     if review:
         frame.at[index, "needs_manual_review"] = True
-    return changed, bool(conflicts), review, bool(reasons)
+    return changed, bool(conflicts), review, bool(reasons), records
+
+
+def _supplement_record(
+    row: pd.Series,
+    batch_id: str,
+    field_name: str,
+    old_value: object,
+    new_value: object,
+    candidate: MetadataCandidate,
+    status: str,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "batch": batch_id,
+        "channel": _clean_text(row.get("channel")) or _clean_text(row.get("platform")),
+        "content_id": _clean_text(row.get("content_id")) or candidate.content_id,
+        "material_id": _clean_text(row.get("material_id")),
+        "title": _clean_text(row.get("title")) or candidate.title,
+        "field_name": field_name,
+        "old_value": _clean_text(old_value),
+        "new_value": _clean_text(new_value),
+        "source": candidate.source,
+        "confidence": candidate.confidence,
+        "status": status,
+        "reason": reason,
+    }
 
 
 def _manual_review_reason(row: pd.Series, conflicts: list[str], candidate: MetadataCandidate) -> str:

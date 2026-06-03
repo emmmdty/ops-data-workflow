@@ -1106,7 +1106,8 @@ def _build_conflict_sheet(conflict_details: pd.DataFrame, canonical: pd.DataFram
     if not conflict_details.empty:
         for _, row in conflict_details.iterrows():
             payload = row.to_dict()
-            payload["issue_type"] = "数值冲突"
+            if _blank(payload.get("issue_type")):
+                payload["issue_type"] = "数值冲突"
             rows.append(payload)
     marked = canonical[canonical["duplicate_group_id"].astype(str).str.startswith("title:", na=False)]
     for group_id, group in marked.groupby("duplicate_group_id", sort=False):
