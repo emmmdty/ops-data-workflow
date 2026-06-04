@@ -36,13 +36,13 @@ def _row(channel: str, index: int, spend: float, category: str = "资讯") -> di
 
 
 class TopicAnalysisTests(unittest.TestCase):
-    def test_channel_topic_limit_matches_platform_rules_and_skips_talent(self):
+    def test_channel_topic_limit_matches_platform_rules(self):
         self.assertEqual(channel_topic_limit("抖音商业化"), 20)
         self.assertEqual(channel_topic_limit("抖音市场部"), 20)
         self.assertEqual(channel_topic_limit("小红书商业化"), 10)
-        self.assertEqual(channel_topic_limit("B站"), 10)
+        self.assertEqual(channel_topic_limit("B站市场部"), 10)
+        self.assertEqual(channel_topic_limit("B站商业化"), 10)
         self.assertEqual(channel_topic_limit("微信市场部"), 10)
-        self.assertEqual(channel_topic_limit("达人数据"), 0)
 
     def test_ai_topic_prompt_includes_content_type_context(self):
         source = Path("ops_data_workflow/ai.py").read_text(encoding="utf-8")
@@ -67,8 +67,7 @@ class TopicAnalysisTests(unittest.TestCase):
         frame = pd.DataFrame(
             [_row("抖音商业化", index, float(100 - index), "股友说") for index in range(25)]
             + [_row("小红书商业化", index, float(50 - index), "达人内容") for index in range(12)]
-            + [_row("B站", index, float(40 - index), "采访") for index in range(12)]
-            + [_row("达人数据", index, float(1000 - index), "达人") for index in range(3)]
+            + [_row("B站市场部", index, float(40 - index), "采访") for index in range(12)]
         )
 
         def labeler(items: pd.DataFrame, env_path: Path | None = None) -> dict[int, str]:
@@ -78,8 +77,7 @@ class TopicAnalysisTests(unittest.TestCase):
 
         self.assertEqual(len(result[result["channel"].eq("抖音商业化")]), 20)
         self.assertEqual(len(result[result["channel"].eq("小红书商业化")]), 10)
-        self.assertEqual(len(result[result["channel"].eq("B站")]), 10)
-        self.assertNotIn("达人数据", set(result["channel"]))
+        self.assertEqual(len(result[result["channel"].eq("B站市场部")]), 10)
         self.assertEqual(set(result["source"]), {"ai"})
         self.assertIn("content_type", result.columns)
         self.assertIn("input_hash", result.columns)

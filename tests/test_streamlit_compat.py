@@ -26,6 +26,15 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("最近 8 周", app_source)
         self.assertIn("最近 12 个月", app_source)
 
+    def test_app_runtime_paths_can_be_overridden_for_isolated_demo(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _app_path_from_env", app_source)
+        self.assertIn('"OPS_DATA_ROOT"', app_source)
+        self.assertIn('"OPS_PROCESSED_ROOT"', app_source)
+        self.assertIn('"OPS_WORKFLOW_DB"', app_source)
+        self.assertIn('"OPS_OUTPUTS_ROOT"', app_source)
+
     def test_generate_page_uses_single_upload_control(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_rollup_generator")]

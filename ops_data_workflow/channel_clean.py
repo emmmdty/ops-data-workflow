@@ -7,6 +7,9 @@ import re
 
 import pandas as pd
 
+from .channel_profiles import load_channel_profiles
+from .field_mapping import load_field_mapping
+
 
 CHANNEL_CLEAN_DIR = "channel_clean"
 CHANNEL_CLEAN_SHEET = "清理后明细"
@@ -33,10 +36,9 @@ CHANNEL_CLEAN_COLUMNS = [
 ]
 UNIFIED_CHANNEL_COLUMNS = [
     "周期",
-    "渠道",
     "平台",
+    "渠道",
     "账号",
-    "原始账号",
     "内容形式",
     "内容类型",
     "标题",
@@ -202,10 +204,9 @@ def _unified_channel_frame(
 ) -> pd.DataFrame:
     result = pd.DataFrame(index=frame.index)
     result["周期"] = _period_value(frame, period_label, period_start, period_end)
-    result["渠道"] = _text_series(frame, "channel")
     result["平台"] = _first_text_series(frame, ["platform", "platform_group"])
+    result["渠道"] = _text_series(frame, "channel")
     result["账号"] = _text_series(frame, "account")
-    result["原始账号"] = _first_text_series(frame, ["account_raw", "author"])
     result["内容形式"] = _text_series(frame, "content_form")
     result["内容类型"] = _first_text_series(
         frame,
@@ -386,28 +387,59 @@ def _raw_extra_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if not raw_columns:
         return pd.DataFrame(index=frame.index)
     result = pd.DataFrame(index=frame.index)
-    used_names: set[str] = set()
+    grouped_columns: dict[str, list[str]] = {}
     for column in raw_columns:
-        display_name = _raw_display_name(str(column), used_names)
-        result[display_name] = frame[column]
+        if _is_mapped_raw_column(str(column)):
+            continue
+        display_name = _raw_display_name(str(column))
+        if _is_ignored_raw_display_name(display_name):
+            continue
+        values = frame[column]
+        if values.map(_clean_text).eq("").all():
+            continue
+        grouped_columns.setdefault(display_name, []).append(column)
+    for display_name, columns in grouped_columns.items():
+        result[display_name] = _first_nonblank_raw_series(frame, columns)
     return result
 
 
-def _raw_display_name(column: str, used_names: set[str]) -> str:
+def _raw_display_name(column: str) -> str:
     parts = column.split("__")
-    source = parts[1] if len(parts) >= 3 else ""
-    raw_name = parts[-1] if len(parts) >= 2 else column
-    base = f"原始字段__{raw_name}"
-    candidate = base
-    if candidate in used_names and source:
-        candidate = f"原始字段__{source}__{raw_name}"
-    counter = 2
-    original = candidate
-    while candidate in used_names:
-        candidate = f"{original}_{counter}"
-        counter += 1
-    used_names.add(candidate)
-    return candidate
+    return (parts[-1] if len(parts) >= 2 else column).strip()
+
+
+def _is_ignored_raw_display_name(display_name: str) -> bool:
+    text = _clean_text(display_name)
+    if not text or text.lower().startswith("unnamed:"):
+        return True
+    return _is_config_ignored_raw_field(text)
+
+
+def _is_config_ignored_raw_field(raw_name: str) -> bool:
+    for ignored in load_field_mapping().ignored_fields:
+        if raw_name == ignored or raw_name.startswith(ignored):
+            return True
+    return False
+
+
+def _first_nonblank_raw_series(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
+    result = pd.Series([""] * len(frame), index=frame.index, dtype=object)
+    for column in columns:
+        values = frame[column]
+        mask = result.map(_clean_text).eq("") & values.map(_clean_text).ne("")
+        result.loc[mask] = values.loc[mask]
+    return result
+
+
+def _is_mapped_raw_column(column: str) -> bool:
+    raw_name = _raw_display_name(column)
+    if raw_name in load_field_mapping().mapped_source_columns:
+        return True
+    for profile in load_channel_profiles().profiles:
+        for aliases in profile.field_aliases.values():
+            if raw_name in aliases:
+                return True
+    return False
 
 
 def _first_column_text(frame: pd.DataFrame, column: str) -> str:

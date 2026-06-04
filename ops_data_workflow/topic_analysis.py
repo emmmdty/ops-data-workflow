@@ -94,7 +94,7 @@ LOCAL_TOPIC_KEYWORDS = [
 
 def channel_topic_limit(channel: object) -> int:
     text = str(channel or "").strip()
-    if not text or "达人" in text:
+    if not text:
         return 0
     if "抖音" in text:
         return 20

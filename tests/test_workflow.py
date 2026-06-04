@@ -175,11 +175,19 @@ class WorkflowTests(unittest.TestCase):
                         "review_status": "待审核",
                         "review_reasons": "内容类型缺失",
                         "raw__小红书商业化__7日付费率": 0.2,
+                        "raw__小红书商业化__7日付费成本": 30,
+                        "raw__小红书商业化__内容类别_解析": "投教",
+                        "raw__小红书商业化__笔记/素材ID": "note-1",
+                        "raw__小红书商业化__消费": 60,
+                        "raw__小红书商业化__10秒播放率%": 0.3,
+                        "raw__小红书商业化__Unnamed: 17": "备注噪声",
+                        "raw__小红书商业化__ ": "空表头噪声",
+                        "raw__抖音市场部__10秒播放率%": "",
                     },
                     {
                         "period_start": "2026-04-01",
                         "period_end": "2026-04-07",
-                        "channel": "B站",
+                        "channel": "B站市场部",
                         "platform": "B站",
                         "platform_group": "B站",
                         "account": "同花顺投资",
@@ -190,6 +198,7 @@ class WorkflowTests(unittest.TestCase):
                         "content_url": "https://www.bilibili.com/video/BV1abc/",
                         "spend": 80,
                         "raw__B站__播放完成率": 0.61,
+                        "raw__小红书商业化__7日付费率": "",
                     },
                 ]
             )
@@ -222,19 +231,18 @@ class WorkflowTests(unittest.TestCase):
             workbook = load_workbook(workbook_path, read_only=True)
             self.assertEqual(
                 workbook.sheetnames,
-                ["小红书商业化", "B站", "导入日志", "重复内容", "冲突项", "补齐来源", "审核记录"],
+                ["小红书商业化", "B站市场部", "导入日志", "重复内容", "冲突项", "补齐来源", "审核记录"],
             )
             workbook.close()
 
             xhs = pd.read_excel(workbook_path, sheet_name="小红书商业化")
             self.assertEqual(
-                list(xhs.columns[:24]),
+                list(xhs.columns[:23]),
                 [
                     "周期",
-                    "渠道",
                     "平台",
+                    "渠道",
                     "账号",
-                    "原始账号",
                     "内容形式",
                     "内容类型",
                     "标题",
@@ -256,13 +264,65 @@ class WorkflowTests(unittest.TestCase):
                     "复核原因",
                 ],
             )
-            self.assertIn("原始字段__7日付费率", xhs.columns)
+            self.assertNotIn("原始账号", xhs.columns)
+            self.assertIn("7日付费率", xhs.columns)
+            self.assertIn("7日付费成本", xhs.columns)
+            self.assertNotIn("内容类别_解析", xhs.columns)
+            self.assertNotIn("消费", xhs.columns)
+            self.assertNotIn("笔记/素材ID", xhs.columns)
+            self.assertNotIn("原始字段__7日付费率", xhs.columns)
+            self.assertNotIn("10秒播放率%", xhs.columns)
+            self.assertNotIn("Unnamed: 17", xhs.columns)
+            self.assertNotIn(" ", xhs.columns)
+            self.assertNotIn("10秒播放率%", xhs.columns)
             self.assertEqual(xhs.iloc[0]["周期"], "2026-04-01 至 2026-04-07")
             self.assertEqual(xhs.iloc[0]["唯一标识"], "note-1")
-            self.assertAlmostEqual(float(xhs.iloc[0]["原始字段__7日付费率"]), 0.2)
+            self.assertAlmostEqual(float(xhs.iloc[0]["7日付费率"]), 0.2)
+            self.assertAlmostEqual(float(xhs.iloc[0]["7日付费成本"]), 30)
+
+            bilibili = pd.read_excel(workbook_path, sheet_name="B站市场部")
+            self.assertIn("播放完成率", bilibili.columns)
+            self.assertNotIn("7日付费率", bilibili.columns)
+            self.assertNotIn("原始账号", bilibili.columns)
 
             fill_sources = pd.read_excel(workbook_path, sheet_name="补齐来源")
             self.assertEqual(list(fill_sources["batch_id"]), ["batch-a"])
+
+    def test_unified_channel_workbook_merges_same_unmapped_raw_header_by_original_name(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "processed"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-07",
+                        "platform": "小红书",
+                        "channel": "小红书商业化",
+                        "title": "内容A",
+                        "content_id": "note-a",
+                        "raw__小红书商业化-账户1__7日付费成本": 12,
+                        "raw__小红书商业化-账户2__7日付费成本": "",
+                    },
+                    {
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-07",
+                        "platform": "小红书",
+                        "channel": "小红书商业化",
+                        "title": "内容B",
+                        "content_id": "note-b",
+                        "raw__小红书商业化-账户1__7日付费成本": "",
+                        "raw__小红书商业化-账户2__7日付费成本": 34,
+                    },
+                ]
+            )
+
+            workbook_path = write_unified_channel_clean_workbook(canonical, output_dir)
+
+            sheet = pd.read_excel(workbook_path, sheet_name="小红书商业化")
+            self.assertIn("7日付费成本", sheet.columns)
+            self.assertNotIn("小红书商业化-账户1__7日付费成本", sheet.columns)
+            self.assertNotIn("小红书商业化-账户2__7日付费成本", sheet.columns)
+            self.assertEqual(sheet["7日付费成本"].tolist(), [12, 34])
 
     def test_workflow_writes_channel_clean_workbooks_with_required_columns(self):
         with TemporaryDirectory() as tmp:
@@ -405,7 +465,7 @@ class WorkflowTests(unittest.TestCase):
 
             self.assertEqual(len(result.canonical), 2)
             platform_summary = result.platform_summary.set_index("channel")
-            self.assertAlmostEqual(platform_summary.loc["B站", "spend"], 80.0)
+            self.assertAlmostEqual(platform_summary.loc["B站市场部", "spend"], 80.0)
             self.assertAlmostEqual(platform_summary.loc["抖音商业化", "activations"], 30.0)
             platform_category = result.platform_category_summary
             self.assertIn("channel", platform_category.columns)
@@ -464,8 +524,8 @@ class WorkflowTests(unittest.TestCase):
                 category_matcher=lambda items, category_library, env_path: {},
             )
 
-            self.assertEqual(result.canonical["channel"].value_counts().to_dict(), {"B站": 2, "小红书商业化": 1})
-            bilibili = result.canonical[result.canonical["channel"].eq("B站")].sort_values("content_id")
+            self.assertEqual(result.canonical["channel"].value_counts().to_dict(), {"B站市场部": 2, "小红书商业化": 1})
+            bilibili = result.canonical[result.canonical["channel"].eq("B站市场部")].sort_values("content_id")
             first = bilibili.iloc[0]
             self.assertEqual(first["content_id"], "BV14Vo5BFE1w")
             self.assertEqual(first["title"], "")
@@ -510,7 +570,8 @@ class WorkflowTests(unittest.TestCase):
             )
 
             row = result.canonical.iloc[0]
-            self.assertEqual(row["channel"], "B站")
+            self.assertEqual(row["platform"], "B站")
+            self.assertEqual(row["channel"], "B站市场部")
             self.assertAlmostEqual(row["impressions"], 4321.0)
             self.assertAlmostEqual(row["clicks"], 321.0)
             self.assertAlmostEqual(row["activations"], 12.0)
@@ -1326,7 +1387,11 @@ xiaohongshu:
 
             self.assertEqual(
                 set(canonical["platform"]),
-                {"B站", "小红书商业化", "抖音商业化", "抖音市场部"},
+                {"B站", "小红书", "抖音"},
+            )
+            self.assertEqual(
+                set(canonical["channel"]),
+                {"B站市场部", "小红书商业化", "抖音商业化", "抖音市场部"},
             )
             self.assertEqual(
                 set(canonical.loc[canonical["platform"].str.contains("抖音"), "platform_group"]),
@@ -1374,7 +1439,8 @@ xiaohongshu:
 
             self.assertTrue((tmp_path / "config" / "reference_tables.xlsx").exists())
             account_mapping = references.account_mapping.set_index(["channel", "source_account_id"])
-            self.assertEqual(account_mapping.loc[("B站", "1622777305"), "account"], "同花顺投资")
+            self.assertEqual(account_mapping.loc[("B站市场部", "1622777305"), "account"], "同花顺投资")
+            self.assertEqual(account_mapping.loc[("B站商业化", "1622777305"), "account"], "同花顺投资")
             self.assertIn("账号映射表", references.tables)
             self.assertIn("字段映射表", references.tables)
 
@@ -1394,7 +1460,53 @@ xiaohongshu:
             self.assertNotIn("source_account_id", account_headers)
             self.assertNotIn("canonical_column", field_headers)
             lookup = account_mapping_lookup(references.account_mapping)
-            self.assertEqual(lookup[("B站", "1622777305")]["account"], "同花顺投资")
+            self.assertEqual(lookup[("B站市场部", "1622777305")]["account"], "同花顺投资")
+            self.assertEqual(lookup[("B站商业化", "1622777305")]["account"], "同花顺投资")
+
+    def test_reference_tables_migrate_legacy_bilibili_account_mapping_rows(self):
+        with TemporaryDirectory() as tmp:
+            reference_path = Path(tmp) / "config" / "reference_tables.xlsx"
+            reference_path.parent.mkdir(parents=True)
+            with pd.ExcelWriter(reference_path, engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "渠道": "B站",
+                            "来源账号ID": "1622777305",
+                            "来源账号名": "",
+                            "实际账号": "同花顺投资",
+                            "映射来源": "历史维护",
+                            "说明": "旧表",
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="账号映射表", index=False)
+
+            references = load_reference_tables(reference_path)
+
+            account_mapping = references.account_mapping.set_index(["channel", "source_account_id"])
+            self.assertEqual(account_mapping.loc[("B站市场部", "1622777305"), "account"], "同花顺投资")
+            self.assertEqual(account_mapping.loc[("B站商业化", "1622777305"), "account"], "同花顺投资")
+            self.assertNotIn("B站", set(references.account_mapping["channel"]))
+            self.assertIn("B站市场部", set(references.content_hierarchy["channel"]))
+            self.assertIn("B站商业化", set(references.content_hierarchy["channel"]))
+            self.assertNotIn("B站", set(references.content_hierarchy["channel"]))
+
+    def test_legacy_bilibili_account_mapping_still_matches_business_channels(self):
+        legacy_mapping = pd.DataFrame(
+            [
+                {
+                    "channel": "B站",
+                    "source_account_id": "1622777305",
+                    "account": "同花顺投资",
+                    "mapping_source": "历史维护",
+                }
+            ]
+        )
+
+        lookup = account_mapping_lookup(legacy_mapping)
+
+        self.assertEqual(lookup[("B站市场部", "1622777305")]["account"], "同花顺投资")
+        self.assertEqual(lookup[("B站商业化", "1622777305")]["account"], "同花顺投资")
 
     def test_unknown_bilibili_mid_is_kept_for_manual_review(self):
         with TemporaryDirectory() as tmp:
@@ -1746,13 +1858,14 @@ xiaohongshu:
             channels = set(result.canonical["channel"])
             self.assertIn("小红书市场部", channels)
             self.assertIn("微信市场部", channels)
-            self.assertIn("达人数据", channels)
+            self.assertIn("抖音商业化", channels)
             self.assertNotIn("微信/腾讯/视频号市场部", channels)
             self.assertNotIn("腾讯市场部", channels)
+            self.assertNotIn("达人数据", channels)
             self.assertNotIn("抖音达人内容", channels)
             social_rows = result.canonical[result.canonical["channel"].eq("微信市场部")]
             self.assertEqual(len(social_rows), 3)
-            self.assertEqual(set(social_rows["platform"]), {"微信", "腾讯", "视频号"})
+            self.assertEqual(set(social_rows["platform"]), {"微信"})
             self.assertEqual(set(social_rows["platform_group"]), {"微信"})
 
     def test_raw_extra_columns_export_with_chinese_display_names(self):
@@ -1901,7 +2014,7 @@ xiaohongshu:
             result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
 
             channel_summary = result.channel_summary.set_index("channel")
-            self.assertAlmostEqual(channel_summary.loc["B站", "spend"], 100.0)
+            self.assertAlmostEqual(channel_summary.loc["B站市场部", "spend"], 100.0)
             self.assertAlmostEqual(channel_summary.loc["抖音商业化", "spend"], 300.0)
             self.assertAlmostEqual(channel_summary.loc["抖音商业化", "activations"], 70.0)
 

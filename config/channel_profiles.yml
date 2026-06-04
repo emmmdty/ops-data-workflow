@@ -89,13 +89,37 @@ channels:
         - 内容形式
     account_filter_enabled: true
     active: true
-  - channel: B站
+  - channel: B站市场部
     platform: B站
     group: B站
     filename_keywords:
+      - B站市场部
+      - B站数据
       - B站
       - bilibili
       - 哔哩哔哩
+    field_aliases:
+      title:
+        - 视频标题
+      content_id:
+        - 视频BVID
+        - BV号
+      account:
+        - UP主
+      manual_category:
+        - 内容类型
+      content_form:
+        - 内容形式
+    account_filter_enabled: false
+    active: true
+  - channel: B站商业化
+    platform: B站
+    group: B站
+    filename_keywords:
+      - B站商业化
+      - B站商增
+      - bilibili商业化
+      - 哔哩哔哩商业化
     field_aliases:
       title:
         - 视频标题
@@ -136,8 +160,11 @@ channels:
     group: 微信
     filename_keywords:
       - 微信商业化
+      - 微信商增
       - 视频号商业化
+      - 视频号商增
       - 腾讯商业化
+      - 腾讯商增
     field_aliases:
       title:
         - 创意名称

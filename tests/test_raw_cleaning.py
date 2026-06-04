@@ -450,7 +450,8 @@ class RawCleaningTests(unittest.TestCase):
             cleaned = load_cleaned_canonical(buckets[0].cleaned_workbook)
             self.assertEqual(len(cleaned), 2)
             xhs = cleaned[cleaned["channel"].eq("小红书商业化")].iloc[0]
-            bilibili = cleaned[cleaned["channel"].eq("B站")].iloc[0]
+            bilibili = cleaned[cleaned["channel"].eq("B站市场部")].iloc[0]
+            self.assertEqual(bilibili["platform"], "B站")
             self.assertEqual(xhs["title"], "5.7日段永平调仓买入泡泡玛特，头像也换了！ #同花顺APP #同花顺资讯")
             self.assertEqual(float(xhs["spend"]), 30.0)
             self.assertEqual(float(xhs["impressions"]), 200.0)
@@ -504,7 +505,8 @@ class RawCleaningTests(unittest.TestCase):
             buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
 
             cleaned = load_cleaned_canonical(buckets[0].cleaned_workbook)
-            bilibili = cleaned[cleaned["channel"].eq("B站")].iloc[0]
+            bilibili = cleaned[cleaned["channel"].eq("B站市场部")].iloc[0]
+            self.assertEqual(bilibili["platform"], "B站")
             self.assertEqual(float(bilibili["impressions"]), 333.0)
             self.assertEqual(float(bilibili["spend"]), 70.0)
             self.assertEqual(float(bilibili["activations"]), 5.0)
@@ -619,6 +621,57 @@ class RawCleaningTests(unittest.TestCase):
             self.assertTrue(cleaned["content_id"].astype(str).str.startswith("row:").all())
             ignored = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="忽略sheet")
             self.assertTrue(ignored["reason"].astype(str).str.contains("汇总行").any())
+
+    def test_clean_source_directory_uses_business_channel_and_other_platform_for_unknown_files(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            _write_xlsx(
+                source / "0508-0514 数据" / "B站数据.xlsx",
+                {
+                    "Sheet1": pd.DataFrame(
+                        [
+                            {
+                                "视频BVID": "BVmarket001",
+                                "视频标题": "B站市场内容",
+                                "花费": 10.0,
+                                "展示量": 100,
+                                "点击量": 10,
+                                "应用激活数": 2,
+                            }
+                        ]
+                    )
+                },
+            )
+            _write_xlsx(
+                source / "0508-0514 数据" / "新平台投放.xlsx",
+                {
+                    "Sheet1": pd.DataFrame(
+                        [
+                            {
+                                "标题": "未知平台内容",
+                                "内容ID": "unknown-1",
+                                "消耗": 20.0,
+                                "曝光量": 200,
+                                "点击量": 20,
+                                "激活数": 4,
+                            }
+                        ]
+                    )
+                },
+            )
+
+            buckets = clean_source_directory(source, root / "data" / "raw", default_year=2026, import_id="import-test")
+
+            cleaned = load_cleaned_canonical(buckets[0].cleaned_workbook)
+            channels = set(cleaned["channel"])
+            self.assertIn("B站市场部", channels)
+            self.assertIn("新平台投放", channels)
+            bili = cleaned[cleaned["channel"].eq("B站市场部")].iloc[0]
+            unknown = cleaned[cleaned["channel"].eq("新平台投放")].iloc[0]
+            self.assertEqual(bili["platform"], "B站")
+            self.assertEqual(unknown["platform"], "其他")
+            self.assertEqual(unknown["platform_group"], "其他")
 
     def test_clean_source_directory_excludes_group_subtotal_rows(self):
         with TemporaryDirectory() as tmp:
@@ -867,10 +920,10 @@ class RawCleaningTests(unittest.TestCase):
             self.assertAlmostEqual(row["activations"], 11.0)
             self.assertAlmostEqual(row["first_pay_count"], 4.0)
             channel_summary = result.channel_summary.set_index("channel")
-            self.assertAlmostEqual(channel_summary.loc["B站", "spend"], 100.0)
-            self.assertAlmostEqual(channel_summary.loc["B站", "impressions"], 4321.0)
-            self.assertAlmostEqual(channel_summary.loc["B站", "activations"], 11.0)
-            self.assertAlmostEqual(channel_summary.loc["B站", "first_pay_count"], 4.0)
+            self.assertAlmostEqual(channel_summary.loc["B站市场部", "spend"], 100.0)
+            self.assertAlmostEqual(channel_summary.loc["B站市场部", "impressions"], 4321.0)
+            self.assertAlmostEqual(channel_summary.loc["B站市场部", "activations"], 11.0)
+            self.assertAlmostEqual(channel_summary.loc["B站市场部", "first_pay_count"], 4.0)
 
     def test_reset_runtime_data_clears_generated_runtime_dirs_and_reinitializes_db(self):
         with TemporaryDirectory() as tmp:

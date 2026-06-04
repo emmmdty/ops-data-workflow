@@ -27,7 +27,7 @@ def _get_logo_base64() -> str:
 
 COLUMN_LABELS = {
     "platform": "平台",
-    "platform_group": "平台组",
+    "platform_group": "平台",
     "channel": "渠道",
     "period_start": "周期开始",
     "period_end": "周期结束",
@@ -37,9 +37,9 @@ COLUMN_LABELS = {
     "content_id_fallback": "备用内容ID",
     "material_id": "素材ID",
     "title": "标题",
-    "account_raw": "原始账号",
+    "account_raw": "账号来源值",
     "account_id": "账号ID",
-    "account": "实际账号",
+    "account": "账号",
     "account_mapping_source": "账号映射来源",
     "account_normalized": "归一账号",
     "account_filter_status": "账号过滤状态",
@@ -637,11 +637,22 @@ def format_display_number(value: object, max_decimals: int = 2) -> str:
 
 
 def localize_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    display = frame.copy()
+    display = _drop_internal_compatibility_columns(frame.copy())
     for column in display.columns:
         if column in DISPLAY_NUMERIC_COLUMNS:
             display[column] = display[column].map(format_display_number)
     return display.rename(columns={column: _localized_column_name(column) for column in display.columns})
+
+
+def _drop_internal_compatibility_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    drop_columns = []
+    if "platform" in frame.columns and "platform_group" in frame.columns:
+        drop_columns.append("platform_group")
+    if "account" in frame.columns and "account_raw" in frame.columns:
+        drop_columns.append("account_raw")
+    if not drop_columns:
+        return frame
+    return frame.drop(columns=drop_columns)
 
 
 def _recap_period_level(period_start: str, period_end: str) -> str:
@@ -724,7 +735,7 @@ def _frame_or_empty(frame: Optional[pd.DataFrame]) -> pd.DataFrame:
 
 def _export_canonical(canonical: pd.DataFrame) -> pd.DataFrame:
     return canonical.drop(
-        columns=["platform", "platform_group", "primary_category", "category_l1"],
+        columns=["platform", "platform_group", "account_raw", "primary_category", "category_l1"],
         errors="ignore",
     )
 

@@ -25,7 +25,15 @@ REFERENCE_SHEETS = {
 DEFAULT_ACCOUNT_MAPPING = pd.DataFrame(
     [
         {
-            "渠道": "B站",
+            "渠道": "B站市场部",
+            "来源账号ID": "1622777305",
+            "来源账号名": "",
+            "实际账号": "同花顺投资",
+            "映射来源": "默认维护",
+            "说明": "B站导出账号为 Up主mid，已确认该 MID 对应同花顺投资。",
+        },
+        {
+            "渠道": "B站商业化",
             "来源账号ID": "1622777305",
             "来源账号名": "",
             "实际账号": "同花顺投资",
@@ -38,7 +46,8 @@ DEFAULT_ACCOUNT_MAPPING = pd.DataFrame(
 
 DEFAULT_CONTENT_HIERARCHY = pd.DataFrame(
     [
-        {"渠道": "B站", "标签词": "", "二级栏目": "采访", "三级题材": "新手教学", "规则": "渠道固定规则"},
+        {"渠道": "B站市场部", "标签词": "", "二级栏目": "采访", "三级题材": "新手教学", "规则": "渠道固定规则"},
+        {"渠道": "B站商业化", "标签词": "", "二级栏目": "采访", "三级题材": "新手教学", "规则": "渠道固定规则"},
         {"渠道": "小红书/抖音", "标签词": "#同花顺资讯", "二级栏目": "资讯", "三级题材": "", "规则": "TAG权威映射"},
         {"渠道": "小红书/抖音", "标签词": "#同花顺股友说", "二级栏目": "股友说", "三级题材": "", "规则": "TAG权威映射"},
         {"渠道": "小红书/抖音", "标签词": "#同顺图解", "二级栏目": "图文", "三级题材": "", "规则": "TAG权威映射"},
@@ -184,6 +193,9 @@ def load_reference_tables(path: Path = Path("config/reference_tables.xlsx")) -> 
         if sheet_name not in tables:
             tables[sheet_name] = frame.copy()
             changed = True
+    migrated = _migrate_reference_tables(tables)
+    if migrated:
+        changed = True
     if any(_has_english_reference_columns(frame) for frame in tables.values()):
         changed = True
     if changed:
@@ -201,10 +213,14 @@ def account_mapping_lookup(account_mapping: pd.DataFrame) -> dict[tuple[str, str
         account = str(row.get("account", "")).strip()
         if not channel or not source_account_id or not account:
             continue
-        lookup[(channel, source_account_id)] = {
+        item = {
             "account": account,
             "mapping_source": str(row.get("mapping_source", "账号映射表")).strip() or "账号映射表",
         }
+        lookup[(channel, source_account_id)] = item
+        if channel == "B站":
+            lookup.setdefault(("B站市场部", source_account_id), item)
+            lookup.setdefault(("B站商业化", source_account_id), item)
     return lookup
 
 
@@ -240,6 +256,81 @@ def _field_mapping_table() -> pd.DataFrame:
 
 def _clean_table(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.astype(object).where(pd.notna(frame), "")
+
+
+def _migrate_reference_tables(tables: dict[str, pd.DataFrame]) -> bool:
+    changed = False
+    account_mapping = to_canonical_reference_columns(tables.get("账号映射表", pd.DataFrame()).copy())
+    migrated_account_mapping = _expand_legacy_bilibili_rows(account_mapping, key_columns=["channel", "source_account_id"])
+    if not migrated_account_mapping.equals(account_mapping):
+        tables["账号映射表"] = to_display_reference_columns(migrated_account_mapping)
+        changed = True
+
+    content_hierarchy = to_canonical_reference_columns(tables.get("内容类型分级表", pd.DataFrame()).copy())
+    migrated_content_hierarchy = _expand_legacy_bilibili_rows(content_hierarchy, key_columns=["channel", "tag"])
+    migrated_content_hierarchy = _ensure_bilibili_content_hierarchy_defaults(migrated_content_hierarchy)
+    if not migrated_content_hierarchy.equals(content_hierarchy):
+        tables["内容类型分级表"] = to_display_reference_columns(migrated_content_hierarchy)
+        changed = True
+    return changed
+
+
+def _ensure_bilibili_content_hierarchy_defaults(frame: pd.DataFrame) -> pd.DataFrame:
+    default_rows = to_canonical_reference_columns(DEFAULT_CONTENT_HIERARCHY.copy())
+    default_rows = default_rows[default_rows["channel"].isin(["B站市场部", "B站商业化"])]
+    if default_rows.empty:
+        return frame
+    rows = frame.copy()
+    for column in default_rows.columns:
+        if column not in rows.columns:
+            rows[column] = ""
+    for column in rows.columns:
+        if column not in default_rows.columns:
+            default_rows[column] = ""
+    existing_keys = {
+        (str(row.get("channel", "") or "").strip(), str(row.get("tag", "") or "").strip())
+        for _, row in rows.fillna("").iterrows()
+    }
+    additions = []
+    for _, row in default_rows[rows.columns].fillna("").iterrows():
+        key = (str(row.get("channel", "") or "").strip(), str(row.get("tag", "") or "").strip())
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        additions.append(row.to_dict())
+    if not additions:
+        return frame
+    return pd.concat([rows, pd.DataFrame(additions, columns=rows.columns)], ignore_index=True)
+
+
+def _expand_legacy_bilibili_rows(frame: pd.DataFrame, *, key_columns: list[str]) -> pd.DataFrame:
+    if frame.empty or "channel" not in frame.columns:
+        return frame
+    rows = frame.copy()
+    existing_keys = {
+        tuple(str(row.get(column, "") or "").strip() for column in key_columns)
+        for _, row in rows.fillna("").iterrows()
+    }
+    additions: list[dict[str, object]] = []
+    legacy_bilibili_indexes: list[object] = []
+    for index, row in rows.fillna("").iterrows():
+        if str(row.get("channel", "")).strip() != "B站":
+            continue
+        legacy_bilibili_indexes.append(index)
+        for channel in ["B站市场部", "B站商业化"]:
+            item = row.to_dict()
+            item["channel"] = channel
+            key = tuple(str(item.get(column, "") or "").strip() for column in key_columns)
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            additions.append(item)
+    if not additions and not legacy_bilibili_indexes:
+        return frame
+    rows = rows.drop(index=legacy_bilibili_indexes)
+    if additions:
+        rows = pd.concat([rows, pd.DataFrame(additions, columns=rows.columns)], ignore_index=True)
+    return rows.reset_index(drop=True)
 
 
 def to_canonical_reference_columns(frame: pd.DataFrame) -> pd.DataFrame:

@@ -21,7 +21,7 @@ from .reference_tables import (
     load_reference_tables,
 )
 from .title_matching import normalized_title_key
-from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, social_platform_from_name
+from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, platform_from_channel_or_name, social_platform_from_name
 
 
 TABULAR_SUFFIXES = {".csv", ".xls", ".xlsx"}
@@ -530,15 +530,14 @@ def _normalize_social_dimensions(canonical: pd.DataFrame) -> pd.DataFrame:
             normalized[column] = ""
         normalized[column] = normalized[column].fillna("").astype(str)
 
-    platform_from_platform = normalized["platform"].map(social_platform_from_name)
-    platform_from_channel = normalized["channel"].map(social_platform_from_name)
+    normalized["channel"] = normalized["channel"].map(normalize_channel_name)
+    platform_from_platform = normalized["platform"].map(lambda value: platform_from_channel_or_name(value, default=""))
+    platform_from_channel = normalized["channel"].map(platform_from_channel_or_name)
     social_platform = platform_from_platform.where(platform_from_platform.ne(""), platform_from_channel)
     social_mask = social_platform.ne("")
     if social_mask.any():
         normalized.loc[social_mask, "platform"] = social_platform[social_mask]
-        normalized.loc[social_mask, "platform_group"] = SOCIAL_PLATFORM_GROUP
-        channel_source = normalized["channel"].where(normalized["channel"].str.strip().ne(""), normalized["platform"])
-        normalized.loc[social_mask, "channel"] = channel_source.loc[social_mask].map(normalize_channel_name)
+        normalized.loc[social_mask, "platform_group"] = social_platform[social_mask]
     return normalized
 
 
@@ -583,7 +582,7 @@ def _apply_account_mappings(canonical: pd.DataFrame, references: ReferenceTables
             canonical.at[index, "account"] = mapped["account"]
             canonical.at[index, "author"] = mapped["account"]
             canonical.at[index, "account_mapping_source"] = mapped["mapping_source"]
-        elif channel == "B站" and account_id:
+        elif _is_bilibili_row(row) and account_id:
             canonical.at[index, "account_mapping_source"] = "未匹配"
     return canonical
 
@@ -867,6 +866,28 @@ def _uses_content_id_only_dedupe(row: pd.Series) -> bool:
     return "小红书" in text or "B站" in text or "bilibili" in normalized
 
 
+def _is_bilibili_row(row: pd.Series) -> bool:
+    text = " ".join(
+        str(row.get(column, "") or "")
+        for column in ["platform_group", "platform", "channel"]
+    )
+    normalized = text.lower()
+    return "B站" in text or "bilibili" in normalized or "哔哩哔哩" in text
+
+
+def _bilibili_mask(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype=bool, index=frame.index)
+    parts = []
+    for column in ["platform_group", "platform", "channel"]:
+        if column in frame.columns:
+            parts.append(frame[column].fillna("").astype(str))
+        else:
+            parts.append(pd.Series("", index=frame.index, dtype=object))
+    text = parts[0].str.cat(parts[1:], sep=" ")
+    return text.str.contains("B站|哔哩哔哩", na=False) | text.str.lower().str.contains("bilibili", na=False)
+
+
 def _preferred_content_title(series: pd.Series) -> str:
     values = [str(value).strip() for value in series.tolist() if not _is_blank(value)]
     if not values:
@@ -900,7 +921,7 @@ def _mark_manual_review_reasons(canonical: pd.DataFrame) -> pd.DataFrame:
         reasons = _split_reasons(row.get("review_reasons", ""))
         if _is_blank(row.get("content_id")):
             reasons.append("内容ID缺失")
-        if _is_blank(row.get("account")) and str(row.get("channel", "")).strip() == "B站" and not _is_blank(row.get("account_id")):
+        if _is_blank(row.get("account")) and _is_bilibili_row(row) and not _is_blank(row.get("account_id")):
             reasons.append("账号映射缺失")
         if _has_manual_conflict(row.get("conflict_details")):
             reasons.append("数值相近重复待审核")
@@ -1170,7 +1191,7 @@ def _complete_categories(
 
 
 def _apply_fixed_channel_categories(canonical: pd.DataFrame) -> None:
-    bilibili = canonical["channel"].fillna("").astype(str).str.strip().eq("B站")
+    bilibili = _bilibili_mask(canonical)
     if not bilibili.any():
         return
     if "content_form" in canonical.columns:
@@ -1189,7 +1210,7 @@ def _category_match_payload(value: object) -> tuple[str, float]:
 
 def _fill_missing_secondary_categories(canonical: pd.DataFrame) -> None:
     missing = canonical["content_category"].map(_is_blank)
-    non_bilibili = ~canonical["channel"].fillna("").astype(str).str.strip().eq("B站")
+    non_bilibili = ~_bilibili_mask(canonical)
     candidates = canonical[missing & non_bilibili]
     if candidates.empty:
         return
@@ -2075,7 +2096,7 @@ def _content_performance_flag(
 
 def _summarize_cover_metrics(canonical: pd.DataFrame) -> pd.DataFrame:
     scoped = canonical[
-        canonical["channel"].eq("B站") | canonical["channel"].astype(str).str.contains("小红书", na=False)
+        _bilibili_mask(canonical) | canonical["channel"].astype(str).str.contains("小红书", na=False)
     ].copy()
     if scoped.empty:
         return pd.DataFrame(

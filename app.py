@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import os
 from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -80,10 +81,15 @@ from ops_data_workflow.upload_input import detect_upload_channel_conflicts, infe
 from ops_data_workflow.workflow import refresh_historical_source_periods, run_archived_workflow, run_rollup_workflow
 
 
-APP_DATA_ROOT = Path("data")
-APP_PROCESSED = Path("processed")
-APP_DB = Path(".runtime/workflow.sqlite3")
-APP_OUTPUTS = Path("outputs")
+def _app_path_from_env(name: str, default: str) -> Path:
+    value = os.environ.get(name, "").strip()
+    return Path(value).expanduser() if value else Path(default)
+
+
+APP_DATA_ROOT = _app_path_from_env("OPS_DATA_ROOT", "data")
+APP_PROCESSED = _app_path_from_env("OPS_PROCESSED_ROOT", "processed")
+APP_DB = _app_path_from_env("OPS_WORKFLOW_DB", ".runtime/workflow.sqlite3")
+APP_OUTPUTS = _app_path_from_env("OPS_OUTPUTS_ROOT", "outputs")
 OVERVIEW_CACHE_VERSION = 2
 CATEGORY_RULES = Path("config/category_rules.yml")
 ENV_PATH = Path(".env")
@@ -2433,7 +2439,7 @@ def _page_category_review() -> None:
 
 def _render_channel_page(channel_name: str) -> None:
     topic_limit = channel_topic_limit(channel_name)
-    topic_scope = f"消耗 Top {topic_limit} 重点内容类型" if topic_limit else "达人数据暂不做内容类型分析"
+    topic_scope = f"消耗 Top {topic_limit} 重点内容类型" if topic_limit else "重点内容类型"
     _render_section_shell("", channel_name, f"按当前总览周期展示该渠道全部栏目数据和{topic_scope}。")
     st.markdown(f'<div id="channel-{html.escape(_html_anchor_id(channel_name))}"></div>', unsafe_allow_html=True)
     st.title(channel_name)
@@ -2486,7 +2492,7 @@ def _render_channel_page(channel_name: str) -> None:
 
     st.subheader("重点内容类型贡献")
     if topic_limit <= 0:
-        st.info("达人数据暂不做内容类型分析，后台明细仍会保留。")
+        st.info("当前渠道没有足够数据生成重点内容类型分析。")
     else:
         topic_labels = load_topic_labels_for_batch(APP_DB, selected_batch_id)
         previous_topic_labels = load_topic_labels_for_batch(APP_DB, previous_batch_id) if previous_batch_id else pd.DataFrame()

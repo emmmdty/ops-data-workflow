@@ -14,7 +14,16 @@ class ChannelProfileConfigTests(unittest.TestCase):
 
         self.assertEqual(
             [profile.channel for profile in profiles.active_profiles()],
-            ["小红书商业化", "小红书市场部", "抖音市场部", "抖音商业化", "B站", "微信市场部", "微信商业化"],
+            [
+                "小红书商业化",
+                "小红书市场部",
+                "抖音市场部",
+                "抖音商业化",
+                "B站市场部",
+                "B站商业化",
+                "微信市场部",
+                "微信商业化",
+            ],
         )
         for profile in profiles.active_profiles():
             self.assertTrue(profile.channel)
@@ -52,9 +61,15 @@ class ChannelProfileConfigTests(unittest.TestCase):
 
         self.assertEqual(infer_channel_from_path("腾讯（市场部）.xlsx"), "微信市场部")
         self.assertEqual(infer_channel_from_path("视频号商业化.xlsx"), "微信商业化")
-        self.assertEqual(infer_channel_from_path("抖音达人.csv"), "达人数据")
-        self.assertEqual(infer_channel_from_path("抖音期货.csv"), "抖音期货通")
-        self.assertEqual(infer_channel_from_path("快手投放.xlsx"), "快手投放")
+        self.assertEqual(infer_channel_from_path("腾讯商增.xlsx"), "微信商业化")
+        self.assertEqual(infer_channel_from_path("微信.xlsx"), "微信市场部")
+        self.assertEqual(infer_channel_from_path("B站.xlsx"), "B站市场部")
+        self.assertEqual(infer_channel_from_path("B站数据.xlsx"), "B站市场部")
+        self.assertEqual(infer_channel_from_path("B站商业化.xlsx"), "B站商业化")
+        self.assertEqual(infer_channel_from_path("B站商增.xlsx"), "B站商业化")
+        self.assertEqual(infer_channel_from_path("抖音达人.csv"), "抖音商业化")
+        self.assertEqual(infer_channel_from_path("抖音期货.csv"), "抖音商业化")
+        self.assertEqual(infer_channel_from_path("新平台投放.xlsx"), "新平台投放")
 
     def test_new_platform_can_be_added_by_configuration_only(self):
         with TemporaryDirectory() as tmp:
@@ -114,11 +129,26 @@ class ChannelProfileConfigTests(unittest.TestCase):
 
         self.assertEqual(
             list(frame.columns),
-            ["渠道", "平台", "平台组", "文件名关键词", "字段别名", "账号过滤", "启用状态"],
+            ["渠道", "平台", "文件名关键词", "字段别名", "账号过滤", "启用状态"],
         )
+        self.assertNotIn("平台组", frame.columns)
         self.assertIn("小红书商业化", frame["渠道"].tolist())
         self.assertIn("启用", frame["启用状态"].tolist())
         self.assertTrue(frame["文件名关键词"].str.len().gt(0).all())
+
+    def test_business_docs_do_not_publish_legacy_raw_field_contract(self):
+        docs = [
+            Path("README.md").read_text(encoding="utf-8"),
+            Path("docs/implementation/cleaning-workflow-contract.md").read_text(encoding="utf-8"),
+            Path("docs/同事使用说明.md").read_text(encoding="utf-8"),
+        ]
+        combined = "\n".join(docs)
+
+        self.assertNotIn("原始字段__", combined)
+        self.assertNotIn("- 原始账号", combined)
+        self.assertIn("未映射的原始字段按原表头保留", combined)
+        self.assertIn("B站市场部", combined)
+        self.assertIn("B站商业化", combined)
 
     def test_app_reference_page_exposes_channel_profile_description(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
