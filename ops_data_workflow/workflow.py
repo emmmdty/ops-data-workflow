@@ -13,13 +13,20 @@ from uuid import uuid4
 import pandas as pd
 
 from .ai import generate_ai_summary, generate_local_summary, resolve_deepseek_settings
-from .channel_clean import write_channel_clean_workbooks
+from .channel_clean import write_channel_clean_workbooks, write_unified_channel_clean_workbook
 from .comparison import build_channel_comparison
 from .external_context import fetch_external_context
 from .models import WorkflowResult
 from .pipeline import TABULAR_SUFFIXES, analyze_canonical_frame, analyze_input_dir
 from .periods import SOURCE_TYPE_ROLLUP, SOURCE_TYPE_UPLOAD, ReviewPeriod, period_metadata_from_dates, period_result_id
-from .raw_cleaning import clean_raw_period_dir, cleaned_workbook_in_dir, load_cleaned_canonical
+from .raw_cleaning import (
+    CONFLICTS_SHEET,
+    DUPLICATE_CONTENT_SHEET,
+    IMPORT_LOG_SHEET,
+    clean_raw_period_dir,
+    cleaned_workbook_in_dir,
+    load_cleaned_canonical,
+)
 from .reference_tables import parse_period_from_raw_dir
 from .source_storage import source_storage_key
 from .reporting import write_outputs
@@ -84,6 +91,17 @@ def run_workflow(
         period_start=period_start,
         period_end=period_end,
     )
+    cleaned_channels_workbook = write_unified_channel_clean_workbook(
+        analysis.canonical,
+        Path(output_dir),
+        period_start=period_start,
+        period_end=period_end,
+        import_log=_read_cleaned_sheet(Path(output_dir) / "cleaned.xlsx", IMPORT_LOG_SHEET),
+        duplicate_content=_read_cleaned_sheet(Path(output_dir) / "cleaned.xlsx", DUPLICATE_CONTENT_SHEET),
+        conflicts=_read_cleaned_sheet(Path(output_dir) / "cleaned.xlsx", CONFLICTS_SHEET),
+        fill_sources=analysis.missing_value_details,
+        review_records=analysis.review_queue,
+    )
     return WorkflowResult(
         batch_id="",
         canonical=analysis.canonical,
@@ -112,6 +130,7 @@ def run_workflow(
         canonical_csv=canonical_csv,
         total_summary_xlsx=total_summary_xlsx,
         archive_dir=Path(""),
+        cleaned_channels_workbook=cleaned_channels_workbook,
         channel_clean_workbooks=channel_clean_workbooks,
         account_filter_rules=analysis.account_filter_rules,
         account_filter_details=analysis.account_filter_details,
@@ -258,6 +277,19 @@ def run_archived_workflow(
         env_path=env_path,
         topic_labeler=_no_topic_labels if ui_only or not enable_deepseek else None,
     )
+    cleaned_channels_workbook = write_unified_channel_clean_workbook(
+        analysis.canonical,
+        processed_dir,
+        period_label=period.period_label,
+        period_start=period.period_start,
+        period_end=period.period_end,
+        batch_id=batch_id,
+        import_log=_read_cleaned_sheet(cleaned_workbook, IMPORT_LOG_SHEET),
+        duplicate_content=_read_cleaned_sheet(cleaned_workbook, DUPLICATE_CONTENT_SHEET),
+        conflicts=_read_cleaned_sheet(cleaned_workbook, CONFLICTS_SHEET),
+        fill_sources=analysis.missing_value_details,
+        review_records=analysis.review_queue,
+    )
 
     output_dir = Path(output_root) / batch_id
     if ui_only:
@@ -369,6 +401,7 @@ def run_archived_workflow(
         canonical_csv=canonical_csv,
         total_summary_xlsx=total_summary_xlsx,
         archive_dir=processed_dir,
+        cleaned_channels_workbook=cleaned_channels_workbook,
         channel_clean_workbooks=channel_clean_workbooks,
         account_filter_rules=analysis.account_filter_rules,
         account_filter_details=analysis.account_filter_details,
@@ -517,6 +550,16 @@ def run_rollup_workflow(
         env_path=env_path,
         topic_labeler=_no_topic_labels if not enable_deepseek else None,
     )
+    cleaned_channels_workbook = write_unified_channel_clean_workbook(
+        analysis.canonical,
+        processed_dir,
+        period_label=period.period_label,
+        period_start=period.period_start,
+        period_end=period.period_end,
+        batch_id=batch_id,
+        fill_sources=analysis.missing_value_details,
+        review_records=analysis.review_queue,
+    )
     output_dir = Path(output_root) / batch_id
     if ui_only:
         report_html = analysis_xlsx = canonical_csv = total_summary_xlsx = None
@@ -624,6 +667,7 @@ def run_rollup_workflow(
         canonical_csv=canonical_csv,
         total_summary_xlsx=total_summary_xlsx,
         archive_dir=processed_dir,
+        cleaned_channels_workbook=cleaned_channels_workbook,
         channel_clean_workbooks=channel_clean_workbooks,
         account_filter_rules=analysis.account_filter_rules,
         account_filter_details=analysis.account_filter_details,
@@ -677,6 +721,16 @@ def _replace_directory(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _read_cleaned_sheet(cleaned_workbook: Path, sheet_name: str) -> pd.DataFrame:
+    cleaned_workbook = Path(cleaned_workbook)
+    if not cleaned_workbook.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_excel(cleaned_workbook, sheet_name=sheet_name)
+    except ValueError:
+        return pd.DataFrame()
 
 
 def _no_category_matches(items, category_library, env_path):

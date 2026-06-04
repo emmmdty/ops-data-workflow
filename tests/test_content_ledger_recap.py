@@ -446,7 +446,7 @@ class ContentLedgerTests(unittest.TestCase):
             self.assertEqual(row["content_url"], "https://v.douyin.com/abc/")
             self.assertEqual(row["ledger_match_source"], "模糊标题")
             self.assertEqual(row["ledger_content_type"], "资讯")
-            self.assertEqual(row["ledger_source_row"], 2)
+            self.assertEqual(row["ledger_source_row"], "2")
             self.assertEqual(row["match_risk_level"], "需复核")
             self.assertIn("标题近似匹配，需确认", row["match_risk_reason"])
 
@@ -491,7 +491,7 @@ class ContentLedgerTests(unittest.TestCase):
         self.assertEqual(row["manual_category"], "股友说")
         self.assertEqual(row["content_url"], "https://v.douyin.com/bridge/")
         self.assertEqual(row["ledger_match_source"], "反馈ID桥表")
-        self.assertEqual(row["ledger_source_row"], 12)
+        self.assertEqual(row["ledger_source_row"], "12")
 
     def test_douyin_id_bridge_conflict_requires_review_without_autofill(self):
         canonical = pd.DataFrame(
@@ -535,6 +535,59 @@ class ContentLedgerTests(unittest.TestCase):
         self.assertEqual(row["ledger_match_source"], "反馈ID桥表")
         self.assertEqual(row["match_risk_level"], "需复核")
         self.assertIn("抖音ID桥表存在 2 条同ID记录", row["match_risk_reason"])
+
+    def test_apply_content_ledger_accepts_excel_string_typed_review_and_form_columns(self):
+        canonical = pd.DataFrame(
+            {
+                "platform": ["小红书"],
+                "platform_group": ["小红书"],
+                "channel": ["小红书商业化"],
+                "content_id": ["note-string-dtype"],
+                "title": ["真实 Excel 读入的字符串列"],
+                "account": ["投资号"],
+                "manual_category": [""],
+                "content_url": [""],
+                "needs_manual_review": pd.Series(["False"], dtype="string"),
+                "content_form": pd.Series([""], dtype="string"),
+            }
+        )
+        ledger = pd.DataFrame(
+            [
+                {
+                    "platform": "小红书",
+                    "content_id": "note-string-dtype",
+                    "title": "真实 Excel 读入的字符串列",
+                    "account": "投资号",
+                    "content_type": "图文",
+                    "content_url": "https://www.xiaohongshu.com/explore/note-string-dtype",
+                    "source_file": "原生内容投稿.xlsx",
+                    "source_sheet": "小红书渠道",
+                    "source_row": 2,
+                    "title_key": "",
+                    "title_key_no_tags": "",
+                },
+                {
+                    "platform": "小红书",
+                    "content_id": "note-string-dtype",
+                    "title": "真实 Excel 读入的字符串列",
+                    "account": "投资号",
+                    "content_type": "图文",
+                    "content_url": "https://www.xiaohongshu.com/explore/note-string-dtype",
+                    "source_file": "原生内容投稿.xlsx",
+                    "source_sheet": "小红书渠道",
+                    "source_row": 3,
+                    "title_key": "",
+                    "title_key_no_tags": "",
+                },
+            ]
+        )
+
+        enriched = apply_content_ledger(canonical, ledger)
+
+        row = enriched.iloc[0]
+        self.assertTrue(bool(row["needs_manual_review"]))
+        self.assertEqual(row["content_form"], "图文")
+        self.assertIn("投稿台账存在 2 条同键记录", row["review_reasons"])
 
     def test_douyin_duplicate_tagless_title_prefers_earliest_published_date(self):
         with TemporaryDirectory() as tmp:
@@ -674,7 +727,7 @@ class ContentLedgerTests(unittest.TestCase):
 
 
 class DuplicatePolicyTests(unittest.TestCase):
-    def test_duplicate_policy_keeps_different_accounts_separate(self):
+    def test_duplicate_policy_merges_same_channel_title_across_accounts(self):
         frame = pd.DataFrame(
             [
                 {
@@ -711,8 +764,14 @@ class DuplicatePolicyTests(unittest.TestCase):
             category_matcher=lambda items, category_library, env_path: {},
         )
 
-        self.assertEqual(len(analysis.canonical), 2)
-        self.assertEqual(set(analysis.canonical["account"]), {"同花顺投资", "同花顺财富"})
+        self.assertEqual(len(analysis.canonical), 1)
+        row = analysis.canonical.iloc[0]
+        self.assertEqual(row["dedupe_key"], "抖音商业化::title::同一个标题")
+        self.assertEqual(row["merged_row_count"], 2)
+        self.assertEqual(row["spend"], 300)
+        self.assertEqual(row["impressions"], 3000)
+        self.assertEqual(row["activations"], 30)
+        self.assertEqual(row["first_pay_count"], 6)
 
     def test_xiaohongshu_dedupes_by_content_id_sums_rows_and_keeps_tagged_title(self):
         frame = pd.DataFrame(
@@ -810,7 +869,7 @@ class DuplicatePolicyTests(unittest.TestCase):
 
         self.assertEqual(len(analysis.canonical), 1)
         row = analysis.canonical.iloc[0]
-        self.assertEqual(row["dedupe_key"], "B站::id::BV1Same")
+        self.assertEqual(row["dedupe_key"], "B站市场部::id::BV1Same")
         self.assertEqual(row["merged_row_count"], 2)
         self.assertEqual(row["spend"], 100)
         self.assertEqual(row["impressions"], 1000)
@@ -872,7 +931,7 @@ class DuplicatePolicyTests(unittest.TestCase):
         self.assertEqual(market["spend"], 80)
         self.assertEqual(market["merged_row_count"], 1)
 
-    def test_douyin_same_content_id_still_keeps_different_accounts_separate(self):
+    def test_douyin_same_content_id_merges_different_accounts(self):
         frame = pd.DataFrame(
             [
                 {
@@ -903,8 +962,11 @@ class DuplicatePolicyTests(unittest.TestCase):
             category_matcher=lambda items, category_library, env_path: {},
         )
 
-        self.assertEqual(len(analysis.canonical), 2)
-        self.assertEqual(set(analysis.canonical["account"]), {"同花顺投资", "同花顺财富"})
+        self.assertEqual(len(analysis.canonical), 1)
+        row = analysis.canonical.iloc[0]
+        self.assertEqual(row["dedupe_key"], "抖音商业化::id::aweme-shared")
+        self.assertEqual(row["merged_row_count"], 2)
+        self.assertEqual(row["spend"], 300)
 
     def test_duplicate_policy_sums_large_differences_and_reviews_close_values(self):
         large_difference = pd.DataFrame(
@@ -954,7 +1016,7 @@ class DuplicatePolicyTests(unittest.TestCase):
         self.assertEqual(summed["spend"], 280)
         self.assertFalse(bool(summed["needs_manual_review"]))
         self.assertIn("spend=100 | 180->sum", summed["conflict_details"])
-        self.assertEqual(reviewed["spend"], 100)
+        self.assertEqual(reviewed["spend"], 203)
         self.assertTrue(bool(reviewed["needs_manual_review"]))
         self.assertIn("数值相近重复待审核", reviewed["review_reasons"])
 
@@ -992,7 +1054,7 @@ class RecapSummaryTests(unittest.TestCase):
         self.assertIn("大盘付费成本", monthly.columns)
         self.assertEqual(monthly[monthly["渠道"].eq("汇总")].iloc[0]["大盘付费数据"], "占位")
         self.assertEqual(float(monthly[monthly["渠道"].eq("汇总")].iloc[0]["原生内容曝光数"]), 4000)
-        self.assertEqual(float(monthly[monthly["渠道"].eq("B站")].iloc[0]["消耗占比"]), 0.75)
+        self.assertEqual(float(monthly[monthly["渠道"].eq("B站市场部")].iloc[0]["消耗占比"]), 0.75)
 
     def test_report_exports_unified_recap_fields(self):
         with TemporaryDirectory() as tmp:

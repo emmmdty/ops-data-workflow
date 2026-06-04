@@ -13,7 +13,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 import pandas as pd
 
 from .comparison import COMPARISON_METRICS, build_channel_comparison
-from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, social_platform_from_name
+from .source_channels import normalize_channel_name, social_platform_from_name
 from .storage import init_db, normalize_batch_metadata, previous_batch_from_rows
 
 
@@ -93,7 +93,7 @@ OVERVIEW_TABLE_COLUMNS = [
 
 COST_METRICS = {"activation_cost", "first_pay_cost"}
 AI_REVIEW_AUTO_PASS_THRESHOLD = 0.80
-BILIBILI_CHANNEL = "B站"
+BILIBILI_CHANNEL = "B站市场部"
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 BATCH_COLUMNS = [
     "batch_id",
@@ -849,7 +849,7 @@ def summarize_dimension_for_metric(
 def summarize_channel_categories(items: pd.DataFrame, channel: str) -> pd.DataFrame:
     """Summarize every nonblank secondary category for one channel."""
     normalized = _normalize_items(items)
-    channel_name = str(channel or "").strip()
+    channel_name = _normalize_channel_value(channel)
     columns = ["category_name", *METRIC_COLUMNS]
     if normalized.empty or not channel_name:
         return pd.DataFrame(columns=columns)
@@ -895,7 +895,7 @@ def compare_channel_topics(current_topics: pd.DataFrame, previous_topics: pd.Dat
 
 def summarize_channel_top_content_links(items: pd.DataFrame, channel: str) -> pd.DataFrame:
     """Return channel-specific spend Top content rows with visible content links."""
-    channel_name = str(channel or "").strip()
+    channel_name = _normalize_channel_value(channel)
     limit = 5 if channel_name else 0
     columns = ["title", "spend", "cover_url", "content_url"]
     if limit <= 0:
@@ -984,7 +984,7 @@ def summarize_channel_top_topics(
 ) -> pd.DataFrame:
     """Summarize AI/fallback topics from the channel's Top N rows for one metric."""
     normalized = _normalize_items(items)
-    channel_name = str(channel or "").strip()
+    channel_name = _normalize_channel_value(channel)
     columns = ["category_name", "topic_name", *METRIC_COLUMNS]
     if normalized.empty or not channel_name or metric not in METRIC_COLUMNS:
         return pd.DataFrame(columns=columns)
@@ -1085,7 +1085,7 @@ def summarize_topics_for_selection(
     if metric not in METRIC_COLUMNS or not channel:
         return pd.DataFrame(columns=["category_name", "topic_name", *METRIC_COLUMNS])
 
-    channel_name = str(channel).strip()
+    channel_name = _normalize_channel_value(channel)
     scoped = normalized[normalized["channel"].eq(channel_name)].copy()
     if category_l2:
         scoped = scoped[scoped["category_l2"].eq(str(category_l2).strip())].copy()
@@ -1323,6 +1323,8 @@ def build_overview_table_rows(
     if not platform_summary.empty:
         display = platform_summary.copy()
         name_column = "channel" if "channel" in display.columns else display.columns[0]
+        if name_column == "channel":
+            display[name_column] = display[name_column].map(normalize_channel_name)
         display["_overview_channel_priority"] = display[name_column].map(_overview_channel_priority)
         display["_overview_channel_order"] = range(len(display))
         display = display.sort_values(
@@ -1436,6 +1438,7 @@ def _normalize_items(items: pd.DataFrame) -> pd.DataFrame:
     if "platform" in normalized.columns:
         missing_platform = normalized["platform"].str.strip().eq("")
         normalized.loc[missing_platform, "platform"] = normalized.loc[missing_platform, "channel"]
+    normalized["channel"] = normalized["channel"].map(normalize_channel_name)
     _normalize_social_display_dimensions(normalized)
     normalized["batch_period_start"] = normalized["batch_period_start"].fillna(normalized["period_start"]).astype(str)
     normalized["batch_period_end"] = normalized["batch_period_end"].fillna(normalized["period_end"]).astype(str)
@@ -1475,7 +1478,7 @@ def _overview_growth_by_channel(channel_comparison: Optional[pd.DataFrame]) -> d
     if channel_comparison is None or channel_comparison.empty or "channel" not in channel_comparison.columns:
         return {}
     comparison = channel_comparison.copy()
-    comparison["channel"] = comparison["channel"].fillna("").astype(str).str.strip()
+    comparison["channel"] = comparison["channel"].fillna("").astype(str).map(normalize_channel_name)
     comparison = comparison[comparison["channel"].ne("")]
     return {str(row["channel"]): row for _, row in comparison.iterrows()}
 
@@ -1544,16 +1547,20 @@ def _normalize_social_display_dimensions(items: pd.DataFrame) -> None:
     if not social_mask.any():
         return
     items.loc[social_mask, "platform"] = social_platform[social_mask]
-    items.loc[social_mask, "platform_group"] = SOCIAL_PLATFORM_GROUP
+    items.loc[social_mask, "platform_group"] = social_platform[social_mask]
     channel_source = items["channel"].where(items["channel"].str.strip().ne(""), items["platform"])
     items.loc[social_mask, "channel"] = channel_source.loc[social_mask].map(normalize_channel_name)
 
 
 def _filter_in(items: pd.DataFrame, column: str, values: Iterable[str]) -> pd.DataFrame:
-    selected = [value for value in values if value]
+    selected = [_normalize_channel_value(value) if column == "channel" else value for value in values if value]
     if not selected:
         return items
     return items[items[column].isin(selected)]
+
+
+def _normalize_channel_value(value: object) -> str:
+    return normalize_channel_name(value)
 
 
 def _add_rate_columns(frame: pd.DataFrame) -> pd.DataFrame:

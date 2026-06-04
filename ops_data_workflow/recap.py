@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from .source_channels import normalize_channel_name
+
 
 WEEKLY_COLUMNS = ["渠道", "消耗", "曝光量", "激活数", "激活成本", "付费", "付费成本"]
 MONTHLY_EXTRA_COLUMNS = ["大盘付费数据", "大盘付费成本", "原生内容曝光数", "消耗占比"]
@@ -17,6 +19,7 @@ def build_recap_summary(items: pd.DataFrame, *, period_level: str = "week") -> p
             prepared[column] = "" if column == "channel" else 0.0
     for column in ["spend", "impressions", "activations", "first_pay_count"]:
         prepared[column] = pd.to_numeric(prepared[column], errors="coerce").fillna(0.0)
+    prepared["channel"] = prepared["channel"].fillna("").astype(str).map(normalize_channel_name)
 
     rows = [_summary_row("汇总", prepared, prepared["spend"].sum())]
     for channel, group in _sorted_channel_groups(prepared):

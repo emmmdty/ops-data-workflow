@@ -160,8 +160,12 @@ def apply_content_ledger(
             enriched[column] = ""
     if "needs_manual_review" not in enriched.columns:
         enriched["needs_manual_review"] = False
+    else:
+        enriched["needs_manual_review"] = enriched["needs_manual_review"].map(_review_flag_truthy).astype(bool)
     if "content_form" not in enriched.columns:
         enriched["content_form"] = ""
+    else:
+        enriched["content_form"] = enriched["content_form"].astype(object)
 
     if ledger.empty and (douyin_id_bridge is None or douyin_id_bridge.empty):
         return enriched
@@ -763,7 +767,7 @@ def _record_match_metadata(frame: pd.DataFrame, index: object, match: LedgerMatc
     frame.at[index, "ledger_filter_status"] = item.get("filter_status", "")
     frame.at[index, "ledger_source_file"] = item.get("source_file", "")
     frame.at[index, "ledger_source_sheet"] = item.get("source_sheet", "")
-    frame.at[index, "ledger_source_row"] = item.get("source_row", "")
+    frame.at[index, "ledger_source_row"] = _clean_text(item.get("source_row", ""))
 
 
 def _mark_match_risk(frame: pd.DataFrame, index: object, reason: str) -> None:
@@ -910,6 +914,17 @@ def _append_text(current: object, addition: str) -> str:
     if addition and addition not in values:
         values.append(addition)
     return "；".join(values)
+
+
+def _review_flag_truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "是", "需复核", "待复核", "待审核"}
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
 
 
 def _looks_like_separator(row: pd.Series) -> bool:

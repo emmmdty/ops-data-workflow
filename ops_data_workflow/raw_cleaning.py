@@ -33,6 +33,7 @@ from .pipeline import (
     _standardize_douyin,
     parse_number,
 )
+from .source_channels import platform_from_channel_or_name, normalize_channel_name
 from .storage import init_db
 
 
@@ -597,11 +598,12 @@ def _standardize_candidate(
 ) -> pd.DataFrame:
     kind = _source_kind(candidate.source_path, raw.columns)
     if kind == "bilibili":
+        channel = normalize_channel_name(candidate.source_path.stem)
         return _standardize(
             raw,
             platform="B站",
             platform_group="B站",
-            channel="B站",
+            channel=channel,
             source_file=candidate.relative_source,
             fields=FIELD_MAPPING.fields_for_source(kind),
         )
@@ -691,11 +693,13 @@ def _grouped_content_type_label(value: object) -> str:
 
 
 def _standardize_generic(raw: pd.DataFrame, source_file: str, channel: str) -> pd.DataFrame:
+    normalized_channel = normalize_channel_name(channel)
+    platform = platform_from_channel_or_name(normalized_channel)
     return _standardize(
         raw,
-        platform=channel,
-        platform_group=channel,
-        channel=channel,
+        platform=platform,
+        platform_group=platform,
+        channel=normalized_channel,
         source_file=source_file,
         fields=FIELD_MAPPING.fields_for_source("generic"),
     )
@@ -711,12 +715,8 @@ def _source_kind(path: Path, columns: Iterable[object]) -> str:
     if "抖音" in name or {"视频id", "视频标题"}.issubset(column_set):
         if "市场部" in name:
             channel = "抖音市场部"
-        elif "达人" in name:
-            channel = "达人数据"
-        elif "商业化" in name:
+        elif "商业化" in name or "商增" in name or "达人" in name or "期货" in name:
             channel = "抖音商业化"
-        elif "期货" in name:
-            channel = "抖音期货通"
         else:
             channel = path.stem
         return f"douyin:{channel}"
@@ -1106,7 +1106,8 @@ def _build_conflict_sheet(conflict_details: pd.DataFrame, canonical: pd.DataFram
     if not conflict_details.empty:
         for _, row in conflict_details.iterrows():
             payload = row.to_dict()
-            payload["issue_type"] = "数值冲突"
+            if _blank(payload.get("issue_type")):
+                payload["issue_type"] = "数值冲突"
             rows.append(payload)
     marked = canonical[canonical["duplicate_group_id"].astype(str).str.startswith("title:", na=False)]
     for group_id, group in marked.groupby("duplicate_group_id", sort=False):

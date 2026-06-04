@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import os
 from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -46,6 +47,7 @@ from ops_data_workflow.dashboard import (
 )
 from ops_data_workflow.reporting import format_display_number, localize_columns, localize_and_sort_columns
 from ops_data_workflow.account_filters import load_account_filter_config
+from ops_data_workflow.channel_profiles import load_channel_profiles, render_channel_profiles_table
 from ops_data_workflow.reference_tables import load_reference_tables
 from ops_data_workflow.raw_sync import sync_raw_periods
 from ops_data_workflow.periods import PERIOD_LEVEL_LABELS, PERIOD_LEVELS, PERIOD_LEVEL_MONTH, PERIOD_LEVEL_WEEK, SOURCE_TYPE_UPLOAD, review_period_from_dates
@@ -78,10 +80,15 @@ from ops_data_workflow.upload_input import detect_upload_channel_conflicts, infe
 from ops_data_workflow.workflow import refresh_historical_source_periods, run_archived_workflow, run_rollup_workflow
 
 
-APP_DATA_ROOT = Path("data")
-APP_PROCESSED = Path("processed")
-APP_DB = Path(".runtime/workflow.sqlite3")
-APP_OUTPUTS = Path("outputs")
+def _app_path_from_env(name: str, default: str) -> Path:
+    value = os.environ.get(name, "").strip()
+    return Path(value).expanduser() if value else Path(default)
+
+
+APP_DATA_ROOT = _app_path_from_env("OPS_DATA_ROOT", "data")
+APP_PROCESSED = _app_path_from_env("OPS_PROCESSED_ROOT", "processed")
+APP_DB = _app_path_from_env("OPS_WORKFLOW_DB", ".runtime/workflow.sqlite3")
+APP_OUTPUTS = _app_path_from_env("OPS_OUTPUTS_ROOT", "outputs")
 OVERVIEW_CACHE_VERSION = 2
 CATEGORY_RULES = Path("config/category_rules.yml")
 ENV_PATH = Path(".env")
@@ -2132,7 +2139,11 @@ def _review_issue_priority(value: object) -> int:
 def _page_reference_tables() -> None:
     _render_section_shell("􀉉", "维护台账", "查看本地映射表和处理规则，确认账号与字段口径。")
     st.title("维护台账")
-    st.caption("查看本地 reference_tables.xlsx 和 account_filters.yml 中的字段、账号映射和统计过滤口径。")
+    st.caption("查看本地 reference_tables.xlsx、channel_profiles.yml 和 account_filters.yml 中的字段、账号映射和统计过滤口径。")
+    channel_profiles = load_channel_profiles(Path("config/channel_profiles.yml"))
+    with st.expander("渠道配置说明", expanded=True):
+        st.markdown("渠道识别来自 config/channel_profiles.yml；文件名关键词用于识别上传渠道，字段别名优先于通用字段映射。")
+        st.dataframe(render_channel_profiles_table(channel_profiles), width="stretch", hide_index=True)
     account_filters = load_account_filter_config(Path("config/account_filters.yml"))
     with st.expander("账号过滤配置", expanded=True):
         st.dataframe(localize_columns(account_filters.to_frame()), width="stretch", hide_index=True)
@@ -2226,9 +2237,9 @@ def _page_category_review() -> None:
         f"""
         <div style="margin:0 0 .8rem 0;">
             <div style="font-size:.86rem;font-weight:700;color:#5f7394;margin-bottom:.2rem;">内容审核</div>
-            <div style="font-size:2.05rem;line-height:1.1;font-weight:760;color:#10233f;">AI 初审 + 人工确认</div>
+            <div style="font-size:2.05rem;line-height:1.1;font-weight:760;color:#10233f;">仅需审核重点内容</div>
             <div style="margin-top:.35rem;color:#5f7394;">
-                只确认素材的内容类型和链接；置信度达到 {AI_REVIEW_AUTO_PASS_THRESHOLD:.2f} 且链接完整的高价值素材自动通过。
+                队列默认收录每渠道 Top 20、单条消耗 2000 元以上、冲突和关键字段补齐失败内容；普通低风险 AI 分类结果不会全量进入审核队列。
             </div>
         </div>
         """,
@@ -2241,10 +2252,9 @@ def _page_category_review() -> None:
         st.info("当前没有可审核内容。")
         return
 
-    items = load_dashboard_items_for_batch(APP_DB, selected_batch_id)
-    all_review_items = build_top_content_review_queue(items, include_auto_passed=True)
+    all_review_items = load_review_queue_for_batch(APP_DB, selected_batch_id)
     if all_review_items.empty:
-        st.info("当前周期没有可审核的分渠道 Top 素材。")
+        st.info("当前周期没有需要人工审核的重点内容。")
         return
 
     channel_options = ["全部渠道"] + sorted(value for value in all_review_items["channel"].fillna("").astype(str).unique() if value)
@@ -2287,6 +2297,11 @@ def _page_category_review() -> None:
             all_review_items[column] = ""
 
     all_review_items = all_review_items.reset_index(drop=True).copy()
+    all_review_items["needs_review"] = True
+    all_review_items["ai_review_status"] = "需人工审核"
+    all_review_items["audit_flags"] = all_review_items["review_reasons"].fillna("").astype(str)
+    all_review_items["ai_review_reason"] = all_review_items["review_reasons"].fillna("").astype(str)
+    all_review_items["rank_in_channel"] = pd.to_numeric(all_review_items["rank_in_channel"], errors="coerce")
     total_count = len(all_review_items)
     manual_count = int(all_review_items["needs_review"].astype(bool).sum())
     auto_count = int(total_count - manual_count)
@@ -2363,7 +2378,7 @@ def _page_category_review() -> None:
     queue_col, content_col, action_col = st.columns([0.95, 1.5, 1.05])
     with queue_col:
         st.subheader("人工异常队列")
-        st.caption("仅展示分渠道 Top 素材中的低置信、缺链接或冲突项。")
+        st.caption("仅展示高消耗、分渠道 Top、冲突或关键字段补齐失败内容。")
         with st.container(height=CONTENT_REVIEW_QUEUE_HEIGHT, border=False):
             for row_index, row in queue.iterrows():
                 active = row_index == index
@@ -2391,7 +2406,7 @@ def _page_category_review() -> None:
             if content_url:
                 st.write(content_url)
             else:
-                st.error("缺失，需要补齐")
+                st.error("缺链接，需要补齐")
         with focus2:
             st.markdown("**AI 内容类型建议**")
             st.write(current_l2 or "未匹配")
@@ -2487,7 +2502,7 @@ def _page_category_review() -> None:
                 st.success(f"当前条目已保存。已保存 {pending_count} 条，未同步修改需点击“同步当前周期数据”后才会更新总览和渠道页。")
                 st.rerun()
 
-    with st.expander("AI 已通过 / 全部 Top 素材预览"):
+    with st.expander("AI 已通过 / 重点审核队列预览"):
         preview_columns = [
             "ai_review_status",
             "ai_review_reason",
@@ -2508,7 +2523,7 @@ def _page_category_review() -> None:
 
 def _render_channel_page(channel_name: str) -> None:
     topic_limit = channel_topic_limit(channel_name)
-    topic_scope = f"消耗 Top {topic_limit} 重点内容类型" if topic_limit else "达人数据暂不做内容类型分析"
+    topic_scope = f"消耗 Top {topic_limit} 重点内容类型" if topic_limit else "重点内容类型"
     _render_section_shell("", channel_name, f"按当前总览周期展示该渠道全部栏目数据和{topic_scope}。")
     st.markdown(f'<div id="channel-{html.escape(_html_anchor_id(channel_name))}"></div>', unsafe_allow_html=True)
     st.title(channel_name)
@@ -2561,7 +2576,7 @@ def _render_channel_page(channel_name: str) -> None:
 
     st.subheader("重点内容类型贡献")
     if topic_limit <= 0:
-        st.info("达人数据暂不做内容类型分析，后台明细仍会保留。")
+        st.info("当前渠道没有足够数据生成重点内容类型分析。")
     else:
         topic_labels = load_topic_labels_for_batch(APP_DB, selected_batch_id)
         previous_topic_labels = load_topic_labels_for_batch(APP_DB, previous_batch_id) if previous_batch_id else pd.DataFrame()
@@ -2881,7 +2896,7 @@ def _display_generation_results() -> None:
         st.dataframe(localize_columns(st.session_state["account_audit"]), width="stretch", hide_index=True)
     with st.expander("字段完整性报告"):
         st.dataframe(localize_columns(st.session_state["data_quality"]), width="stretch", hide_index=True)
-    with st.expander("分类审核队列"):
+    with st.expander("重点审核队列"):
         st.dataframe(localize_columns(st.session_state["review_queue"]), width="stretch", hide_index=True)
     with st.expander("分渠道总数据"):
         st.dataframe(localize_columns(st.session_state["platform_summary"]), width="stretch", hide_index=True)

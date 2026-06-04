@@ -972,7 +972,7 @@ class DashboardTests(unittest.TestCase):
                 "first_pay_cost_change_rate",
             ],
         )
-        self.assertEqual(rows["channel"].tolist(), ["汇总", "抖音商业化", "B站"])
+        self.assertEqual(rows["channel"].tolist(), ["汇总", "抖音商业化", "B站市场部"])
         self.assertAlmostEqual(rows.iloc[0]["spend"], 250.0)
         self.assertAlmostEqual(summary.total_impressions, 2500.0)
         self.assertAlmostEqual(rows.iloc[0]["impressions"], 2500.0)
@@ -1023,7 +1023,7 @@ class DashboardTests(unittest.TestCase):
 
         rows = build_overview_table_rows(summary, platform_summary, pd.DataFrame())
 
-        self.assertEqual(rows["channel"].tolist(), ["汇总", "抖音商业化", "小红书商业化", "B站", "其他渠道"])
+        self.assertEqual(rows["channel"].tolist(), ["汇总", "抖音商业化", "小红书商业化", "B站市场部", "其他渠道"])
 
     def test_format_beijing_datetime_converts_utc_created_at_for_selector(self):
         result = format_beijing_datetime("2026-05-19T01:02:03+00:00")
@@ -1614,7 +1614,7 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(counts[(batch_id, "抖音市场部")], 20)
             self.assertEqual(counts[(batch_id, "小红书商业化")], 10)
             self.assertEqual(counts[(batch_id, "小红书市场部")], 10)
-            self.assertEqual(counts[(batch_id, "B站")], 5)
+            self.assertEqual(counts[(batch_id, "B站市场部")], 5)
             self.assertEqual(counts[(batch_id, "其他渠道")], 10)
 
         missing_link = queue[queue["title"].eq("抖音商业化标题00")].iloc[0]

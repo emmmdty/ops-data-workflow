@@ -9,8 +9,9 @@ from unittest.mock import patch
 import pandas as pd
 from openpyxl import load_workbook
 
+from ops_data_workflow.channel_clean import write_unified_channel_clean_workbook
 from ops_data_workflow.workflow import refresh_historical_source_periods, run_archived_workflow, run_workflow
-from ops_data_workflow.pipeline import analyze_canonical_frame, analyze_input_dir
+from ops_data_workflow.pipeline import _build_review_queue, analyze_canonical_frame, analyze_input_dir
 from ops_data_workflow.reference_tables import account_mapping_lookup, load_reference_tables, parse_period_from_raw_dir
 
 
@@ -142,6 +143,187 @@ def _looks_like_english_field_name(value: object) -> bool:
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_unified_channel_clean_workbook_writes_channel_and_system_sheets(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "processed"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-07",
+                        "channel": "小红书商业化",
+                        "platform": "小红书",
+                        "platform_group": "小红书",
+                        "account": "同花顺投资",
+                        "account_raw": "同花顺投资原始",
+                        "content_form": "图文",
+                        "content_category": "热点行情",
+                        "title": "小红书内容",
+                        "content_id": "note-1",
+                        "material_id": "mat-xhs",
+                        "content_url": "https://xhs.example/note-1",
+                        "source_time": "2026-04-02",
+                        "spend": 100,
+                        "impressions": 1000,
+                        "clicks": 100,
+                        "activations": 10,
+                        "first_pay_count": 2,
+                        "activation_cost": 10,
+                        "first_pay_cost": 50,
+                        "metadata_source": "xhs_public",
+                        "metadata_confidence": 0.8,
+                        "review_status": "待审核",
+                        "review_reasons": "内容类型缺失",
+                        "raw__小红书商业化__7日付费率": 0.2,
+                        "raw__小红书商业化__7日付费成本": 30,
+                        "raw__小红书商业化__内容类别_解析": "投教",
+                        "raw__小红书商业化__笔记/素材ID": "note-1",
+                        "raw__小红书商业化__消费": 60,
+                        "raw__小红书商业化__10秒播放率%": 0.3,
+                        "raw__小红书商业化__Unnamed: 17": "备注噪声",
+                        "raw__小红书商业化__ ": "空表头噪声",
+                        "raw__抖音市场部__10秒播放率%": "",
+                    },
+                    {
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-07",
+                        "channel": "B站市场部",
+                        "platform": "B站",
+                        "platform_group": "B站",
+                        "account": "同花顺投资",
+                        "content_form": "视频",
+                        "manual_category": "投教",
+                        "title": "B站内容",
+                        "content_id": "BV1abc",
+                        "content_url": "https://www.bilibili.com/video/BV1abc/",
+                        "spend": 80,
+                        "raw__B站__播放完成率": 0.61,
+                        "raw__小红书商业化__7日付费率": "",
+                    },
+                ]
+            )
+
+            workbook_path = write_unified_channel_clean_workbook(
+                canonical,
+                output_dir,
+                period_label="2026-04-01 至 2026-04-07",
+                batch_id="batch-a",
+                import_log=pd.DataFrame([{"source_file": "小红书商业化.xlsx", "status": "imported"}]),
+                duplicate_content=pd.DataFrame([{"dedupe_key": "note-1", "rows": 2}]),
+                conflicts=pd.DataFrame([{"issue_type": "同ID标题冲突", "content_id": "note-1"}]),
+                fill_sources=pd.DataFrame(
+                    [
+                        {
+                            "batch_id": "batch-a",
+                            "channel": "小红书商业化",
+                            "content_id": "note-1",
+                            "field_name": "title",
+                            "source": "xhs_public",
+                            "confidence": 0.8,
+                            "status": "filled",
+                        }
+                    ]
+                ),
+                review_records=pd.DataFrame([{"content_id": "note-1", "action": "待审核"}]),
+            )
+
+            self.assertEqual(workbook_path, output_dir / "cleaned_channels.xlsx")
+            workbook = load_workbook(workbook_path, read_only=True)
+            self.assertEqual(
+                workbook.sheetnames,
+                ["小红书商业化", "B站市场部", "导入日志", "重复内容", "冲突项", "补齐来源", "审核记录"],
+            )
+            workbook.close()
+
+            xhs = pd.read_excel(workbook_path, sheet_name="小红书商业化")
+            self.assertEqual(
+                list(xhs.columns[:23]),
+                [
+                    "周期",
+                    "平台",
+                    "渠道",
+                    "账号",
+                    "内容形式",
+                    "内容类型",
+                    "标题",
+                    "内容ID",
+                    "素材ID",
+                    "唯一标识",
+                    "内容链接",
+                    "发布时间",
+                    "消耗",
+                    "曝光量",
+                    "点击量",
+                    "激活数",
+                    "付费数",
+                    "激活成本",
+                    "付费成本",
+                    "补齐来源",
+                    "补齐置信度",
+                    "复核状态",
+                    "复核原因",
+                ],
+            )
+            self.assertNotIn("原始账号", xhs.columns)
+            self.assertIn("7日付费率", xhs.columns)
+            self.assertIn("7日付费成本", xhs.columns)
+            self.assertNotIn("内容类别_解析", xhs.columns)
+            self.assertNotIn("消费", xhs.columns)
+            self.assertNotIn("笔记/素材ID", xhs.columns)
+            self.assertNotIn("原始字段__7日付费率", xhs.columns)
+            self.assertNotIn("10秒播放率%", xhs.columns)
+            self.assertNotIn("Unnamed: 17", xhs.columns)
+            self.assertNotIn(" ", xhs.columns)
+            self.assertNotIn("10秒播放率%", xhs.columns)
+            self.assertEqual(xhs.iloc[0]["周期"], "2026-04-01 至 2026-04-07")
+            self.assertEqual(xhs.iloc[0]["唯一标识"], "note-1")
+            self.assertAlmostEqual(float(xhs.iloc[0]["7日付费率"]), 0.2)
+            self.assertAlmostEqual(float(xhs.iloc[0]["7日付费成本"]), 30)
+
+            bilibili = pd.read_excel(workbook_path, sheet_name="B站市场部")
+            self.assertIn("播放完成率", bilibili.columns)
+            self.assertNotIn("7日付费率", bilibili.columns)
+            self.assertNotIn("原始账号", bilibili.columns)
+
+            fill_sources = pd.read_excel(workbook_path, sheet_name="补齐来源")
+            self.assertEqual(list(fill_sources["batch_id"]), ["batch-a"])
+
+    def test_unified_channel_workbook_merges_same_unmapped_raw_header_by_original_name(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "processed"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-07",
+                        "platform": "小红书",
+                        "channel": "小红书商业化",
+                        "title": "内容A",
+                        "content_id": "note-a",
+                        "raw__小红书商业化-账户1__7日付费成本": 12,
+                        "raw__小红书商业化-账户2__7日付费成本": "",
+                    },
+                    {
+                        "period_start": "2026-04-01",
+                        "period_end": "2026-04-07",
+                        "platform": "小红书",
+                        "channel": "小红书商业化",
+                        "title": "内容B",
+                        "content_id": "note-b",
+                        "raw__小红书商业化-账户1__7日付费成本": "",
+                        "raw__小红书商业化-账户2__7日付费成本": 34,
+                    },
+                ]
+            )
+
+            workbook_path = write_unified_channel_clean_workbook(canonical, output_dir)
+
+            sheet = pd.read_excel(workbook_path, sheet_name="小红书商业化")
+            self.assertIn("7日付费成本", sheet.columns)
+            self.assertNotIn("小红书商业化-账户1__7日付费成本", sheet.columns)
+            self.assertNotIn("小红书商业化-账户2__7日付费成本", sheet.columns)
+            self.assertEqual(sheet["7日付费成本"].tolist(), [12, 34])
+
     def test_workflow_writes_channel_clean_workbooks_with_required_columns(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -283,7 +465,7 @@ class WorkflowTests(unittest.TestCase):
 
             self.assertEqual(len(result.canonical), 2)
             platform_summary = result.platform_summary.set_index("channel")
-            self.assertAlmostEqual(platform_summary.loc["B站", "spend"], 80.0)
+            self.assertAlmostEqual(platform_summary.loc["B站市场部", "spend"], 80.0)
             self.assertAlmostEqual(platform_summary.loc["抖音商业化", "activations"], 30.0)
             platform_category = result.platform_category_summary
             self.assertIn("channel", platform_category.columns)
@@ -342,8 +524,8 @@ class WorkflowTests(unittest.TestCase):
                 category_matcher=lambda items, category_library, env_path: {},
             )
 
-            self.assertEqual(result.canonical["channel"].value_counts().to_dict(), {"B站": 2, "小红书商业化": 1})
-            bilibili = result.canonical[result.canonical["channel"].eq("B站")].sort_values("content_id")
+            self.assertEqual(result.canonical["channel"].value_counts().to_dict(), {"B站市场部": 2, "小红书商业化": 1})
+            bilibili = result.canonical[result.canonical["channel"].eq("B站市场部")].sort_values("content_id")
             first = bilibili.iloc[0]
             self.assertEqual(first["content_id"], "BV14Vo5BFE1w")
             self.assertEqual(first["title"], "")
@@ -388,7 +570,8 @@ class WorkflowTests(unittest.TestCase):
             )
 
             row = result.canonical.iloc[0]
-            self.assertEqual(row["channel"], "B站")
+            self.assertEqual(row["platform"], "B站")
+            self.assertEqual(row["channel"], "B站市场部")
             self.assertAlmostEqual(row["impressions"], 4321.0)
             self.assertAlmostEqual(row["clicks"], 321.0)
             self.assertAlmostEqual(row["activations"], 12.0)
@@ -1239,7 +1422,11 @@ xiaohongshu:
 
             self.assertEqual(
                 set(canonical["platform"]),
-                {"B站", "小红书商业化", "抖音商业化", "抖音市场部"},
+                {"B站", "小红书", "抖音"},
+            )
+            self.assertEqual(
+                set(canonical["channel"]),
+                {"B站市场部", "小红书商业化", "抖音商业化", "抖音市场部"},
             )
             self.assertEqual(
                 set(canonical.loc[canonical["platform"].str.contains("抖音"), "platform_group"]),
@@ -1287,7 +1474,8 @@ xiaohongshu:
 
             self.assertTrue((tmp_path / "config" / "reference_tables.xlsx").exists())
             account_mapping = references.account_mapping.set_index(["channel", "source_account_id"])
-            self.assertEqual(account_mapping.loc[("B站", "1622777305"), "account"], "同花顺投资")
+            self.assertEqual(account_mapping.loc[("B站市场部", "1622777305"), "account"], "同花顺投资")
+            self.assertEqual(account_mapping.loc[("B站商业化", "1622777305"), "account"], "同花顺投资")
             self.assertIn("账号映射表", references.tables)
             self.assertIn("字段映射表", references.tables)
 
@@ -1307,7 +1495,53 @@ xiaohongshu:
             self.assertNotIn("source_account_id", account_headers)
             self.assertNotIn("canonical_column", field_headers)
             lookup = account_mapping_lookup(references.account_mapping)
-            self.assertEqual(lookup[("B站", "1622777305")]["account"], "同花顺投资")
+            self.assertEqual(lookup[("B站市场部", "1622777305")]["account"], "同花顺投资")
+            self.assertEqual(lookup[("B站商业化", "1622777305")]["account"], "同花顺投资")
+
+    def test_reference_tables_migrate_legacy_bilibili_account_mapping_rows(self):
+        with TemporaryDirectory() as tmp:
+            reference_path = Path(tmp) / "config" / "reference_tables.xlsx"
+            reference_path.parent.mkdir(parents=True)
+            with pd.ExcelWriter(reference_path, engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "渠道": "B站",
+                            "来源账号ID": "1622777305",
+                            "来源账号名": "",
+                            "实际账号": "同花顺投资",
+                            "映射来源": "历史维护",
+                            "说明": "旧表",
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="账号映射表", index=False)
+
+            references = load_reference_tables(reference_path)
+
+            account_mapping = references.account_mapping.set_index(["channel", "source_account_id"])
+            self.assertEqual(account_mapping.loc[("B站市场部", "1622777305"), "account"], "同花顺投资")
+            self.assertEqual(account_mapping.loc[("B站商业化", "1622777305"), "account"], "同花顺投资")
+            self.assertNotIn("B站", set(references.account_mapping["channel"]))
+            self.assertIn("B站市场部", set(references.content_hierarchy["channel"]))
+            self.assertIn("B站商业化", set(references.content_hierarchy["channel"]))
+            self.assertNotIn("B站", set(references.content_hierarchy["channel"]))
+
+    def test_legacy_bilibili_account_mapping_still_matches_business_channels(self):
+        legacy_mapping = pd.DataFrame(
+            [
+                {
+                    "channel": "B站",
+                    "source_account_id": "1622777305",
+                    "account": "同花顺投资",
+                    "mapping_source": "历史维护",
+                }
+            ]
+        )
+
+        lookup = account_mapping_lookup(legacy_mapping)
+
+        self.assertEqual(lookup[("B站市场部", "1622777305")]["account"], "同花顺投资")
+        self.assertEqual(lookup[("B站商业化", "1622777305")]["account"], "同花顺投资")
 
     def test_unknown_bilibili_mid_is_kept_for_manual_review(self):
         with TemporaryDirectory() as tmp:
@@ -1406,11 +1640,142 @@ xiaohongshu:
             market = result.canonical[result.canonical["channel"].eq("抖音市场部")].iloc[0]
             self.assertEqual(commercial["merged_row_count"], 2)
             self.assertAlmostEqual(commercial["spend"], 220.0)
-            self.assertAlmostEqual(commercial["impressions"], 1000.0)
+            self.assertAlmostEqual(commercial["impressions"], 2005.0)
             self.assertTrue(commercial["needs_manual_review"])
             self.assertIn("数值冲突", commercial["review_reasons"])
             self.assertIn("spend", commercial["conflict_details"])
             self.assertEqual(market["merged_row_count"], 1)
+
+    def test_channel_dedupe_prefers_id_then_url_then_title_and_recomputes_rates(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-stable-1",
+                    "content_url": "https://www.douyin.com/video/dy-stable-1",
+                    "title": "同 ID 原始标题",
+                    "account": "投资号",
+                    "manual_category": "热点行情",
+                    "spend": 100,
+                    "impressions": 1000,
+                    "clicks": 100,
+                    "activations": 10,
+                    "first_pay_count": 2,
+                    "source_file": "a.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-stable-1",
+                    "content_url": "https://www.douyin.com/video/dy-stable-1?share_token=abc",
+                    "title": "同 ID 补充标题 #投教",
+                    "account": "财经号",
+                    "manual_category": "热点行情",
+                    "spend": 100,
+                    "impressions": 1000,
+                    "clicks": 100,
+                    "activations": 10,
+                    "first_pay_count": 2,
+                    "source_file": "b.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "content_url": "https://www.douyin.com/video/7291234567890123456?foo=1",
+                    "title": "链接行标题 A",
+                    "account": "投资号",
+                    "manual_category": "热点行情",
+                    "spend": 30,
+                    "impressions": 300,
+                    "clicks": 30,
+                    "activations": 3,
+                    "first_pay_count": 1,
+                    "source_file": "c.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "content_url": "https://www.douyin.com/video/7291234567890123456/",
+                    "title": "链接行标题 B #补充",
+                    "account": "财经号",
+                    "manual_category": "热点行情",
+                    "spend": 40,
+                    "impressions": 400,
+                    "clicks": 40,
+                    "activations": 4,
+                    "first_pay_count": 1,
+                    "source_file": "d.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "content_url": "",
+                    "title": " 标题  兜底 合并 ",
+                    "account": "投资号",
+                    "manual_category": "热点行情",
+                    "spend": 10,
+                    "impressions": 100,
+                    "clicks": 10,
+                    "activations": 1,
+                    "first_pay_count": 0,
+                    "source_file": "e.csv",
+                },
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "content_url": "",
+                    "title": "标题兜底合并",
+                    "account": "财经号",
+                    "manual_category": "热点行情",
+                    "spend": 15,
+                    "impressions": 150,
+                    "clicks": 15,
+                    "activations": 2,
+                    "first_pay_count": 1,
+                    "source_file": "f.csv",
+                },
+            ]
+        )
+
+        with TemporaryDirectory() as tmp:
+            result = analyze_canonical_frame(
+                frame,
+                "2026-04-01",
+                "2026-04-27",
+                category_matcher=lambda items, category_library, env_path: {},
+                reference_tables_path=Path(tmp) / "reference_tables.xlsx",
+            )
+
+            self.assertEqual(len(result.canonical), 3)
+            by_key = result.canonical.set_index("dedupe_key")
+            id_row = by_key.loc["抖音商业化::id::dy-stable-1"]
+            self.assertEqual(id_row["merged_row_count"], 2)
+            self.assertEqual(id_row["title"], "同 ID 补充标题 #投教")
+            self.assertAlmostEqual(id_row["spend"], 200.0)
+            self.assertAlmostEqual(id_row["impressions"], 2000.0)
+            self.assertAlmostEqual(id_row["activation_cost"], 10.0)
+            self.assertAlmostEqual(id_row["first_pay_rate"], 0.2)
+            self.assertIn("同ID标题不一致", id_row["review_reasons"])
+            self.assertIn("title", id_row["conflict_details"])
+
+            url_row = by_key.loc["抖音商业化::url::https://www.douyin.com/video/7291234567890123456"]
+            self.assertEqual(url_row["merged_row_count"], 2)
+            self.assertAlmostEqual(url_row["spend"], 70.0)
+
+            title_row = by_key.loc["抖音商业化::title::标题兜底合并"]
+            self.assertEqual(title_row["merged_row_count"], 2)
+            self.assertAlmostEqual(title_row["spend"], 25.0)
 
     def test_generic_excel_is_treated_as_channel_from_file_name(self):
         with TemporaryDirectory() as tmp:
@@ -1528,13 +1893,14 @@ xiaohongshu:
             channels = set(result.canonical["channel"])
             self.assertIn("小红书市场部", channels)
             self.assertIn("微信市场部", channels)
-            self.assertIn("达人数据", channels)
+            self.assertIn("抖音商业化", channels)
             self.assertNotIn("微信/腾讯/视频号市场部", channels)
             self.assertNotIn("腾讯市场部", channels)
+            self.assertNotIn("达人数据", channels)
             self.assertNotIn("抖音达人内容", channels)
             social_rows = result.canonical[result.canonical["channel"].eq("微信市场部")]
             self.assertEqual(len(social_rows), 3)
-            self.assertEqual(set(social_rows["platform"]), {"微信", "腾讯", "视频号"})
+            self.assertEqual(set(social_rows["platform"]), {"微信"})
             self.assertEqual(set(social_rows["platform_group"]), {"微信"})
 
     def test_raw_extra_columns_export_with_chinese_display_names(self):
@@ -1631,6 +1997,48 @@ xiaohongshu:
             self.assertIn("人工审核表", workbook.sheetnames)
             workbook.close()
 
+    def test_review_queue_defaults_to_key_items_without_full_ai_review_backlog(self):
+        rows = []
+        for index in range(25):
+            spend = 5000.0 - index * 100 if index <= 21 else 100.0
+            rows.append(
+                {
+                    "period_start": "2026-05-15",
+                    "period_end": "2026-05-21",
+                    "channel": "抖音商业化",
+                    "title": f"低风险 AI 已分类素材 {index:02d}",
+                    "content_url": f"https://example.com/{index}",
+                    "content_id": f"dy-{index:02d}",
+                    "material_id": f"mat-{index:02d}",
+                    "content_category": "资讯",
+                    "category_l2": "资讯",
+                    "category_l3": "",
+                    "category_source": "DeepSeek匹配",
+                    "category_confidence": 0.75,
+                    "review_status": "待复核",
+                    "needs_manual_review": "False",
+                    "review_reasons": "",
+                    "spend": spend,
+                    "activations": 1,
+                }
+            )
+        rows[23]["content_url"] = ""
+        rows[23]["review_reasons"] = "内容链接补齐失败"
+        rows[24]["review_reasons"] = "内容类型冲突"
+        rows[24]["needs_manual_review"] = True
+
+        queue = _build_review_queue(pd.DataFrame(rows))
+
+        queued_titles = set(queue["title"])
+        self.assertEqual(len(queue), 24)
+        self.assertIn("低风险 AI 已分类素材 00", queued_titles)
+        self.assertIn("低风险 AI 已分类素材 21", queued_titles)
+        self.assertIn("低风险 AI 已分类素材 23", queued_titles)
+        self.assertIn("低风险 AI 已分类素材 24", queued_titles)
+        self.assertNotIn("低风险 AI 已分类素材 22", queued_titles)
+        self.assertIn("content_url", queue.columns)
+        self.assertTrue(queue["needs_manual_review"].astype(bool).all())
+
     def test_workflow_summarizes_channels_without_external_totals(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
@@ -1641,7 +2049,7 @@ xiaohongshu:
             result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
 
             channel_summary = result.channel_summary.set_index("channel")
-            self.assertAlmostEqual(channel_summary.loc["B站", "spend"], 100.0)
+            self.assertAlmostEqual(channel_summary.loc["B站市场部", "spend"], 100.0)
             self.assertAlmostEqual(channel_summary.loc["抖音商业化", "spend"], 300.0)
             self.assertAlmostEqual(channel_summary.loc["抖音商业化", "activations"], 70.0)
 
@@ -1831,6 +2239,8 @@ xiaohongshu:
 
             self.assertTrue(reviewed_batches)
             self.assertTrue((result.archive_dir / "cleaned.xlsx").exists())
+            self.assertEqual(result.cleaned_channels_workbook, result.archive_dir / "cleaned_channels.xlsx")
+            self.assertTrue(result.cleaned_channels_workbook.exists())
             self.assertIsNone(result.report_html)
             self.assertIsNone(result.analysis_xlsx)
             self.assertIsNone(result.canonical_csv)

@@ -26,6 +26,15 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("最近 8 周", app_source)
         self.assertIn("最近 12 个月", app_source)
 
+    def test_app_runtime_paths_can_be_overridden_for_isolated_demo(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _app_path_from_env", app_source)
+        self.assertIn('"OPS_DATA_ROOT"', app_source)
+        self.assertIn('"OPS_PROCESSED_ROOT"', app_source)
+        self.assertIn('"OPS_WORKFLOW_DB"', app_source)
+        self.assertIn('"OPS_OUTPUTS_ROOT"', app_source)
+
     def test_generate_page_uses_single_upload_control(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_rollup_generator")]
@@ -654,7 +663,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         ]
 
         self.assertIn("内容审核", app_source)
-        self.assertIn("build_top_content_review_queue", app_source)
+        self.assertIn("load_review_queue_for_batch", app_source)
         self.assertIn("AI 初审", review_source)
         self.assertIn("人工异常队列", review_source)
         self.assertIn("CONTENT_REVIEW_QUEUE_HEIGHT", app_source)
@@ -676,6 +685,19 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertNotIn('("账号"', review_source)
         self.assertNotIn("三级题材", review_source)
         self.assertNotIn('"category_l3"', review_source)
+
+    def test_content_review_page_uses_focused_review_queue_and_regenerates_outputs(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        review_source = app_source[app_source.index("def _page_category_review") : app_source.index("def _render_channel_page")]
+
+        self.assertIn("仅需审核重点内容", review_source)
+        self.assertIn("普通低风险 AI 分类结果不会全量进入审核队列", review_source)
+        self.assertIn("load_review_queue_for_batch(APP_DB, selected_batch_id)", review_source)
+        self.assertIn("output_mode=\"ui_only\"", review_source)
+        self.assertIn("_store_artifacts(result)", review_source)
+        self.assertIn("当前条目已保存。已保存", review_source)
+        self.assertIn("同步当前周期数据", review_source)
+        self.assertIn("当前周期数据已同步。", review_source)
 
     def test_app_hides_removed_pages_and_tertiary_topic_ui(self):
         app_source = Path("app.py").read_text(encoding="utf-8")

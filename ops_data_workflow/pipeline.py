@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 import re
 from typing import Callable, Dict, Iterable, List, Mapping, Optional
+from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 
@@ -20,7 +21,7 @@ from .reference_tables import (
     load_reference_tables,
 )
 from .title_matching import normalized_title_key
-from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, social_platform_from_name
+from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, platform_from_channel_or_name, social_platform_from_name
 
 
 TABULAR_SUFFIXES = {".csv", ".xls", ".xlsx"}
@@ -94,6 +95,24 @@ STANDARD_COLUMNS = [
 
 INTERNAL_COMPAT_COLUMNS = {"platform", "platform_group"}
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
+REVIEW_QUEUE_TOP_N = 20
+REVIEW_QUEUE_HIGH_SPEND_THRESHOLD = 2000.0
+REVIEW_QUEUE_CRITICAL_FIELDS = [
+    ("content_url", "内容链接"),
+    ("content_id", "内容ID"),
+    ("title", "标题"),
+    ("content_category", "内容类型"),
+]
+REVIEW_QUEUE_HIGH_RISK_PATTERNS = [
+    "同ID标题冲突",
+    "标题冲突",
+    "同标题多链接",
+    "投稿台账多候选",
+    "内容类型冲突",
+    "类型/台账冲突",
+    "内容ID冲突",
+    "高风险",
+]
 
 
 @dataclass(frozen=True)
@@ -511,15 +530,14 @@ def _normalize_social_dimensions(canonical: pd.DataFrame) -> pd.DataFrame:
             normalized[column] = ""
         normalized[column] = normalized[column].fillna("").astype(str)
 
-    platform_from_platform = normalized["platform"].map(social_platform_from_name)
-    platform_from_channel = normalized["channel"].map(social_platform_from_name)
+    normalized["channel"] = normalized["channel"].map(normalize_channel_name)
+    platform_from_platform = normalized["platform"].map(lambda value: platform_from_channel_or_name(value, default=""))
+    platform_from_channel = normalized["channel"].map(platform_from_channel_or_name)
     social_platform = platform_from_platform.where(platform_from_platform.ne(""), platform_from_channel)
     social_mask = social_platform.ne("")
     if social_mask.any():
         normalized.loc[social_mask, "platform"] = social_platform[social_mask]
-        normalized.loc[social_mask, "platform_group"] = SOCIAL_PLATFORM_GROUP
-        channel_source = normalized["channel"].where(normalized["channel"].str.strip().ne(""), normalized["platform"])
-        normalized.loc[social_mask, "channel"] = channel_source.loc[social_mask].map(normalize_channel_name)
+        normalized.loc[social_mask, "platform_group"] = social_platform[social_mask]
     return normalized
 
 
@@ -564,7 +582,7 @@ def _apply_account_mappings(canonical: pd.DataFrame, references: ReferenceTables
             canonical.at[index, "account"] = mapped["account"]
             canonical.at[index, "author"] = mapped["account"]
             canonical.at[index, "account_mapping_source"] = mapped["mapping_source"]
-        elif channel == "B站" and account_id:
+        elif _is_bilibili_row(row) and account_id:
             canonical.at[index, "account_mapping_source"] = "未匹配"
     return canonical
 
@@ -619,7 +637,16 @@ def _preprocess_canonical(canonical: pd.DataFrame) -> dict[str, pd.DataFrame]:
         ),
         "conflict_retention_details": pd.DataFrame(
             conflict_rows,
-            columns=["dedupe_key", "channel", "content_id", "column", "values", "action", "relative_difference"],
+            columns=[
+                "dedupe_key",
+                "channel",
+                "content_id",
+                "column",
+                "values",
+                "action",
+                "relative_difference",
+                "issue_type",
+            ],
         ),
         "missing_value_details": missing_details,
     }
@@ -630,16 +657,15 @@ def _dedupe_key(row: pd.Series) -> str:
     content_id = "" if _is_blank(row.get("content_id")) else str(row.get("content_id")).strip()
     if not channel:
         return ""
-    if _uses_content_id_only_dedupe(row):
-        return f"{channel}::id::{content_id}" if content_id else ""
-    account = account_match_label(channel, row.get("account", ""))
-    account_part = f"account::{account}::" if account else ""
     if content_id:
-        return f"{channel}::{account_part}id::{content_id}"
+        return f"{channel}::id::{content_id}"
+    content_url = _normalized_content_url_key(row.get("content_url", ""))
+    if content_url:
+        return f"{channel}::url::{content_url}"
     title = normalized_title_key(row.get("title", ""))
     if not title:
         return ""
-    return f"{channel}::{account_part}title::{title}"
+    return f"{channel}::title::{title}"
 
 
 def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[str, object]]]:
@@ -651,8 +677,8 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
     if len(group) == 1:
         return merged, conflicts
 
-    content_id_only_dedupe = _uses_content_id_only_dedupe(merged)
-    exact_cross_sheet_duplicate = content_id_only_dedupe and _is_exact_cross_sheet_duplicate(group)
+    dedupe_kind = _dedupe_kind(str(merged.get("dedupe_key", "")))
+    exact_cross_sheet_duplicate = _is_exact_cross_sheet_duplicate(group)
     review_conflict_columns: list[str] = []
     for column in NUMERIC_COLUMNS:
         values = pd.to_numeric(group[column], errors="coerce").dropna()
@@ -662,19 +688,14 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
         if exact_cross_sheet_duplicate:
             merged[column] = float(values.iloc[0])
             continue
-        if content_id_only_dedupe:
-            merged[column] = float(values.sum())
-            continue
+        merged[column] = float(values.sum())
         unique_values = list(dict.fromkeys(float(value) for value in values))
         if len(unique_values) <= 1:
-            merged[column] = unique_values[0]
             continue
         relative_difference = _relative_difference(unique_values)
         if relative_difference > 0.05:
-            merged[column] = float(sum(unique_values))
             action = "sum"
         else:
-            merged[column] = unique_values[0]
             action = "first_non_blank"
             review_conflict_columns.append(column)
         conflicts.append(
@@ -694,7 +715,7 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
             continue
         if column == "dedupe_key":
             merged[column] = group[column].iloc[0]
-        elif column == "title" and content_id_only_dedupe:
+        elif column == "title":
             merged[column] = _preferred_content_title(group[column])
         else:
             merged[column] = _first_non_blank_value(group[column])
@@ -706,7 +727,26 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
         for value in group.get("conflict_details", pd.Series(dtype=object)).tolist()
         if not _is_blank(value)
     ]
-    if content_id_only_dedupe and _has_different_base_titles(group.get("title", pd.Series(dtype=object))):
+    text_conflicts = _duplicate_text_conflicts(group, dedupe_kind)
+    if text_conflicts:
+        existing_conflicts.extend(text_conflicts["details"])
+        existing_reasons.extend(text_conflicts["reasons"])
+        merged["needs_manual_review"] = True
+        for detail, reason in zip(text_conflicts["details"], text_conflicts["reasons"]):
+            column, _, values = detail.partition("=")
+            conflicts.append(
+                {
+                    "dedupe_key": merged.get("dedupe_key", ""),
+                    "channel": merged.get("channel", ""),
+                    "content_id": merged.get("content_id", ""),
+                    "column": column,
+                    "values": values,
+                    "action": "manual_review",
+                    "relative_difference": "",
+                    "issue_type": reason,
+                }
+            )
+    if dedupe_kind == "id" and _has_different_base_titles(group.get("title", pd.Series(dtype=object))):
         existing_reasons.append("同ID标题不一致")
     if review_conflict_columns:
         existing_conflicts.extend(f"{item['column']}={item['values']}->{item['action']}" for item in conflicts)
@@ -720,6 +760,71 @@ def _merge_duplicate_group(group: pd.DataFrame) -> tuple[pd.Series, list[dict[st
     merged["conflict_details"] = "; ".join(dict.fromkeys(existing_conflicts))
     merged["review_reasons"] = "；".join(dict.fromkeys(reason for reason in existing_reasons if reason))
     return merged, conflicts
+
+
+def _dedupe_kind(dedupe_key: str) -> str:
+    if "::id::" in dedupe_key:
+        return "id"
+    if "::url::" in dedupe_key:
+        return "url"
+    if "::title::" in dedupe_key:
+        return "title"
+    return ""
+
+
+def _normalized_content_url_key(value: object) -> str:
+    text = "" if _is_blank(value) else str(value).strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.netloc:
+        return text.rstrip("/")
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    path = re.sub(r"/+", "/", parsed.path or "").rstrip("/")
+    return urlunparse((scheme, netloc, path, "", "", ""))
+
+
+def _duplicate_text_conflicts(group: pd.DataFrame, dedupe_kind: str) -> dict[str, list[str]]:
+    details: list[str] = []
+    reasons: list[str] = []
+    title_values = _distinct_text_values(group.get("title", pd.Series(dtype=object)), key_func=normalized_title_key)
+    if dedupe_kind == "id" and len(title_values) > 1:
+        details.append(f"title={' | '.join(title_values)}->preferred")
+        reasons.append("同ID标题不一致")
+    url_values = _distinct_text_values(group.get("content_url", pd.Series(dtype=object)), key_func=_normalized_content_url_key)
+    if dedupe_kind == "title" and len(url_values) > 1:
+        details.append(f"content_url={' | '.join(url_values)}->first_non_blank")
+        reasons.append("同标题多链接")
+    content_type_values: list[str] = []
+    for column in ["manual_category", "content_form", "content_category"]:
+        if column not in group.columns:
+            continue
+        values = _distinct_text_values(group[column])
+        if len(values) > 1:
+            details.append(f"{column}={' | '.join(values)}->first_non_blank")
+            content_type_values.extend(values)
+    if content_type_values:
+        reasons.append("内容类型冲突")
+    return {
+        "details": list(dict.fromkeys(details)),
+        "reasons": list(dict.fromkeys(reasons)),
+    }
+
+
+def _distinct_text_values(series: pd.Series, *, key_func: Callable[[object], str] | None = None) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in series.tolist():
+        if _is_blank(value):
+            continue
+        text = str(value).strip()
+        key = key_func(value) if key_func else text
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        values.append(text)
+    return values
 
 
 def _is_exact_cross_sheet_duplicate(group: pd.DataFrame) -> bool:
@@ -761,6 +866,28 @@ def _uses_content_id_only_dedupe(row: pd.Series) -> bool:
     return "小红书" in text or "B站" in text or "bilibili" in normalized
 
 
+def _is_bilibili_row(row: pd.Series) -> bool:
+    text = " ".join(
+        str(row.get(column, "") or "")
+        for column in ["platform_group", "platform", "channel"]
+    )
+    normalized = text.lower()
+    return "B站" in text or "bilibili" in normalized or "哔哩哔哩" in text
+
+
+def _bilibili_mask(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype=bool, index=frame.index)
+    parts = []
+    for column in ["platform_group", "platform", "channel"]:
+        if column in frame.columns:
+            parts.append(frame[column].fillna("").astype(str))
+        else:
+            parts.append(pd.Series("", index=frame.index, dtype=object))
+    text = parts[0].str.cat(parts[1:], sep=" ")
+    return text.str.contains("B站|哔哩哔哩", na=False) | text.str.lower().str.contains("bilibili", na=False)
+
+
 def _preferred_content_title(series: pd.Series) -> str:
     values = [str(value).strip() for value in series.tolist() if not _is_blank(value)]
     if not values:
@@ -794,7 +921,7 @@ def _mark_manual_review_reasons(canonical: pd.DataFrame) -> pd.DataFrame:
         reasons = _split_reasons(row.get("review_reasons", ""))
         if _is_blank(row.get("content_id")):
             reasons.append("内容ID缺失")
-        if _is_blank(row.get("account")) and str(row.get("channel", "")).strip() == "B站" and not _is_blank(row.get("account_id")):
+        if _is_blank(row.get("account")) and _is_bilibili_row(row) and not _is_blank(row.get("account_id")):
             reasons.append("账号映射缺失")
         if _has_manual_conflict(row.get("conflict_details")):
             reasons.append("数值相近重复待审核")
@@ -1064,7 +1191,7 @@ def _complete_categories(
 
 
 def _apply_fixed_channel_categories(canonical: pd.DataFrame) -> None:
-    bilibili = canonical["channel"].fillna("").astype(str).str.strip().eq("B站")
+    bilibili = _bilibili_mask(canonical)
     if not bilibili.any():
         return
     if "content_form" in canonical.columns:
@@ -1083,7 +1210,7 @@ def _category_match_payload(value: object) -> tuple[str, float]:
 
 def _fill_missing_secondary_categories(canonical: pd.DataFrame) -> None:
     missing = canonical["content_category"].map(_is_blank)
-    non_bilibili = ~canonical["channel"].fillna("").astype(str).str.strip().eq("B站")
+    non_bilibili = ~_bilibili_mask(canonical)
     candidates = canonical[missing & non_bilibili]
     if candidates.empty:
         return
@@ -1635,19 +1762,40 @@ def _build_data_quality_report(canonical: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
-    queue = canonical[
-        canonical["review_status"].isin(["待审核", "待复核"])
-        | canonical["content_category"].map(_is_blank)
-        | canonical["needs_manual_review"].astype(bool)
-    ].copy()
+    prepared = canonical.copy()
+    for column in [
+        "period_start",
+        "period_end",
+        "channel",
+        "spend",
+        "activations",
+        "needs_manual_review",
+        "review_reasons",
+        "conflict_details",
+        "match_risk_level",
+        "match_risk_reason",
+        *[field for field, _ in REVIEW_QUEUE_CRITICAL_FIELDS],
+    ]:
+        if column not in prepared.columns:
+            prepared[column] = False if column == "needs_manual_review" else ""
+
+    spend = pd.to_numeric(prepared["spend"], errors="coerce").fillna(0.0)
+    prepared["__review_rank_in_channel"] = _review_queue_rank_in_channel(prepared, spend)
+    top_content = prepared["__review_rank_in_channel"].le(REVIEW_QUEUE_TOP_N)
+    high_spend = spend.ge(REVIEW_QUEUE_HIGH_SPEND_THRESHOLD)
+    high_risk = _review_queue_high_risk_mask(prepared)
+    missing_critical = _review_queue_missing_critical_mask(prepared)
+    queue = prepared[top_content | high_spend | high_risk | missing_critical].copy()
     if queue.empty:
         return pd.DataFrame(
             columns=[
                 "review_status",
+                "rank_in_channel",
                 "needs_manual_review",
                 "review_reasons",
                 "channel",
                 "title",
+                "content_url",
                 "account_id",
                 "account_raw",
                 "account",
@@ -1657,6 +1805,9 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
                 "dedupe_key",
                 "merged_row_count",
                 "conflict_details",
+                "manual_category",
+                "ai_category",
+                "content_category",
                 "category_l2",
                 "category_l3",
                 "category_source",
@@ -1679,12 +1830,17 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
                 "review_action",
             ]
         )
+    queue["rank_in_channel"] = queue["__review_rank_in_channel"].astype("Int64")
+    queue["review_reasons"] = queue.apply(_review_queue_reasons, axis=1)
+    queue["needs_manual_review"] = True
     columns = [
         "review_status",
+        "rank_in_channel",
         "needs_manual_review",
         "review_reasons",
         "channel",
         "title",
+        "content_url",
         "account_id",
         "account_raw",
         "account",
@@ -1694,6 +1850,9 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
         "dedupe_key",
         "merged_row_count",
         "conflict_details",
+        "manual_category",
+        "ai_category",
+        "content_category",
         "category_l2",
         "category_l3",
         "category_source",
@@ -1718,7 +1877,75 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
     for column in columns:
         if column not in queue.columns:
             queue[column] = ""
-    return queue.sort_values(["spend", "activations"], ascending=[False, False])[columns].reset_index(drop=True)
+    return queue.sort_values(["spend", "rank_in_channel", "activations"], ascending=[False, True, False])[columns].reset_index(drop=True)
+
+
+def _review_queue_rank_in_channel(canonical: pd.DataFrame, spend: pd.Series) -> pd.Series:
+    frame = canonical[["period_start", "period_end", "channel"]].copy()
+    frame["__spend"] = spend
+    return (
+        frame.groupby(["period_start", "period_end", "channel"], dropna=False)["__spend"]
+        .rank(method="first", ascending=False)
+        .astype("Int64")
+    )
+
+
+def _review_queue_high_risk_mask(canonical: pd.DataFrame) -> pd.Series:
+    text = pd.Series("", index=canonical.index, dtype=object)
+    for column in ["review_reasons", "conflict_details", "match_risk_level", "match_risk_reason"]:
+        if column in canonical.columns:
+            text = text.str.cat(canonical[column].fillna("").astype(str), sep="；")
+    matched = pd.Series(False, index=canonical.index)
+    for pattern in REVIEW_QUEUE_HIGH_RISK_PATTERNS:
+        matched = matched | text.str.contains(pattern, na=False)
+    manual_flag = canonical.get("needs_manual_review", pd.Series(False, index=canonical.index)).map(_review_queue_truthy)
+    return matched | manual_flag
+
+
+def _review_queue_missing_critical_mask(canonical: pd.DataFrame) -> pd.Series:
+    mask = pd.Series(False, index=canonical.index)
+    for column, _ in REVIEW_QUEUE_CRITICAL_FIELDS:
+        if column in canonical.columns:
+            mask = mask | canonical[column].map(_is_blank)
+    return mask
+
+
+def _review_queue_reasons(row: pd.Series) -> str:
+    reasons = _split_reasons(row.get("review_reasons", ""))
+    rank = parse_number(row.get("rank_in_channel"))
+    if not pd.isna(rank) and rank <= REVIEW_QUEUE_TOP_N:
+        reasons.append("分渠道消耗Top20")
+    spend = parse_number(row.get("spend"))
+    if not pd.isna(spend) and spend >= REVIEW_QUEUE_HIGH_SPEND_THRESHOLD:
+        reasons.append("单条消耗>=2000元")
+    for column, label in REVIEW_QUEUE_CRITICAL_FIELDS:
+        if _is_blank(row.get(column)):
+            reasons.append(f"{label}补齐失败")
+    if _review_row_has_high_risk_conflict(row):
+        reasons.append("高风险冲突")
+
+    unique_reasons = []
+    for reason in reasons:
+        text = str(reason or "").strip()
+        if text and text not in unique_reasons:
+            unique_reasons.append(text)
+    return "；".join(unique_reasons)
+
+
+def _review_row_has_high_risk_conflict(row: pd.Series) -> bool:
+    text = "；".join(
+        str(row.get(column, "") or "")
+        for column in ["review_reasons", "conflict_details", "match_risk_level", "match_risk_reason"]
+    )
+    if _review_queue_truthy(row.get("needs_manual_review", False)):
+        return True
+    return any(pattern in text for pattern in REVIEW_QUEUE_HIGH_RISK_PATTERNS)
+
+
+def _review_queue_truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "是", "需复核", "待审核"}
+    return bool(value)
 
 
 def _build_account_audit(
@@ -1869,7 +2096,7 @@ def _content_performance_flag(
 
 def _summarize_cover_metrics(canonical: pd.DataFrame) -> pd.DataFrame:
     scoped = canonical[
-        canonical["channel"].eq("B站") | canonical["channel"].astype(str).str.contains("小红书", na=False)
+        _bilibili_mask(canonical) | canonical["channel"].astype(str).str.contains("小红书", na=False)
     ].copy()
     if scoped.empty:
         return pd.DataFrame(

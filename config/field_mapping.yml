@@ -108,13 +108,15 @@ invalid_content_values: ["", "#REF!", "0", "nan", "None", "NONE"]
 graphic_values: [图文, 图文笔记]
 video_values: [视频, 视频笔记, 短视频, 直播]
 default_content_form_by_channel:
-  B站: 视频
+  B站市场部: 视频
+  B站商业化: 视频
 
 passthrough_fields:
   category_l3: [三级题材, 题材]
   category_status: [类别来源_解析]
 
 ignored_fields:
+  - 内容类别_解析
   - 10s完播数
   - 10秒播放率%
   - "2026目标  10个爆款/月"

@@ -38,6 +38,7 @@ class WorkflowResult:
     canonical_csv: Optional[Path]
     total_summary_xlsx: Optional[Path]
     archive_dir: Path
+    cleaned_channels_workbook: Optional[Path] = None
     channel_clean_workbooks: list[Path] = field(default_factory=list)
     account_filter_rules: pd.DataFrame = field(default_factory=pd.DataFrame)
     account_filter_details: pd.DataFrame = field(default_factory=pd.DataFrame)
