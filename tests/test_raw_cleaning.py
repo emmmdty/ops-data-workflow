@@ -6,10 +6,11 @@ import unittest
 from openpyxl import load_workbook
 import pandas as pd
 
-from ops_data_workflow.periods import PERIOD_LEVEL_MONTH
+from ops_data_workflow.periods import PERIOD_LEVEL_MONTH, PERIOD_LEVEL_WEEK, review_period_from_dates
 from ops_data_workflow.raw_cleaning import (
     _additive_metric_columns,
     clean_source_directory,
+    clean_raw_period_dir,
     load_cleaned_canonical,
     reset_runtime_data,
 )
@@ -179,6 +180,61 @@ class RawCleaningTests(unittest.TestCase):
             self.assertEqual(float(cleaned["spend"].sum()), 30.0)
             ignored = pd.read_excel(buckets[0].cleaned_workbook, sheet_name="忽略sheet")
             self.assertTrue(ignored["reason"].astype(str).str.contains("汇总行").any())
+
+    def test_clean_raw_period_dir_can_enrich_public_metadata(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_dir = root / "raw"
+            _write_xlsx(
+                raw_dir / "0508-0514 数据" / "B站数据.xlsx",
+                {
+                    "Sheet1": pd.DataFrame(
+                        [
+                            {
+                                "视频BVID": "BV1metadata1",
+                                "花费": 10.0,
+                                "展示量": 100,
+                                "点击量": 10,
+                                "应用激活数": 2,
+                                "应用内首次付费次数": 1,
+                            }
+                        ]
+                    )
+                },
+            )
+            period = review_period_from_dates(
+                pd.Timestamp("2026-05-08").date(),
+                pd.Timestamp("2026-05-14").date(),
+                PERIOD_LEVEL_WEEK,
+            )
+
+            bucket = clean_raw_period_dir(
+                raw_dir,
+                period,
+                default_year=2026,
+                output_dir=root / "processed",
+                metadata_enrichment_mode="safe_public",
+                metadata_cache_dir=root / "metadata-cache",
+                fetch_bilibili_metadata=lambda bvid: {
+                    "id": bvid,
+                    "link": f"https://www.bilibili.com/video/{bvid}/",
+                    "title": "补全标题",
+                    "tags": "财经",
+                    "published_at": "2026-05-09",
+                },
+            )
+
+            cleaned = load_cleaned_canonical(bucket.cleaned_workbook)
+            row = cleaned.iloc[0]
+            self.assertEqual(row["content_url"], "https://www.bilibili.com/video/BV1metadata1/")
+            self.assertEqual(row["title"], "补全标题")
+            self.assertEqual(row["source_time"], "2026-05-09")
+            self.assertEqual(row["metadata_tags"], "财经")
+            self.assertEqual(row["metadata_source"], "bilibili_public_api")
+
+            manifest = pd.read_json(bucket.manifest_path, typ="series").to_dict()
+            self.assertEqual(manifest["metadata_enrichment"]["mode"], "safe_public")
+            self.assertEqual(manifest["metadata_enrichment"]["filled_rows"], 1)
 
     def test_clean_source_directory_dedupes_bilibili_duplicate_summary_sheets_by_unit_name(self):
         with TemporaryDirectory() as tmp:
@@ -781,7 +837,7 @@ class RawCleaningTests(unittest.TestCase):
                                 "raw__B站__点击量": 321,
                                 "raw__B站__APP激活数": 11,
                                 "raw__B站__激活成本": 9.1,
-                                "raw__B站__首次付费数": 4,
+                                "raw__B站__7日付费次数": 4,
                                 "raw__B站__付费成本": 25.0,
                             }
                         ]

@@ -105,6 +105,23 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("覆盖已存在渠道", generate_source)
         self.assertIn("overwrite_existing_channels", app_source)
 
+    def test_generate_page_can_enable_safe_public_metadata_enrichment(self):
+        app_source = Path("app.py").read_text(encoding="utf-8")
+        generate_source = app_source[app_source.index("def _page_generate") : app_source.index("def _render_rollup_generator")]
+
+        self.assertIn("尝试自动补充公开信息", generate_source)
+        self.assertIn("enable_metadata_enrichment", generate_source)
+        self.assertIn('"safe_public" if enable_metadata_enrichment else "off"', generate_source)
+        self.assertIn("metadata_enrichment_mode=metadata_enrichment_mode", app_source)
+        self.assertIn("_render_metadata_enrichment_summary", app_source)
+        self.assertIn("自动补全行数", app_source)
+        self.assertIn("记录提示行数", app_source)
+        self.assertIn("高消耗需复核行数", app_source)
+        self.assertIn("公开接口失败行数", app_source)
+        self.assertIn("重算历史批次并补充公开信息", generate_source)
+        self.assertIn("refresh_historical_source_periods", app_source)
+        self.assertIn("historical_refresh_summary", app_source)
+
     def test_app_does_not_run_raw_sync_after_navigation_render(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
 
@@ -205,7 +222,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("OVERVIEW_CACHE_VERSION", load_source)
         self.assertIn("cache_version", load_source)
 
-    def test_overview_platform_chart_uses_current_previous_bars_and_growth_axis(self):
+    def test_overview_platform_chart_uses_current_previous_bars_and_growth_labels(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         platform_chart_source = app_source[
             app_source.index("def _build_platform_chart_figure") : app_source.index("def _content_filter_panel")
@@ -214,25 +231,28 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("channel_comparison", platform_chart_source)
         self.assertIn('"本期"', platform_chart_source)
         self.assertIn('"上期"', platform_chart_source)
-        self.assertIn('"环比"', platform_chart_source)
-        self.assertIn("secondary_y=True", platform_chart_source)
-        self.assertIn("yaxis2", platform_chart_source)
+        self.assertIn("__growth_text", platform_chart_source)
+        self.assertIn("__growth_hover_text", platform_chart_source)
+        self.assertIn('barmode="group"', platform_chart_source)
+        self.assertNotIn("secondary_y=True", platform_chart_source)
+        self.assertNotIn("yaxis2", platform_chart_source)
 
-    def test_overview_platform_chart_uses_actual_metric_bars_without_relative_index(self):
+    def test_overview_platform_chart_uses_actual_value_bars_with_log_axis(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         platform_chart_source = app_source[
             app_source.index("def _build_platform_chart_figure") : app_source.index("def _content_filter_panel")
         ]
 
         self.assertNotIn("__bar_scale", platform_chart_source)
-        self.assertNotIn("__current_index", platform_chart_source)
-        self.assertNotIn("__previous_index", platform_chart_source)
-        self.assertNotIn("渠道内相对指数", platform_chart_source)
+        self.assertNotIn("__current_change_index", platform_chart_source)
+        self.assertNotIn("__previous_change_index", platform_chart_source)
+        self.assertNotIn("环比指数（上期=100）", platform_chart_source)
+        self.assertIn("_metric_uses_log_axis(y_metric)", platform_chart_source)
+        self.assertIn('"yaxis.type": "log" if', platform_chart_source)
         self.assertIn("分渠道{y_label}对比", platform_chart_source)
         self.assertIn("本期实际{y_label}", platform_chart_source)
         self.assertIn("上期实际{y_label}", platform_chart_source)
         self.assertIn("yaxis.title.text", platform_chart_source)
-        self.assertIn("str(meta[\"y_label\"])", platform_chart_source)
         self.assertIn("sort_values(", platform_chart_source)
         self.assertIn("[y_metric]", platform_chart_source)
         self.assertIn("本期实际", platform_chart_source)
@@ -300,6 +320,9 @@ class StreamlitCompatibilityTests(unittest.TestCase):
     def test_channel_pages_use_previous_period_comparison_for_metrics_categories_and_topics(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         channel_source = app_source[app_source.index("def _render_channel_page") : app_source.index("def _render_channel_summary_metrics")]
+        period_chart_source = app_source[
+            app_source.index("def _build_period_comparison_bar_figure") : app_source.index("def _render_platform_chart")
+        ]
 
         self.assertIn("previous_batch_from_rows", app_source)
         self.assertIn("previous_batch_id", channel_source)
@@ -308,10 +331,11 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("_render_channel_summary_metrics(channel_summary, channel_growth_row)", channel_source)
         self.assertIn("_render_period_comparison_bar_chart(", channel_source)
         self.assertIn("PERIOD_COMPARISON_CHART_HEIGHT", app_source)
-        self.assertIn('__current_index"] = 100.0', app_source)
-        self.assertIn('__previous_index"', app_source)
-        self.assertIn("周期对比指数（本期=100）", app_source)
-        self.assertIn("环比 ", app_source)
+        self.assertNotIn('"__current_change_index"', period_chart_source)
+        self.assertNotIn('"__previous_change_index"', period_chart_source)
+        self.assertIn('type="log"', period_chart_source)
+        self.assertIn('title="消耗"', period_chart_source)
+        self.assertIn("环比：", app_source)
         self.assertIn("uniformtext", app_source)
         self.assertNotIn('"activations",\n            "激活数"', channel_source)
         self.assertIn("compare_channel_topics", channel_source)
@@ -625,18 +649,29 @@ class StreamlitCompatibilityTests(unittest.TestCase):
     def test_app_renders_single_item_category_review_flow(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
         review_source = app_source[app_source.index("def _page_category_review") : app_source.index("def _render_channel_page")]
+        save_source = review_source[
+            review_source.index('if st.button("保存并下一条"') : review_source.index('with st.expander("AI 已通过')
+        ]
 
         self.assertIn("内容审核", app_source)
         self.assertIn("build_top_content_review_queue", app_source)
         self.assertIn("AI 初审", review_source)
         self.assertIn("人工异常队列", review_source)
+        self.assertIn("CONTENT_REVIEW_QUEUE_HEIGHT", app_source)
+        self.assertIn("st.container(height=CONTENT_REVIEW_QUEUE_HEIGHT", review_source)
+        self.assertNotIn("queue.head(10).iterrows()", review_source)
         self.assertIn("AI 已通过", review_source)
         self.assertIn("缺链接", app_source)
         self.assertIn("内容链接", app_source)
         self.assertIn("打开校验", review_source)
         self.assertIn("快捷内容类型", review_source)
         self.assertIn("保存并下一条", review_source)
-        self.assertIn("apply_review_resolutions_and_regenerate", app_source)
+        self.assertIn("同步当前周期数据", review_source)
+        self.assertIn("未同步修改", review_source)
+        self.assertIn("_content_review_pending_sync_count", review_source)
+        self.assertIn("apply_review_resolutions_and_regenerate", review_source)
+        self.assertNotIn("apply_review_resolutions_and_regenerate", save_source)
+        self.assertNotIn("正在同步当前周期数据", save_source)
         self.assertIn("category_confidence", app_source)
         self.assertNotIn('("账号"', review_source)
         self.assertNotIn("三级题材", review_source)

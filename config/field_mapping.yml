@@ -66,7 +66,7 @@ fields:
   - display: 付费数
     internal: first_pay_count
     role: additive_metric
-    source_columns: [首次付费次数, 首次付费次数(转化时间), 首次付费数, 七日付费数, 应用内付费, 应用内首次付费次数, 求和项:应用内首次付费次数, 付费次数, 付费数, 注册次数, 注册次数（点击归因）]
+    source_columns: [首次付费次数, 首次付费次数(转化时间), 首次付费数, 七日付费数, 7日付费次数, 应用内付费, 应用内首次付费次数, 求和项:应用内首次付费次数, 付费次数, 付费数, 注册次数, 注册次数（点击归因）]
   - display: 激活成本
     internal: activation_cost_raw
     role: derived_metric_raw
@@ -74,7 +74,7 @@ fields:
   - display: 付费成本
     internal: first_pay_cost_raw
     role: derived_metric_raw
-    source_columns: [首次付费成本, 首次付费成本(转化时间), 七日付费成本, 应用内首次付费成本, 付费成本, 注册次数成本]
+    source_columns: [首次付费成本, 首次付费成本(转化时间), 七日付费成本, 7日付费成本, 应用内首次付费成本, 付费成本, 注册次数成本]
   - display: 点击率
     internal: ctr_raw
     role: derived_metric_raw
@@ -86,7 +86,7 @@ fields:
   - display: 付费率
     internal: first_pay_rate_raw
     role: derived_metric_raw
-    source_columns: [首次付费率, 首次付费率%, 首次付费率(转化时间), 七日付费率, 应用内首次付费率]
+    source_columns: [首次付费率, 首次付费率%, 首次付费率(转化时间), 七日付费率, 7日付费率, 应用内首次付费率]
   - display: 点赞数
     internal: likes
     role: engagement

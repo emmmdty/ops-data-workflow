@@ -16,6 +16,9 @@ from .field_mapping import load_field_mapping
 from .reference_tables import to_display_reference_columns
 
 
+LOG_AXIS_MAJOR_TICK = 1
+
+
 def _get_logo_base64() -> str:
     """将项目根目录下的 brand_logo.png 转为 base64 字符串，用于内嵌到 HTML 报告中。"""
     logo_path = Path(__file__).parent.parent / "brand_logo.png"
@@ -97,6 +100,13 @@ COLUMN_LABELS = {
     "ledger_source_row": "投稿台账来源行",
     "match_risk_level": "匹配风险等级",
     "match_risk_reason": "匹配风险原因",
+    "metadata_source": "公开补充来源",
+    "metadata_confidence": "公开补充置信度",
+    "metadata_fetched_at": "公开补充时间",
+    "metadata_error": "公开补充错误",
+    "metadata_review_reason": "公开补充复核原因",
+    "metadata_tags": "公开补充标签",
+    "metadata_content_type_candidate": "公开补充内容类型候选",
     "source_file": "来源文件",
     "source_sheet": "来源Sheet",
     "source_row": "来源行",
@@ -470,11 +480,12 @@ def _write_html(
         if matrix_data.empty:
             matrix_chart = "<p>暂无可绘制消耗气泡。</p>"
         else:
-            matrix_chart = px.scatter(
+            matrix_data["spend_marker_size"] = matrix_data["spend"].pow(0.5)
+            matrix_fig = px.scatter(
                 matrix_data,
                 x="heat_score",
                 y=first_pay_rate,
-                size="spend",
+                size="spend_marker_size",
                 color="content_category",
                 hover_name="category_display",
                 title="内容类别热度 x 付费率矩阵",
@@ -482,8 +493,19 @@ def _write_html(
                     "heat_score": "热度评分",
                     first_pay_rate: "付费率",
                     "spend": "消耗",
+                    "spend_marker_size": "消耗",
                 },
-            ).to_html(full_html=False, include_plotlyjs=False)
+                custom_data=["spend"],
+            )
+            matrix_fig.update_traces(
+                hovertemplate=(
+                    "<b>%{hovertext}</b><br>"
+                    "热度评分=%{x}<br>"
+                    "付费率=%{y}<br>"
+                    "真实消耗=%{customdata[0]}<extra></extra>"
+                )
+            )
+            matrix_chart = matrix_fig.to_html(full_html=False, include_plotlyjs=False)
 
     platform_chart_data = platform_category_summary.copy()
     if not platform_chart_data.empty:
@@ -491,19 +513,22 @@ def _write_html(
     if platform_chart_data.empty:
         platform_chart = "<p>暂无渠道对比数据。</p>"
     else:
-        platform_chart = px.bar(
+        platform_fig = px.bar(
             platform_chart_data,
             x="chart_category_display",
             y="activations",
             color="channel",
             barmode="group",
+            log_y=True,
             title="各渠道栏目题材激活数",
             labels={
                 "chart_category_display": "内容分类",
                 "activations": "激活数",
                 "channel": "渠道",
             },
-        ).to_html(full_html=False, include_plotlyjs=False)
+        )
+        platform_fig.update_yaxes(dtick=LOG_AXIS_MAJOR_TICK)
+        platform_chart = platform_fig.to_html(full_html=False, include_plotlyjs=False)
 
     pending_spend = float(pending_categories["spend"].sum()) if not pending_categories.empty else 0.0
     total_spend = float(canonical["spend"].sum()) if not canonical.empty else 0.0

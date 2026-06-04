@@ -249,7 +249,7 @@ def _seed_dashboard_db(db_path: Path) -> None:
 
 
 class DashboardTests(unittest.TestCase):
-    def test_overview_platform_chart_bars_use_actual_metric_values(self):
+    def test_overview_platform_chart_bars_use_actual_values_with_log_axis_and_growth_labels(self):
         from app import _build_platform_chart_figure
 
         platform_summary = pd.DataFrame(
@@ -284,9 +284,165 @@ class DashboardTests(unittest.TestCase):
         previous_spend = next(trace for trace in fig.data if trace.name == "总消耗 上期")
         self.assertEqual(list(current_spend.y), [120.0, 80.0])
         self.assertEqual(list(previous_spend.y), [60.0, 100.0])
-        self.assertNotIn("渠道内相对指数", str(fig.to_plotly_json()))
         self.assertEqual(fig.layout.yaxis.title.text, "总消耗")
-        self.assertEqual(fig.layout.yaxis2.title.text, "环比")
+        self.assertEqual(fig.layout.yaxis.type, "log")
+        self.assertEqual(fig.layout.yaxis.dtick, 1)
+        self.assertFalse(hasattr(fig.layout, "yaxis2") and fig.layout.yaxis2.title.text)
+        self.assertEqual(current_spend.customdata[0][1], "120")
+        self.assertEqual(current_spend.customdata[0][2], "60")
+        self.assertEqual(current_spend.customdata[0][3], "+100%")
+        self.assertEqual(list(current_spend.text), ["120<br>+100%", "80<br>-20%"])
+
+    def test_overview_platform_chart_shows_current_value_without_previous_baseline(self):
+        from app import _build_platform_chart_figure
+
+        platform_summary = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "spend": 120.0, "activations": 12.0},
+                {"channel": "小红书市场部", "spend": 80.0, "activations": 8.0},
+            ]
+        )
+        channel_comparison = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "spend_previous": 60.0,
+                    "spend_change_rate": 1.0,
+                    "activations_previous": 6.0,
+                    "activations_change_rate": 1.0,
+                }
+            ]
+        )
+
+        fig = _build_platform_chart_figure(platform_summary, channel_comparison)
+
+        self.assertIsNotNone(fig)
+        current_spend = next(trace for trace in fig.data if trace.name == "总消耗 本期")
+        self.assertEqual(list(current_spend.y), [120.0, 80.0])
+        self.assertEqual(list(current_spend.text), ["120<br>+100%", "80"])
+        self.assertEqual(current_spend.customdata[1][1], "80")
+        self.assertEqual(current_spend.customdata[1][2], "-")
+        self.assertEqual(current_spend.customdata[1][3], "")
+
+    def test_period_comparison_chart_uses_actual_values_with_log_axis_and_growth_labels(self):
+        from app import _build_period_comparison_bar_figure
+
+        frame = pd.DataFrame(
+            [
+                {
+                    "category": "股友说",
+                    "spend": 120.0,
+                    "spend_previous": 60.0,
+                    "spend_change_rate": 1.0,
+                },
+                {
+                    "category": "资讯",
+                    "spend": 80.0,
+                    "spend_previous": 100.0,
+                    "spend_change_rate": -0.2,
+                },
+            ]
+        )
+
+        fig = _build_period_comparison_bar_figure(frame, "category", "内容类型", "重点内容类型贡献")
+
+        current = next(trace for trace in fig.data if trace.name == "本期消耗")
+        previous = next(trace for trace in fig.data if trace.name == "上期消耗")
+        self.assertEqual(list(current.y), [120.0, 80.0])
+        self.assertEqual(list(previous.y), [60.0, 100.0])
+        self.assertEqual(fig.layout.yaxis.title.text, "消耗")
+        self.assertEqual(fig.layout.yaxis.type, "log")
+        self.assertEqual(fig.layout.yaxis.dtick, 1)
+        self.assertEqual(current.customdata[0][1], "120")
+        self.assertEqual(current.customdata[0][2], "60")
+        self.assertEqual(current.customdata[0][3], "+100%")
+        self.assertEqual(list(current.text), ["120<br>+100%", "80<br>-20%"])
+
+    def test_period_comparison_chart_shows_current_value_without_previous_baseline(self):
+        from app import _build_period_comparison_bar_figure
+
+        frame = pd.DataFrame(
+            [
+                {
+                    "category": "股友说",
+                    "spend": 120.0,
+                    "spend_previous": 60.0,
+                    "spend_change_rate": 1.0,
+                },
+                {
+                    "category": "新栏目",
+                    "spend": 80.0,
+                    "spend_previous": pd.NA,
+                    "spend_change_rate": pd.NA,
+                },
+            ]
+        )
+
+        fig = _build_period_comparison_bar_figure(frame, "category", "内容类型", "重点内容类型贡献")
+
+        current = next(trace for trace in fig.data if trace.name == "本期消耗")
+        previous = next(trace for trace in fig.data if trace.name == "上期消耗")
+        self.assertEqual(list(current.y), [120.0, 80.0])
+        self.assertEqual(previous.y[0], 60.0)
+        self.assertTrue(pd.isna(previous.y[1]))
+        self.assertEqual(list(current.text), ["120<br>+100%", "80"])
+        self.assertEqual(current.customdata[1][1], "80")
+        self.assertEqual(current.customdata[1][2], "-")
+        self.assertEqual(current.customdata[1][3], "")
+
+    def test_content_review_item_key_prefers_stable_content_identifiers(self):
+        from app import _content_review_item_key
+
+        self.assertEqual(
+            _content_review_item_key(
+                {
+                    "content_id": "content-1",
+                    "material_id": "material-1",
+                    "channel": "抖音商业化",
+                    "title": "标题",
+                }
+            ),
+            "content_id:content-1",
+        )
+        self.assertEqual(
+            _content_review_item_key(
+                {
+                    "content_id": "",
+                    "material_id": "material-1",
+                    "channel": "抖音商业化",
+                    "title": "标题",
+                }
+            ),
+            "material_id:material-1",
+        )
+        self.assertEqual(
+            _content_review_item_key(
+                {
+                    "content_id": "",
+                    "material_id": "",
+                    "channel": "抖音商业化",
+                    "title": "标题",
+                }
+            ),
+            "channel-title:抖音商业化:标题",
+        )
+
+    def test_content_review_pending_sync_filter_and_index_bounds(self):
+        from app import _content_review_pending_sync_count, _filter_content_review_pending_queue
+
+        queue = pd.DataFrame(
+            [
+                {"content_id": "saved", "material_id": "", "channel": "抖音商业化", "title": "已保存"},
+                {"content_id": "todo-1", "material_id": "", "channel": "抖音商业化", "title": "待处理1"},
+                {"content_id": "", "material_id": "todo-2", "channel": "抖音商业化", "title": "待处理2"},
+            ]
+        )
+
+        filtered, bounded_index = _filter_content_review_pending_queue(queue, {"content_id:saved"}, 5)
+
+        self.assertEqual(list(filtered["title"]), ["待处理1", "待处理2"])
+        self.assertEqual(bounded_index, 1)
+        self.assertEqual(_content_review_pending_sync_count({"content_id:saved"}), 1)
 
     def test_manual_recap_report_persists_separately_from_upload_reports(self):
         with TemporaryDirectory() as tmp:
@@ -1720,6 +1876,26 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertIn("曝光量", result.columns)
         self.assertNotIn("展示/曝光量", result.columns)
+
+    def test_localized_sorted_columns_hide_internal_compatibility_fields(self):
+        frame = pd.DataFrame(
+            {
+                "platform": ["抖音"],
+                "platform_group": ["抖音"],
+                "channel": ["抖音商业化"],
+                "account": ["同花顺投资"],
+                "account_raw": ["同花顺投资原始"],
+                "spend": [100],
+            }
+        )
+
+        result = localize_and_sort_columns(frame)
+
+        self.assertIn("平台", result.columns)
+        self.assertIn("渠道", result.columns)
+        self.assertIn("账号", result.columns)
+        self.assertNotIn("平台组", result.columns)
+        self.assertNotIn("原始账号", result.columns)
 
     def test_display_numbers_trim_insignificant_trailing_zeroes(self):
         self.assertEqual(format_display_number(67.90), "67.9")

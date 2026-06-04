@@ -86,6 +86,7 @@ class FieldMappingTests(unittest.TestCase):
         self.assertIn("content_form", internal_fields)
         self.assertIn("manual_category", internal_fields)
         self.assertNotIn("类型", mapping.field_by_internal("manual_category").source_columns)
+        self.assertIn("7日付费次数", mapping.source_columns_for("first_pay_count"))
 
     def test_config_validation_rejects_missing_required_field(self):
         data = _default_config()

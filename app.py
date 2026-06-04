@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import html
+import json
 from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -9,7 +10,6 @@ from urllib.parse import quote
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -75,7 +75,7 @@ from ops_data_workflow.topic_analysis import (
     summarize_persisted_topic_labels,
 )
 from ops_data_workflow.upload_input import detect_upload_channel_conflicts, infer_period_from_upload_names, materialize_uploaded_files
-from ops_data_workflow.workflow import run_archived_workflow, run_rollup_workflow
+from ops_data_workflow.workflow import refresh_historical_source_periods, run_archived_workflow, run_rollup_workflow
 
 
 APP_DATA_ROOT = Path("data")
@@ -153,6 +153,8 @@ BAR_CONTINUOUS_SCALE = ["#D7ECFF", "#64D2FF", "#0A84FF", "#0B3D91"]
 RATE_METRIC_COLUMNS = {"ctr", "first_pay_rate", "spend_change_rate", "activations_change_rate", "first_pay_count_change_rate", "activation_cost_change_rate", "first_pay_cost_change_rate"}
 SOURCE_TYPE_LABELS = {SOURCE_TYPE_UPLOAD: "上传原始包", "rollup": "系统汇总"}
 PERIOD_COMPARISON_CHART_HEIGHT = 420
+LOG_AXIS_MAJOR_TICK = 1
+CONTENT_REVIEW_QUEUE_HEIGHT = 560
 
 
 def _get_logo_base64() -> str:
@@ -638,6 +640,17 @@ def _store_artifacts(result) -> None:
     st.session_state["channel_comparison"] = result.channel_comparison
     st.session_state["comparison_note"] = result.comparison_note
     st.session_state["ai_summary"] = result.ai_summary
+    st.session_state["metadata_enrichment_summary"] = _load_metadata_enrichment_summary(result.archive_dir)
+
+
+def _load_metadata_enrichment_summary(archive_dir: Path) -> dict:
+    manifest_path = Path(archive_dir) / "period_manifest.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    summary = payload.get("metadata_enrichment")
+    return summary if isinstance(summary, dict) else {}
 
 
 def _ensure_generate_period_defaults() -> None:
@@ -1676,7 +1689,14 @@ def _page_generate() -> None:
             )
         else:
             st.session_state["overwrite_existing_channels"] = False
+        enable_metadata_enrichment = st.checkbox(
+            "尝试自动补充公开信息",
+            value=False,
+            key="enable_metadata_enrichment",
+            help="仅使用低风险公开信息：B站缓存/公开接口；抖音/小红书链接和ID推导。不会覆盖 Excel 已有字段，仅高消耗冲突或内容ID冲突进入人工复核。",
+        )
         generate = st.button("生成本周期数据", type="primary", width="stretch")
+        refresh_history = st.button("重算历史批次并补充公开信息", width="stretch")
 
     if generate:
         if not uploaded:
@@ -1692,9 +1712,16 @@ def _page_generate() -> None:
                     period_start,
                     period_end,
                     overwrite_existing_channels=overwrite_existing_channels,
+                    metadata_enrichment_mode="safe_public" if enable_metadata_enrichment else "off",
                 )
             except Exception as exc:
                 st.error(f"生成失败：{exc}")
+
+    if refresh_history:
+        try:
+            _run_historical_refresh_with_progress()
+        except Exception as exc:
+            st.error(f"历史批次重算失败：{exc}")
 
     _render_rollup_generator()
 
@@ -1703,12 +1730,35 @@ def _page_generate() -> None:
     else:
         st.info("可点击选择目录，或把多个 CSV / Excel / ZIP 拖入上传区；目录上传会保留子目录结构。")
 
+
+def _run_historical_refresh_with_progress():
+    with st.status("正在重算历史批次", expanded=True) as status:
+        results = refresh_historical_source_periods(
+            data_root=APP_DATA_ROOT,
+            processed_root=APP_PROCESSED,
+            output_root=APP_OUTPUTS,
+            db_path=APP_DB,
+            metadata_cache_dir=APP_DATA_ROOT / "metadata_cache",
+            env_path=ENV_PATH,
+            reference_root=APP_DATA_ROOT / "reference",
+        )
+        if not results:
+            st.session_state["historical_refresh_summary"] = "未找到可重算的历史原始数据目录。"
+            status.update(label="未找到可重算的历史原始数据目录", state="complete", expanded=False)
+            return []
+        latest = results[-1]
+        _store_artifacts(latest)
+        st.session_state["historical_refresh_summary"] = f"已重算 {len(results)} 个历史批次，并启用公开信息补充。"
+        status.update(label=st.session_state["historical_refresh_summary"], state="complete", expanded=False)
+        return results
+
 def _run_with_generation_progress(
     uploaded,
     period_start: date,
     period_end: date,
     *,
     overwrite_existing_channels: bool = False,
+    metadata_enrichment_mode: str = "off",
 ):
     with st.status(GENERATION_PROGRESS_STEPS[0], expanded=True) as status:
         progress_bar = st.progress(0, text=GENERATION_PROGRESS_STEPS[0])
@@ -1755,6 +1805,8 @@ def _run_with_generation_progress(
                         output_mode="ui_only",
                         enable_deepseek=True,
                         enable_external_context=False,
+                        metadata_enrichment_mode=metadata_enrichment_mode,
+                        metadata_cache_dir=APP_DATA_ROOT / "metadata_cache",
                     )
                 assert result is not None
             else:
@@ -1790,6 +1842,8 @@ def _run_with_generation_progress(
                     output_mode="ui_only",
                     enable_deepseek=True,
                     enable_external_context=False,
+                    metadata_enrichment_mode=metadata_enrichment_mode,
+                    metadata_cache_dir=APP_DATA_ROOT / "metadata_cache",
                 )
             _store_artifacts(result)
             progress_bar.progress(100, text="页面数据生成完成")
@@ -2105,6 +2159,68 @@ def _content_review_type_options(queue: pd.DataFrame, current: pd.Series) -> lis
     return values or ["资讯", "股友说", "盘点", "大佬采访", "问财问句"]
 
 
+def _content_review_item_key(row) -> str:
+    for column in ["content_id", "material_id"]:
+        value = row.get(column, "") if hasattr(row, "get") else ""
+        text = "" if pd.isna(value) else str(value).strip()
+        if text:
+            return f"{column}:{text}"
+    channel = row.get("channel", "") if hasattr(row, "get") else ""
+    title = row.get("title", "") if hasattr(row, "get") else ""
+    channel_text = "" if pd.isna(channel) else str(channel).strip()
+    title_text = "" if pd.isna(title) else str(title).strip()
+    return f"channel-title:{channel_text}:{title_text}"
+
+
+def _content_review_pending_state_key(batch_id: str) -> str:
+    return f"category_review_pending_sync:{batch_id}"
+
+
+def _content_review_pending_items(batch_id: str) -> set[str]:
+    stored = st.session_state.get(_content_review_pending_state_key(batch_id), set())
+    if isinstance(stored, (set, list, tuple)):
+        return {str(value) for value in stored if str(value).strip()}
+    return set()
+
+
+def _content_review_pending_sync_count(pending_items) -> int:
+    if not pending_items:
+        return 0
+    return len({str(value) for value in pending_items if str(value).strip()})
+
+
+def _mark_content_review_pending_sync(batch_id: str, item_key: str) -> int:
+    pending_items = _content_review_pending_items(batch_id)
+    if item_key:
+        pending_items.add(str(item_key))
+    st.session_state[_content_review_pending_state_key(batch_id)] = sorted(pending_items)
+    return _content_review_pending_sync_count(pending_items)
+
+
+def _clear_content_review_pending_sync(batch_id: str) -> None:
+    st.session_state[_content_review_pending_state_key(batch_id)] = []
+
+
+def _filter_content_review_pending_queue(
+    queue: pd.DataFrame,
+    pending_items,
+    index: int,
+) -> tuple[pd.DataFrame, int]:
+    filtered = queue.reset_index(drop=True).copy()
+    pending_keys = {str(value) for value in pending_items if str(value).strip()}
+    if pending_keys and not filtered.empty:
+        keep_mask = filtered.apply(lambda row: _content_review_item_key(row) not in pending_keys, axis=1)
+        filtered = filtered[keep_mask].reset_index(drop=True)
+    try:
+        requested_index = int(index)
+    except Exception:
+        requested_index = 0
+    if filtered.empty:
+        return filtered, 0
+    bounded_index = max(0, min(requested_index, len(filtered) - 1))
+    return filtered, bounded_index
+
+
 def _page_category_review() -> None:
     st.markdown(
         f"""
@@ -2184,6 +2300,44 @@ def _page_category_review() -> None:
 
     queue = all_review_items[all_review_items["needs_review"].astype(bool)].copy()
     queue = queue.sort_values(["spend", "rank_in_channel"], ascending=[False, True]).reset_index(drop=True)
+    pending_items = _content_review_pending_items(selected_batch_id)
+    pending_count = _content_review_pending_sync_count(pending_items)
+    sync_message_key = f"category_review_sync_message:{selected_batch_id}"
+    sync_message = st.session_state.pop(sync_message_key, "")
+    if sync_message:
+        st.success(str(sync_message))
+
+    sync_status_col, sync_action_col = st.columns([0.68, 0.32], gap="small")
+    with sync_status_col:
+        if pending_count:
+            st.warning(f"已保存 {pending_count} 条，尚未同步到当前周期数据。")
+        else:
+            st.caption("暂无待同步修改。")
+    with sync_action_col:
+        if st.button("同步当前周期数据", width="stretch", disabled=pending_count == 0):
+            with st.spinner("正在同步当前周期数据..."):
+                result = apply_review_resolutions_and_regenerate(
+                    APP_DB,
+                    selected_batch_id,
+                    output_root=APP_OUTPUTS,
+                    processed_root=APP_PROCESSED,
+                    category_rules_path=CATEGORY_RULES,
+                    env_path=ENV_PATH,
+                    output_mode="ui_only",
+                    enable_deepseek=True,
+                    enable_external_context=False,
+                )
+                _store_artifacts(result)
+                _clear_content_review_pending_sync(selected_batch_id)
+                st.session_state["category_review_index"] = 0
+                st.session_state[sync_message_key] = "当前周期数据已同步。"
+            st.rerun()
+
+    if "category_review_index" not in st.session_state:
+        st.session_state["category_review_index"] = 0
+    queue, index = _filter_content_review_pending_queue(queue, pending_items, st.session_state["category_review_index"])
+    st.session_state["category_review_index"] = index
+
     if queue.empty:
         st.success("当前筛选条件下没有需要人工确认的内容。")
         with st.expander("AI 已通过 / 全部 Top 素材预览"):
@@ -2201,14 +2355,8 @@ def _page_category_review() -> None:
             st.dataframe(localize_columns(all_review_items[preview_columns]), width="stretch", hide_index=True)
         return
 
-    if "category_review_index" not in st.session_state:
-        st.session_state["category_review_index"] = 0
-    st.session_state["category_review_index"] = min(
-        st.session_state["category_review_index"],
-        max(len(queue) - 1, 0),
-    )
-    index = st.session_state["category_review_index"]
     current = queue.iloc[index]
+    current_key = _content_review_item_key(current)
     content_url = str(current.get("content_url", "") or "").strip()
     current_l2 = str(current.get("category_l2", "") or current.get("content_category", "") or current.get("manual_category", "") or current.get("ai_category", "") or "")
 
@@ -2216,16 +2364,17 @@ def _page_category_review() -> None:
     with queue_col:
         st.subheader("人工异常队列")
         st.caption("仅展示分渠道 Top 素材中的低置信、缺链接或冲突项。")
-        for row_index, row in queue.head(10).iterrows():
-            active = row_index == index
-            marker = "▶ " if active else ""
-            with st.container(border=True):
-                st.markdown(f"**{marker}{row.get('channel', '-') or '-'} · #{row.get('rank_in_channel', '-') or '-'}**")
-                st.write(str(row.get("title", "") or "-"))
-                st.caption(
-                    f"{row.get('audit_flags', '') or row.get('ai_review_reason', '') or '-'} | "
-                    f"消耗 {_fmt_metric_number(row.get('spend', 0), 0)}"
-                )
+        with st.container(height=CONTENT_REVIEW_QUEUE_HEIGHT, border=False):
+            for row_index, row in queue.iterrows():
+                active = row_index == index
+                marker = "▶ " if active else ""
+                with st.container(border=True):
+                    st.markdown(f"**{marker}{row.get('channel', '-') or '-'} · #{row.get('rank_in_channel', '-') or '-'}**")
+                    st.write(str(row.get("title", "") or "-"))
+                    st.caption(
+                        f"{row.get('audit_flags', '') or row.get('ai_review_reason', '') or '-'} | "
+                        f"消耗 {_fmt_metric_number(row.get('spend', 0), 0)}"
+                    )
 
     with content_col:
         st.subheader("当前素材判断")
@@ -2268,7 +2417,7 @@ def _page_category_review() -> None:
 
     with action_col:
         st.subheader("确认结果")
-        review_key_prefix = f"review_item_{index}"
+        review_key_prefix = f"review_item_{current_key}"
         confirmed_url = st.text_input("内容链接", value=content_url, key=f"{review_key_prefix}_content_url")
         if confirmed_url.strip().lower().startswith(("http://", "https://")):
             st.link_button("打开校验", confirmed_url.strip(), width="stretch")
@@ -2314,7 +2463,7 @@ def _page_category_review() -> None:
                     pd.DataFrame(
                         [
                             {
-                                "issue_id": f"content-url:{index}:{current.get('content_id', '')}:{current.get('material_id', '')}",
+                                "issue_id": f"content-url:{current_key}",
                                 "issue_type": "Top内容审核",
                                 "review_action": "改字段",
                                 "channel": current.get("channel", ""),
@@ -2333,21 +2482,9 @@ def _page_category_review() -> None:
             if saved == 0 and url_saved == 0:
                 st.error("请先填写内容类型或新的内容链接，再保存当前审核。")
             else:
-                st.session_state["category_review_index"] = min(index + 1, max(len(queue) - 1, 0))
-                with st.spinner("正在同步当前周期数据..."):
-                    result = apply_review_resolutions_and_regenerate(
-                        APP_DB,
-                        selected_batch_id,
-                        output_root=APP_OUTPUTS,
-                        processed_root=APP_PROCESSED,
-                        category_rules_path=CATEGORY_RULES,
-                        env_path=ENV_PATH,
-                        output_mode="ui_only",
-                        enable_deepseek=True,
-                        enable_external_context=False,
-                    )
-                    _store_artifacts(result)
-                st.success("当前条目已保存并同步到后续数据。")
+                pending_count = _mark_content_review_pending_sync(selected_batch_id, current_key)
+                st.session_state["category_review_index"] = min(index, max(len(queue) - 2, 0))
+                st.success(f"当前条目已保存。已保存 {pending_count} 条，未同步修改需点击“同步当前周期数据”后才会更新总览和渠道页。")
                 st.rerun()
 
     with st.expander("AI 已通过 / 全部 Top 素材预览"):
@@ -2729,6 +2866,9 @@ def _render_short_table_blocks(frame: pd.DataFrame, label: str, rows_per_block: 
 def _display_generation_results() -> None:
     total_summary: pd.DataFrame = st.session_state["total_summary"]
     st.success(f"数据清洗并入库完成，周期标识：{st.session_state['batch_id']}")
+    if st.session_state.get("historical_refresh_summary"):
+        st.success(str(st.session_state["historical_refresh_summary"]))
+    _render_metadata_enrichment_summary(st.session_state.get("metadata_enrichment_summary", {}))
     st.subheader("总体核心指标")
     summary = build_dashboard_summary(st.session_state["platform_summary"])
     _render_kpis(summary)
@@ -2747,6 +2887,23 @@ def _display_generation_results() -> None:
         st.dataframe(localize_columns(st.session_state["platform_summary"]), width="stretch", hide_index=True)
 
     st.info("当前为页面数据模式：已保留清洗核验文件和页面展示数据，未生成下载产物或 AI 报告。")
+
+
+def _render_metadata_enrichment_summary(summary: dict) -> None:
+    if not summary or summary.get("mode") != "safe_public":
+        return
+    hint_rows = int(summary.get("hint_rows") or summary.get("conflict_rows") or 0)
+    metrics = [
+        ("自动补全行数", int(summary.get("filled_rows") or 0)),
+        ("记录提示行数", hint_rows),
+        ("高消耗需复核行数", int(summary.get("review_rows") or 0)),
+        ("公开接口失败行数", int(summary.get("error_rows") or 0)),
+    ]
+    st.caption(
+        "公开信息补充："
+        + "；".join(f"{label} {value}" for label, value in metrics)
+        + f"；缓存命中 {int(summary.get('cache_hits') or 0)}"
+    )
 
 
 def _render_kpis(summary) -> None:
@@ -3037,14 +3194,38 @@ def _axis_tick_format(metric: str) -> str:
     return ",.0f"
 
 
+def _metric_uses_log_axis(metric: str) -> bool:
+    return metric not in RATE_METRIC_COLUMNS
+
+
+def _bar_text_with_growth(value_text: str, growth_text: str) -> str:
+    return f"{value_text}<br>{growth_text}" if growth_text else value_text
+
+
+def _growth_hover_text(growth_text: str) -> str:
+    return f"<br>环比：{growth_text}" if growth_text else ""
+
+
 def _render_period_comparison_bar_chart(
     frame: pd.DataFrame,
     label_column: str,
     x_label: str,
     title: str,
 ) -> None:
-    if frame.empty or label_column not in frame.columns or "spend" not in frame.columns:
+    fig = _build_period_comparison_bar_figure(frame, label_column, x_label, title)
+    if fig is None:
         return
+    st.plotly_chart(fig, config={"displayModeBar": False})
+
+
+def _build_period_comparison_bar_figure(
+    frame: pd.DataFrame,
+    label_column: str,
+    x_label: str,
+    title: str,
+) -> go.Figure | None:
+    if frame.empty or label_column not in frame.columns or "spend" not in frame.columns:
+        return None
     chart = frame.copy()
     chart[label_column] = chart[label_column].fillna("").astype(str).str.strip()
     chart = chart[chart[label_column].ne("")]
@@ -3053,26 +3234,23 @@ def _render_period_comparison_bar_chart(
     chart["spend_change_rate"] = pd.to_numeric(chart.get("spend_change_rate", pd.NA), errors="coerce")
     chart = chart.dropna(subset=["spend"])
     if chart.empty:
-        return
+        return None
 
     chart["__axis_label"] = chart[label_column].map(_compact_axis_label)
     chart["__current_text"] = chart["spend"].map(lambda value: _format_chart_value(value, "spend"))
     chart["__previous_text"] = chart["spend_previous"].map(lambda value: _format_chart_value(value, "spend") or "-")
-    chart["__growth_text"] = chart["spend_change_rate"].map(lambda value: _fmt_growth_delta(value) or "（-）")
-    chart["__current_bar_text"] = chart["__current_text"] + "<br>环比 " + chart["__growth_text"]
-    chart["__current_index"] = 100.0
-    chart["__previous_index"] = (
-        chart["spend_previous"] / chart["spend"].where(chart["spend"].gt(0)) * 100
-    )
-    chart["__previous_index_plot"] = chart["__previous_index"].fillna(0.0)
-    customdata = chart[[label_column, "__current_text", "__previous_text", "__growth_text"]].to_numpy()
-    y_max = pd.concat([chart["__current_index"], chart["__previous_index_plot"]], ignore_index=True).max(skipna=True)
-    y_range = [0, max(118.0, float(y_max) * 1.18)] if pd.notna(y_max) and float(y_max) > 0 else [0, 118]
+    chart["__growth_text"] = chart["spend_change_rate"].map(lambda value: _fmt_growth_delta(value) or "")
+    chart["__current_bar_text"] = [
+        _bar_text_with_growth(value_text, growth_text)
+        for value_text, growth_text in zip(chart["__current_text"], chart["__growth_text"])
+    ]
+    chart["__growth_hover_text"] = chart["__growth_text"].map(_growth_hover_text)
+    customdata = chart[[label_column, "__current_text", "__previous_text", "__growth_text", "__growth_hover_text"]].to_numpy()
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
             x=chart["__axis_label"],
-            y=chart["__current_index"],
+            y=chart["spend"],
             text=chart["__current_bar_text"],
             customdata=customdata,
             marker={"color": "#0A84FF", "line": {"width": 0.8, "color": "rgba(255,255,255,0.72)"}},
@@ -3081,13 +3259,13 @@ def _render_period_comparison_bar_chart(
             texttemplate="%{text}",
             textposition="outside",
             cliponaxis=False,
-            hovertemplate=f"{x_label}：%{{customdata[0]}}<br>本期消耗：%{{customdata[1]}}<br>环比：%{{customdata[3]}}<extra></extra>",
+            hovertemplate=f"{x_label}：%{{customdata[0]}}<br>本期消耗：%{{customdata[1]}}%{{customdata[4]}}<extra></extra>",
         )
     )
     fig.add_trace(
         go.Bar(
             x=chart["__axis_label"],
-            y=chart["__previous_index_plot"],
+            y=chart["spend_previous"],
             text=chart["__previous_text"],
             customdata=customdata,
             marker={"color": "#8E9AAF", "line": {"width": 0.8, "color": "rgba(255,255,255,0.72)"}},
@@ -3103,6 +3281,7 @@ def _render_period_comparison_bar_chart(
         template="plotly_white",
         height=PERIOD_COMPARISON_CHART_HEIGHT,
         margin=dict(l=20, r=20, t=68, b=92),
+        barmode="group",
         bargap=0.24,
         bargroupgap=0.08,
         showlegend=True,
@@ -3114,8 +3293,14 @@ def _render_period_comparison_bar_chart(
         legend=dict(yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig.update_xaxes(title=x_label, tickangle=-25, automargin=True)
-    fig.update_yaxes(title="周期对比指数（本期=100）", tickformat=",.0f", range=y_range, gridcolor="rgba(95,115,148,0.16)")
-    st.plotly_chart(fig, config={"displayModeBar": False})
+    fig.update_yaxes(
+        title="消耗",
+        type="log",
+        dtick=LOG_AXIS_MAJOR_TICK,
+        tickformat=",.0f",
+        gridcolor="rgba(95,115,148,0.16)",
+    )
+    return fig
 
 
 def _render_platform_chart(
@@ -3138,7 +3323,7 @@ def _build_platform_chart_figure(
     if platform_summary.empty:
         return None
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig = go.Figure()
     trace_meta: list[dict[str, object]] = []
     comparison_by_channel = _chart_comparison_by_channel(channel_comparison)
     for metric_name, (y_metric, y_label, is_cost) in CHART_METRICS.items():
@@ -3167,17 +3352,23 @@ def _build_platform_chart_figure(
             na_position="last",
         )
         chart["__bar_text"] = chart[y_metric].map(lambda value: _format_chart_value(value, y_metric))
-        chart["__previous_text"] = chart[previous_column].map(lambda value: _format_chart_value(value, y_metric))
-        chart["__growth_text"] = chart[change_column].map(_fmt_growth_delta)
+        chart["__previous_text"] = chart[previous_column].map(lambda value: _format_chart_value(value, y_metric) or "-")
+        chart["__growth_text"] = chart[change_column].map(lambda value: _fmt_growth_delta(value) or "")
         chart["__axis_label"] = chart["channel"].map(_compact_axis_label)
-        trace_index = len(trace_meta) * 3
+        chart["__current_bar_text"] = [
+            _bar_text_with_growth(value_text, growth_text)
+            for value_text, growth_text in zip(chart["__bar_text"], chart["__growth_text"])
+        ]
+        chart["__growth_hover_text"] = chart["__growth_text"].map(_growth_hover_text)
+        trace_index = len(trace_meta) * 2
         visible = len(trace_meta) == 0
+        customdata = chart[["channel", "__bar_text", "__previous_text", "__growth_text", "__growth_hover_text"]].to_numpy()
         fig.add_trace(
             go.Bar(
                 x=chart["__axis_label"],
                 y=chart[y_metric],
-                text=chart["__bar_text"],
-                customdata=chart[["channel", "__bar_text"]].to_numpy(),
+                text=chart["__current_bar_text"],
+                customdata=customdata,
                 marker={"color": "#0A84FF", "line": {"width": 0.8, "color": "rgba(255,255,255,0.72)"}},
                 name=f"{metric_name} 本期",
                 legendgroup=metric_name,
@@ -3186,16 +3377,19 @@ def _build_platform_chart_figure(
                 texttemplate="%{text}",
                 textposition="outside",
                 cliponaxis=False,
-                hovertemplate=f"渠道：%{{customdata[0]}}<br>本期实际{y_label}：%{{customdata[1]}}<extra></extra>",
-            ),
-            secondary_y=False,
+                hovertemplate=(
+                    f"渠道：%{{customdata[0]}}<br>本期实际{y_label}：%{{customdata[1]}}"
+                    f"<br>上期实际{y_label}：%{{customdata[2]}}%{{customdata[4]}}"
+                    "<extra></extra>"
+                ),
+            )
         )
         fig.add_trace(
             go.Bar(
                 x=chart["__axis_label"],
                 y=chart[previous_column],
                 text=chart["__previous_text"],
-                customdata=chart[["channel", "__previous_text"]].to_numpy(),
+                customdata=customdata,
                 marker={"color": "#8E9AAF", "line": {"width": 0.8, "color": "rgba(255,255,255,0.72)"}},
                 name=f"{metric_name} 上期",
                 legendgroup=metric_name,
@@ -3204,27 +3398,12 @@ def _build_platform_chart_figure(
                 texttemplate="%{text}",
                 textposition="outside",
                 cliponaxis=False,
-                hovertemplate=f"渠道：%{{customdata[0]}}<br>上期实际{y_label}：%{{customdata[1]}}<extra></extra>",
-            ),
-            secondary_y=False,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=chart["__axis_label"],
-                y=chart[change_column] * 100,
-                text=chart["__growth_text"],
-                customdata=chart[["channel", "__growth_text"]].to_numpy(),
-                mode="lines+markers+text",
-                marker={"color": "#FF9F0A" if not is_cost else "#BF5AF2", "size": 9, "symbol": "diamond" if is_cost else "circle"},
-                line={"color": "#FF9F0A" if not is_cost else "#BF5AF2", "width": 2},
-                name=f"{metric_name} 环比",
-                legendgroup=metric_name,
-                visible=visible,
-                texttemplate="%{text}",
-                textposition="top center",
-                hovertemplate=f"渠道：%{{customdata[0]}}<br>{y_label}环比：%{{customdata[1]}}<extra></extra>",
-            ),
-            secondary_y=True,
+                hovertemplate=(
+                    f"渠道：%{{customdata[0]}}<br>上期实际{y_label}：%{{customdata[2]}}"
+                    f"<br>本期实际{y_label}：%{{customdata[1]}}%{{customdata[4]}}"
+                    "<extra></extra>"
+                ),
+            )
         )
         trace_meta.append(
             {
@@ -3234,6 +3413,7 @@ def _build_platform_chart_figure(
                 "title": f"分渠道{y_label}对比",
                 "height": max(360, min(680, 300 + len(chart) * 22)),
                 "trace_start": trace_index,
+                "log_axis": _metric_uses_log_axis(y_metric),
             }
         )
 
@@ -3242,9 +3422,9 @@ def _build_platform_chart_figure(
 
     buttons = []
     for button_index, meta in enumerate(trace_meta):
-        visible = [False] * (len(trace_meta) * 3)
+        visible = [False] * (len(trace_meta) * 2)
         start = int(meta["trace_start"])
-        for index in range(start, start + 3):
+        for index in range(start, start + 2):
             visible[index] = True
         buttons.append(
             {
@@ -3255,10 +3435,10 @@ def _build_platform_chart_figure(
                     {
                         "title.text": str(meta["title"]),
                         "yaxis.title.text": str(meta["y_label"]),
-                        "yaxis.tickformat": ",.0f",
+                        "yaxis.type": "log" if bool(meta["log_axis"]) else "linear",
+                        "yaxis.dtick": LOG_AXIS_MAJOR_TICK if bool(meta["log_axis"]) else None,
+                        "yaxis.tickformat": _axis_tick_format(str(meta["y_metric"])),
                         "yaxis.range": None,
-                        "yaxis2.title.text": "环比",
-                        "yaxis2.tickformat": ".1f",
                         "height": int(meta["height"]),
                     },
                 ],
@@ -3270,6 +3450,7 @@ def _build_platform_chart_figure(
         template="plotly_white",
         height=int(initial["height"]),
         margin=dict(l=20, r=20, t=104, b=92),
+        barmode="group",
         bargap=0.28,
         showlegend=True,
         plot_bgcolor="rgba(255,255,255,0.96)",
@@ -3277,7 +3458,6 @@ def _build_platform_chart_figure(
         font=dict(color="#10233f"),
         title=dict(text=str(initial["title"]), font=dict(size=18, color="#10233f")),
         legend=dict(yanchor="bottom", y=1.02, xanchor="right", x=1),
-        yaxis2=dict(title="环比", ticksuffix="%", gridcolor="rgba(255,255,255,0)", zeroline=True),
         updatemenus=[
             {
                 "type": "buttons",
@@ -3295,16 +3475,10 @@ def _build_platform_chart_figure(
     fig.update_xaxes(title="渠道", tickangle=-25, automargin=True)
     fig.update_yaxes(
         title=str(initial["y_label"]),
-        tickformat=",.0f",
+        type="log" if bool(initial["log_axis"]) else "linear",
+        dtick=LOG_AXIS_MAJOR_TICK if bool(initial["log_axis"]) else None,
+        tickformat=_axis_tick_format(str(initial["y_metric"])),
         gridcolor="rgba(95,115,148,0.16)",
-        secondary_y=False,
-    )
-    fig.update_yaxes(
-        title="环比",
-        ticksuffix="%",
-        gridcolor="rgba(255,255,255,0)",
-        zeroline=True,
-        secondary_y=True,
     )
     return fig
 

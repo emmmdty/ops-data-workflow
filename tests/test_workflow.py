@@ -1,5 +1,6 @@
 from pathlib import Path
 from contextlib import closing
+import json
 import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
@@ -8,7 +9,7 @@ from unittest.mock import patch
 import pandas as pd
 from openpyxl import load_workbook
 
-from ops_data_workflow.workflow import run_archived_workflow, run_workflow
+from ops_data_workflow.workflow import refresh_historical_source_periods, run_archived_workflow, run_workflow
 from ops_data_workflow.pipeline import analyze_canonical_frame, analyze_input_dir
 from ops_data_workflow.reference_tables import account_mapping_lookup, load_reference_tables, parse_period_from_raw_dir
 
@@ -429,6 +430,41 @@ class WorkflowTests(unittest.TestCase):
             channel_summary = result.channel_summary.set_index("channel")
             self.assertAlmostEqual(channel_summary.loc["小红书商业化", "activations"], 9.0)
             self.assertAlmostEqual(channel_summary.loc["小红书商业化", "first_pay_count"], 3.0)
+
+    def test_xiaohongshu_commercial_seven_day_pay_count_alias_is_ingested(self):
+        with TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            raw_dir.mkdir()
+            with pd.ExcelWriter(raw_dir / "小红书商业化.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "时间": "2026-05-15~2026-05-21",
+                            "标题": "小红书七日付费内容",
+                            "笔记ID": "note-seven-day-pay",
+                            "发布作者": "同花顺理财",
+                            "内容分类": "产品科普",
+                            "消费": 100.0,
+                            "展现量": 1000,
+                            "点击量": 100,
+                            "APP激活数": 9,
+                            "7日付费次数": 5,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="kos账号笔记投放数据", index=False)
+
+            result = analyze_input_dir(
+                raw_dir,
+                "2026-05-15",
+                "2026-05-21",
+                category_matcher=lambda items, category_library, env_path: {},
+            )
+
+            row = result.canonical.iloc[0]
+            self.assertEqual(row["channel"], "小红书商业化")
+            self.assertAlmostEqual(row["first_pay_count"], 5.0)
+            channel_summary = result.channel_summary.set_index("channel")
+            self.assertAlmostEqual(channel_summary.loc["小红书商业化", "first_pay_count"], 5.0)
 
     def test_xiaohongshu_commercial_metric_rates_are_not_ingested_as_counts(self):
         with TemporaryDirectory() as tmp:
@@ -877,8 +913,41 @@ xiaohongshu:
         self.assertEqual(item["content_category"], "资讯")
         self.assertEqual(item["ai_category"], "")
         self.assertEqual(item["category_status"], "人工标记")
-        self.assertFalse(bool(item["needs_manual_review"]))
-        self.assertEqual(item["conflict_details"], "")
+
+    def test_high_spend_douyin_unmatched_uses_stronger_local_category_rules(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-trading-mindset",
+                    "title": "股市是仅次于高考，最公平的竞争 #同花顺 #交易心法",
+                    "spend": 262031.87,
+                    "manual_category": "",
+                },
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-unknown-low",
+                    "title": "全国在校大学生博主招募，有意私信",
+                    "spend": 20.0,
+                    "manual_category": "",
+                },
+            ]
+        )
+
+        result = analyze_canonical_frame(
+            frame,
+            "2026-05-01",
+            "2026-05-31",
+            category_matcher=lambda items, category_library, env_path: {},
+        )
+
+        canonical = result.canonical.set_index("content_id")
+        self.assertEqual(canonical.loc["dy-trading-mindset", "content_category"], "交易心法")
+        self.assertEqual(canonical.loc["dy-trading-mindset", "category_status"], "高消耗规则匹配")
+        self.assertEqual(canonical.loc["dy-unknown-low", "content_category"], "")
+        self.assertEqual(canonical.loc["dy-unknown-low", "category_status"], "未匹配")
 
     def test_title_keyword_rules_complete_missing_category_before_ai_matcher(self):
         with TemporaryDirectory() as tmp:
@@ -1628,6 +1697,79 @@ xiaohongshu:
             workbook.close()
             self.assertTrue(result.total_summary_xlsx.exists())
 
+    def test_reporting_html_uses_log_axis_for_absolute_platform_chart(self):
+        from ops_data_workflow.reporting import write_outputs
+
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "out"
+            canonical = pd.DataFrame(
+                [
+                    {"channel": "抖音商业化", "spend": 1000.0, "activations": 100.0, "first_pay_count": 10.0},
+                    {"channel": "小红书商业化", "spend": 10.0, "activations": 1.0, "first_pay_count": 0.0},
+                ]
+            )
+            category_summary = pd.DataFrame(
+                [
+                    {
+                        "category_display": "股友说",
+                        "content_category": "股友说",
+                        "overall_score": 90.0,
+                        "activations": 100.0,
+                        "spend": 1000.0,
+                        "heat_score": 80.0,
+                        "first_pay_rate": 0.1,
+                    },
+                    {
+                        "category_display": "资讯",
+                        "content_category": "资讯",
+                        "overall_score": 30.0,
+                        "activations": 1.0,
+                        "spend": 10.0,
+                        "heat_score": 20.0,
+                        "first_pay_rate": 0.0,
+                    },
+                ]
+            )
+            platform_category_summary = pd.DataFrame(
+                [
+                    {"channel": "抖音商业化", "category_display": "股友说", "activations": 30.0},
+                    {"channel": "小红书商业化", "category_display": "资讯", "activations": 10.0},
+                ]
+            )
+            total_summary = pd.DataFrame(
+                [{"channel": "总计", "spend": 1010.0, "activations": 101.0, "first_pay_count": 10.0}]
+            )
+
+            report_html, *_ = write_outputs(
+                output_dir,
+                "2026-05-01",
+                "2026-05-31",
+                canonical,
+                category_summary,
+                pd.DataFrame(),
+                pd.DataFrame(),
+                platform_category_summary,
+                total_summary,
+                pd.DataFrame(),
+                pd.DataFrame(),
+                account_audit=pd.DataFrame(),
+                top_content_items=pd.DataFrame(),
+                cover_metrics=pd.DataFrame(),
+                data_quality=pd.DataFrame(),
+                review_queue=pd.DataFrame(),
+                preprocessing_report=pd.DataFrame(),
+                reference_tables={},
+                channel_comparison=pd.DataFrame(),
+                comparison_note="暂无对比",
+                ai_summary="",
+            )
+
+            html = report_html.read_text(encoding="utf-8")
+            self.assertIn('"type":"log"', html)
+            self.assertIn('"dtick":1', html)
+            self.assertIn("\\u771f\\u5b9e\\u6d88\\u8017", html)
+            self.assertIn("customdata[0]", html)
+
     def test_archived_workflow_ui_only_runs_ai_review_without_report_api_calls(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1910,6 +2052,211 @@ xiaohongshu:
             self.assertIn("渠道", platform_category_headers)
             self.assertIn("最终内容类别", platform_category_headers)
             workbook.close()
+
+    def test_archived_workflow_persists_safe_public_metadata_enrichment_from_cache(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            metadata_cache = tmp_path / "metadata-cache"
+            cache_item = metadata_cache / "bilibili" / "BV1workflow1.json"
+            cache_item.parent.mkdir(parents=True)
+            cache_item.write_text(
+                json.dumps(
+                    {
+                        "id": "BV1workflow1",
+                        "link": "https://www.bilibili.com/video/BV1workflow1/",
+                        "title": "缓存标题",
+                        "tags": "财经",
+                        "published_at": "2026-05-09",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            pd.DataFrame(
+                [
+                    {
+                        "视频BVID": "BV1workflow1",
+                        "花费": 10.0,
+                        "展示量": 100,
+                        "点击量": 10,
+                        "应用激活数": 2,
+                        "应用内首次付费次数": 1,
+                    }
+                ]
+            ).to_csv(raw_dir / "B站数据.csv", index=False, encoding="utf-8-sig")
+
+            result = run_archived_workflow(
+                raw_dir,
+                "2026-05-08",
+                "2026-05-14",
+                output_root=tmp_path / "outputs",
+                processed_root=tmp_path / "processed",
+                db_path=tmp_path / ".runtime" / "workflow.sqlite3",
+                output_mode="ui_only",
+                enable_deepseek=False,
+                enable_external_context=False,
+                metadata_enrichment_mode="safe_public",
+                metadata_cache_dir=metadata_cache,
+            )
+
+            with closing(sqlite3.connect(tmp_path / ".runtime" / "workflow.sqlite3")) as conn:
+                row = conn.execute(
+                    """
+                    select content_url, title, source_time, metadata_source, metadata_tags
+                    from canonical_items
+                    where batch_id = ?
+                    """,
+                    (result.batch_id,),
+                ).fetchone()
+
+            self.assertEqual(row[0], "https://www.bilibili.com/video/BV1workflow1/")
+            self.assertEqual(row[1], "缓存标题")
+            self.assertEqual(row[2], "2026-05-09")
+            self.assertEqual(row[3], "metadata_cache")
+            self.assertEqual(row[4], "财经")
+
+    def test_archived_workflow_can_force_reclean_existing_cleaned_workbook_for_metadata_enrichment(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            stale_cleaned = raw_dir / "cleaned.xlsx"
+            with pd.ExcelWriter(stale_cleaned, engine="openpyxl") as writer:
+                pd.DataFrame(
+                    [
+                        {
+                            "platform": "B站",
+                            "platform_group": "B站",
+                            "channel": "B站",
+                            "content_id": "BV1stale001",
+                            "title": "旧清洗标题",
+                            "content_url": "",
+                            "spend": 1.0,
+                            "impressions": 1.0,
+                            "clicks": 1.0,
+                            "activations": 1.0,
+                            "first_pay_count": 1.0,
+                        }
+                    ]
+                ).to_excel(writer, sheet_name="清洗后明细", index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "视频BVID": "BV1fresh001",
+                        "花费": 10.0,
+                        "展示量": 100,
+                        "点击量": 10,
+                        "应用激活数": 2,
+                        "应用内首次付费次数": 1,
+                    }
+                ]
+            ).to_csv(raw_dir / "B站数据.csv", index=False, encoding="utf-8-sig")
+
+            metadata_cache = tmp_path / "metadata-cache"
+            cache_item = metadata_cache / "bilibili" / "BV1fresh001.json"
+            cache_item.parent.mkdir(parents=True)
+            cache_item.write_text(
+                json.dumps(
+                    {
+                        "id": "BV1fresh001",
+                        "link": "https://www.bilibili.com/video/BV1fresh001/",
+                        "title": "原始表补全标题",
+                        "published_at": "2026-05-09",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_archived_workflow(
+                raw_dir,
+                "2026-05-08",
+                "2026-05-14",
+                output_root=tmp_path / "outputs",
+                processed_root=tmp_path / "processed",
+                db_path=tmp_path / ".runtime" / "workflow.sqlite3",
+                output_mode="ui_only",
+                enable_deepseek=False,
+                enable_external_context=False,
+                metadata_enrichment_mode="safe_public",
+                metadata_cache_dir=metadata_cache,
+                force_reclean=True,
+            )
+
+            self.assertIn("BV1fresh001", set(result.canonical["content_id"]))
+            self.assertNotIn("BV1stale001", set(result.canonical["content_id"]))
+            self.assertEqual(result.top_content_items.iloc[0]["title"], "原始表补全标题")
+
+    def test_refresh_historical_source_periods_rebuilds_from_raw_sources_with_safe_public_metadata(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_root = tmp_path / "data"
+            source_dir = data_root / "weeks" / "20260508-20260514"
+            source_dir.mkdir(parents=True)
+            pd.DataFrame(
+                [
+                    {
+                        "视频BVID": "BV1history1",
+                        "花费": 20.0,
+                        "展示量": 200,
+                        "点击量": 20,
+                        "应用激活数": 4,
+                        "应用内首次付费次数": 2,
+                    }
+                ]
+            ).to_csv(source_dir / "B站数据.csv", index=False, encoding="utf-8-sig")
+            processed_dir = tmp_path / "processed" / "20260508-20260514" / "upload:week:20260508-20260514"
+            processed_dir.mkdir(parents=True)
+            with pd.ExcelWriter(processed_dir / "cleaned.xlsx", engine="openpyxl") as writer:
+                pd.DataFrame([{"channel": "B站", "content_id": "BV1oldhist"}]).to_excel(
+                    writer,
+                    sheet_name="清洗后明细",
+                    index=False,
+                )
+            metadata_cache = tmp_path / "metadata-cache"
+            cache_item = metadata_cache / "bilibili" / "BV1history1.json"
+            cache_item.parent.mkdir(parents=True)
+            cache_item.write_text(
+                json.dumps(
+                    {
+                        "id": "BV1history1",
+                        "link": "https://www.bilibili.com/video/BV1history1/",
+                        "title": "历史重算标题",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            results = refresh_historical_source_periods(
+                data_root=data_root,
+                processed_root=tmp_path / "processed",
+                output_root=tmp_path / "outputs",
+                db_path=tmp_path / ".runtime" / "workflow.sqlite3",
+                metadata_cache_dir=metadata_cache,
+            )
+
+            self.assertEqual([result.batch_id for result in results], ["upload:week:20260508-20260514"])
+            with closing(sqlite3.connect(tmp_path / ".runtime" / "workflow.sqlite3")) as conn:
+                canonical_row = conn.execute(
+                    """
+                    select content_id, title, metadata_source
+                    from canonical_items
+                    where batch_id = 'upload:week:20260508-20260514'
+                    """
+                ).fetchone()
+                top_row = conn.execute(
+                    """
+                    select content_id, title, content_url
+                    from top_content_items
+                    where batch_id = 'upload:week:20260508-20260514'
+                    """
+                ).fetchone()
+
+            self.assertEqual(canonical_row, ("BV1history1", "历史重算标题", "metadata_cache"))
+            self.assertEqual(top_row, ("BV1history1", "历史重算标题", "https://www.bilibili.com/video/BV1history1/"))
 
 
 if __name__ == "__main__":
