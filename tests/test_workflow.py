@@ -2030,14 +2030,88 @@ xiaohongshu:
         queue = _build_review_queue(pd.DataFrame(rows))
 
         queued_titles = set(queue["title"])
-        self.assertEqual(len(queue), 24)
+        self.assertEqual(len(queue), 23)
         self.assertIn("低风险 AI 已分类素材 00", queued_titles)
         self.assertIn("低风险 AI 已分类素材 21", queued_titles)
-        self.assertIn("低风险 AI 已分类素材 23", queued_titles)
         self.assertIn("低风险 AI 已分类素材 24", queued_titles)
         self.assertNotIn("低风险 AI 已分类素材 22", queued_titles)
+        self.assertNotIn("低风险 AI 已分类素材 23", queued_titles)
         self.assertIn("content_url", queue.columns)
         self.assertTrue(queue["needs_manual_review"].astype(bool).all())
+
+    def test_review_queue_caps_to_highest_priority_items_per_batch(self):
+        rows = []
+
+        def append_row(
+            title: str,
+            *,
+            spend: float,
+            channel: str = "抖音商业化",
+            review_reasons: str = "",
+            conflict_details: str = "",
+            content_url: str = "https://example.com/item",
+            needs_manual_review: object = False,
+            activations: int = 1,
+        ) -> None:
+            rows.append(
+                {
+                    "period_start": "2026-05-15",
+                    "period_end": "2026-05-21",
+                    "channel": channel,
+                    "title": title,
+                    "content_url": content_url,
+                    "content_id": title,
+                    "material_id": f"mat-{title}",
+                    "content_category": "资讯",
+                    "category_l2": "资讯",
+                    "category_l3": "",
+                    "category_source": "自动补齐",
+                    "category_confidence": 0.75,
+                    "review_status": "待复核",
+                    "needs_manual_review": needs_manual_review,
+                    "review_reasons": review_reasons,
+                    "conflict_details": conflict_details,
+                    "spend": spend,
+                    "activations": activations,
+                }
+            )
+
+        for index in range(5):
+            append_row(
+                f"高消耗冲突 {index}",
+                spend=3000 + index,
+                review_reasons="内容ID冲突",
+                conflict_details="内容ID冲突",
+            )
+        for index in range(5):
+            append_row(f"高消耗缺链接 {index}", spend=2800 + index, content_url="")
+        for index in range(5):
+            append_row(
+                f"渠道Top缺链接 {index}",
+                spend=1500 - index,
+                channel="B站市场部",
+                content_url="",
+            )
+        for index in range(60):
+            append_row(f"高消耗普通 {index:02d}", spend=10000 - index * 10, activations=index)
+        for index in range(10):
+            append_row(
+                f"低消耗宽泛待复核 {index}",
+                spend=100 + index,
+                needs_manual_review=True,
+                review_reasons="分类待复核",
+            )
+
+        queue = _build_review_queue(pd.DataFrame(rows))
+
+        queued_titles = set(queue["title"])
+        self.assertEqual(len(queue), 49)
+        self.assertTrue({f"高消耗冲突 {index}" for index in range(5)} <= queued_titles)
+        self.assertTrue({f"高消耗缺链接 {index}" for index in range(5)} <= queued_titles)
+        self.assertTrue({f"渠道Top缺链接 {index}" for index in range(5)} <= queued_titles)
+        self.assertIn("高消耗普通 00", queued_titles)
+        self.assertNotIn("高消耗普通 59", queued_titles)
+        self.assertFalse(any(title.startswith("低消耗宽泛待复核") for title in queued_titles))
 
     def test_workflow_summarizes_channels_without_external_totals(self):
         with TemporaryDirectory() as tmp:

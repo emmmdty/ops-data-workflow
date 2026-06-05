@@ -96,6 +96,7 @@ STANDARD_COLUMNS = [
 INTERNAL_COMPAT_COLUMNS = {"platform", "platform_group"}
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
 REVIEW_QUEUE_TOP_N = 20
+REVIEW_QUEUE_MAX_ITEMS = 49
 REVIEW_QUEUE_HIGH_SPEND_THRESHOLD = 2000.0
 REVIEW_QUEUE_CRITICAL_FIELDS = [
     ("content_url", "内容链接"),
@@ -1785,7 +1786,8 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
     high_spend = spend.ge(REVIEW_QUEUE_HIGH_SPEND_THRESHOLD)
     high_risk = _review_queue_high_risk_mask(prepared)
     missing_critical = _review_queue_missing_critical_mask(prepared)
-    queue = prepared[top_content | high_spend | high_risk | missing_critical].copy()
+    candidate_mask = high_risk | high_spend | (top_content & missing_critical)
+    queue = prepared[candidate_mask].copy()
     if queue.empty:
         return pd.DataFrame(
             columns=[
@@ -1830,6 +1832,12 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
                 "review_action",
             ]
         )
+    queue["__review_priority"] = _review_queue_priority(
+        high_spend.loc[queue.index],
+        high_risk.loc[queue.index],
+        missing_critical.loc[queue.index],
+        top_content.loc[queue.index],
+    )
     queue["rank_in_channel"] = queue["__review_rank_in_channel"].astype("Int64")
     queue["review_reasons"] = queue.apply(_review_queue_reasons, axis=1)
     queue["needs_manual_review"] = True
@@ -1877,7 +1885,11 @@ def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
     for column in columns:
         if column not in queue.columns:
             queue[column] = ""
-    return queue.sort_values(["spend", "rank_in_channel", "activations"], ascending=[False, True, False])[columns].reset_index(drop=True)
+    queue = queue.sort_values(
+        ["__review_priority", "spend", "rank_in_channel", "activations"],
+        ascending=[True, False, True, False],
+    ).head(REVIEW_QUEUE_MAX_ITEMS)
+    return queue[columns].reset_index(drop=True)
 
 
 def _review_queue_rank_in_channel(canonical: pd.DataFrame, spend: pd.Series) -> pd.Series:
@@ -1898,8 +1910,22 @@ def _review_queue_high_risk_mask(canonical: pd.DataFrame) -> pd.Series:
     matched = pd.Series(False, index=canonical.index)
     for pattern in REVIEW_QUEUE_HIGH_RISK_PATTERNS:
         matched = matched | text.str.contains(pattern, na=False)
-    manual_flag = canonical.get("needs_manual_review", pd.Series(False, index=canonical.index)).map(_review_queue_truthy)
-    return matched | manual_flag
+    return matched
+
+
+def _review_queue_priority(
+    high_spend: pd.Series,
+    high_risk: pd.Series,
+    missing_critical: pd.Series,
+    top_content: pd.Series,
+) -> pd.Series:
+    priority = pd.Series(5, index=high_spend.index, dtype="int64")
+    priority.loc[high_spend & high_risk] = 0
+    priority.loc[(priority == 5) & high_spend & missing_critical] = 1
+    priority.loc[(priority == 5) & top_content & missing_critical] = 2
+    priority.loc[(priority == 5) & high_spend] = 3
+    priority.loc[(priority == 5) & high_risk] = 4
+    return priority
 
 
 def _review_queue_missing_critical_mask(canonical: pd.DataFrame) -> pd.Series:
@@ -1937,8 +1963,6 @@ def _review_row_has_high_risk_conflict(row: pd.Series) -> bool:
         str(row.get(column, "") or "")
         for column in ["review_reasons", "conflict_details", "match_risk_level", "match_risk_reason"]
     )
-    if _review_queue_truthy(row.get("needs_manual_review", False)):
-        return True
     return any(pattern in text for pattern in REVIEW_QUEUE_HIGH_RISK_PATTERNS)
 
 

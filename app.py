@@ -2239,7 +2239,7 @@ def _page_category_review() -> None:
             <div style="font-size:.86rem;font-weight:700;color:#5f7394;margin-bottom:.2rem;">内容审核</div>
             <div style="font-size:2.05rem;line-height:1.1;font-weight:760;color:#10233f;">仅需审核重点内容</div>
             <div style="margin-top:.35rem;color:#5f7394;">
-                队列默认收录每渠道 Top 20、单条消耗 2000 元以上、冲突和关键字段补齐失败内容；普通低风险 AI 分类结果不会全量进入审核队列。
+                系统只推送最高优先级的少量人工审核项，每个周期少于 50 条；普通低风险 AI 分类结果不会全量进入审核队列。
             </div>
         </div>
         """,
@@ -2378,7 +2378,7 @@ def _page_category_review() -> None:
     queue_col, content_col, action_col = st.columns([0.95, 1.5, 1.05])
     with queue_col:
         st.subheader("人工异常队列")
-        st.caption("仅展示高消耗、分渠道 Top、冲突或关键字段补齐失败内容。")
+        st.caption("仅展示系统挑出的最高优先级审核项；每个周期少于 50 条。")
         with st.container(height=CONTENT_REVIEW_QUEUE_HEIGHT, border=False):
             for row_index, row in queue.iterrows():
                 active = row_index == index
