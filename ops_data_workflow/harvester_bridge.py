@@ -825,6 +825,7 @@ def _harvester_capture_env(harvester_root: Path) -> dict[str, str]:
     env["HARVESTER_PROGRESS_LOGS"] = "1"
     env["CRAWL_BROWSER_HEADLESS"] = "1"
     env["MATERIAL_BROWSER_FALLBACK_HEADLESS"] = "1"
+    env["PLAYWRIGHT_HEADLESS"] = "1"
     env["LOGIN_CHECK_HEADLESS"] = "1"
     return env
 
