@@ -968,7 +968,7 @@ class DashboardTests(unittest.TestCase):
     def test_format_beijing_datetime_converts_utc_created_at_for_selector(self):
         result = format_beijing_datetime("2026-05-19T01:02:03+00:00")
 
-        self.assertEqual(result, "2026年05月19日  09:02:03")
+        self.assertEqual(result, "2026-05-19 09:02:03")
 
     def test_list_successful_dashboard_batches_keeps_latest_batch_per_period(self):
         with TemporaryDirectory() as tmp:

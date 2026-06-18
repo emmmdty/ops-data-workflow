@@ -267,10 +267,13 @@ def format_beijing_datetime(value: object) -> str:
     """Format stored batch timestamps as Beijing time for selectors."""
     if value is None or pd.isna(value):
         return ""
+    text = str(value).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", text):
+        return text
     timestamp = pd.to_datetime(value, errors="coerce", utc=True)
     if pd.isna(timestamp):
-        return str(value)
-    return timestamp.tz_convert(BEIJING_TIMEZONE).strftime("%Y年%m月%d日  %H:%M:%S")
+        return text
+    return timestamp.tz_convert(BEIJING_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def load_latest_dashboard_items(db_path: Path) -> pd.DataFrame:

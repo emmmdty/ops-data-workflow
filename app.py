@@ -45,7 +45,7 @@ from ops_data_workflow.periods import (
     review_period_from_dates,
 )
 from ops_data_workflow.recap_settings import get_recap_settings, update_recap_settings
-from ops_data_workflow.reporting import format_display_number, localize_columns
+from ops_data_workflow.reporting import DISPLAY_NUMERIC_COLUMNS, format_display_number, localize_columns
 from ops_data_workflow.rollups import rollup_period_for, select_rollup_component_batches
 from ops_data_workflow.source_storage import source_dir_for_period, source_storage_key
 from ops_data_workflow.storage import (
@@ -87,9 +87,36 @@ ENV_PATH = Path(".env")
 HARVESTER_ENV_PATH = Path("/Users/tjk/Documents/Codex/harvester-THS/.env")
 
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
+INTEGER_DISPLAY_COLUMNS = {
+    "impressions",
+    "clicks",
+    "activations",
+    "first_pay_count",
+    "item_count",
+    "unique_content_count",
+    "material_count",
+    "channel_count",
+    "merged_row_count",
+    "rank_position",
+    "pending_item_count",
+    "secondary_category_count",
+    "observed_count",
+    "count",
+    "total",
+}
+PERCENT_DISPLAY_COLUMNS = {
+    column
+    for column in DISPLAY_NUMERIC_COLUMNS
+    if column.endswith("_share") or column.endswith("_rate")
+} | {"ctr", "share"}
+TABLE_NUMERIC_COLUMNS = DISPLAY_NUMERIC_COLUMNS | {"share"}
+LOCALIZED_TABLE_NUMERIC_COLUMNS = {
+    localize_columns(pd.DataFrame(columns=[column])).columns[0]: column
+    for column in TABLE_NUMERIC_COLUMNS
+}
 
 
-st.set_page_config(page_title="原生内容投放分析工作台", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="原生内容投放分析工作台", layout="wide", initial_sidebar_state="collapsed")
 
 
 def _inject_theme() -> None:
@@ -109,6 +136,20 @@ def _inject_theme() -> None:
             background: #eef3f8;
             border-right: 1px solid #d8e1ec;
         }
+        [data-testid="stExpandSidebarButton"] {
+            width: 36px;
+            height: 36px;
+            margin: 12px 0 0 12px;
+            border: 1px solid #d0dae7;
+            border-radius: 8px;
+            background: #ffffff;
+            box-shadow: 0 6px 16px rgba(25, 40, 68, 0.12);
+        }
+        [data-testid="stExpandSidebarButton"]:hover,
+        [data-testid="stExpandSidebarButton"]:focus {
+            border-color: #7aa7df;
+            background: #f5f9ff;
+        }
         h1, h2, h3, label, [data-testid="stMarkdownContainer"] {
             letter-spacing: 0;
         }
@@ -119,11 +160,17 @@ def _inject_theme() -> None:
             border-radius: 8px;
             background: #ffffff;
         }
-        div[data-testid="stMetricValue"] {
+        div[data-testid="stMetricValue"],
+        div[data-testid="stMetricValue"] > div,
+        div[data-testid="stMetricValue"] p {
             font-variant-numeric: tabular-nums;
             line-height: 1.15;
-            white-space: normal;
+            max-width: 100%;
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
             overflow-wrap: anywhere;
+            word-break: break-word;
         }
         div[data-testid="stDataFrame"], div[data-testid="stFileUploader"], [data-testid="stExpander"] details {
             border-radius: 8px;
@@ -133,13 +180,14 @@ def _inject_theme() -> None:
             min-height: 42px;
             font-weight: 600;
         }
-        [data-testid="stToolbar"],
+        .weight-button-spacer {
+            height: 1.7rem;
+        }
         [data-testid="stDecoration"],
         [data-testid="stHeaderActionElements"],
         [data-testid="stAppDeployButton"],
         [data-testid="stMainMenu"],
         #MainMenu,
-        header [data-testid="stToolbar"],
         [data-testid="stDataFrame"] button[title],
         [data-testid="stDataFrame"] [aria-label="Show/hide columns"],
         [data-testid="stDataFrame"] [aria-label="Download as CSV"],
@@ -308,6 +356,100 @@ def _inject_theme() -> None:
             color: #0d4f9f;
             font-size: 1.08rem;
         }
+        .local-recap-metric {
+            min-height: 118px;
+            padding: 14px 16px;
+            border: 1px solid #dce4ef;
+            border-radius: 8px;
+            background: #ffffff;
+        }
+        .local-recap-label {
+            color: #2d3748;
+            font-size: 0.9rem;
+            font-weight: 500;
+            line-height: 1.25;
+            margin-bottom: 6px;
+        }
+        .local-recap-value-line {
+            align-items: baseline;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            line-height: 1.1;
+            margin-bottom: 8px;
+        }
+        .local-recap-value {
+            color: #2b3141;
+            font-size: 2rem;
+            font-variant-numeric: tabular-nums;
+            font-weight: 500;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+        .local-recap-share {
+            color: #49637f;
+            font-size: 0.82rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .local-recap-note {
+            color: #6b778c;
+            font-size: 0.78rem;
+            line-height: 1.35;
+        }
+        .channel-overview-table-wrap {
+            width: 100%;
+            overflow-x: auto;
+            border: 1px solid #dce4ef;
+            border-radius: 8px;
+            background: #ffffff;
+        }
+        .channel-overview-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #ffffff;
+            color: #1f2937;
+            font-size: 0.86rem;
+        }
+        .channel-overview-table th,
+        .channel-overview-table td {
+            border-right: 1px solid #e5ebf3;
+            border-bottom: 1px solid #e5ebf3;
+            padding: 8px 10px;
+            text-align: right;
+            vertical-align: middle;
+            white-space: nowrap;
+        }
+        .channel-overview-table th:first-child,
+        .channel-overview-table td:first-child {
+            text-align: left;
+        }
+        .channel-overview-table th {
+            background: #f7f9fc;
+            color: #6b7280;
+            font-weight: 400;
+        }
+        .channel-overview-table tr:last-child td {
+            border-bottom: 0;
+        }
+        .channel-overview-table th:last-child,
+        .channel-overview-table td:last-child {
+            border-right: 0;
+        }
+        .channel-value {
+            color: #1f2937;
+            font-weight: 400;
+        }
+        .channel-delta {
+            margin-left: 4px;
+            font-weight: 600;
+        }
+        .channel-delta-good {
+            color: #c0392b;
+        }
+        .channel-delta-bad {
+            color: #1f8a4c;
+        }
         .top-link-open {
             color: #1d67c5;
             text-decoration: none;
@@ -399,14 +541,14 @@ def _page_overview() -> None:
     previous_items = _overview_items_for_batch(previous_batch_id) if previous_batch_id else pd.DataFrame()
 
     st.caption(_batch_caption(record))
-    st.subheader("分渠道总览")
     channel_totals = _channel_totals_for_display(
         totals,
         items,
         activation_weight=settings.activation_weight,
         first_pay_weight=settings.first_pay_weight,
+        previous_totals=previous_totals,
+        previous_items=previous_items,
     )
-    _show_frame(_display_value_columns(channel_totals), height=320, fit_all_rows=True)
 
     _render_recap_weight_settings(settings, key_prefix="overview")
     metrics = _overview_metrics(
@@ -428,6 +570,9 @@ def _page_overview() -> None:
     _render_metric_row(metrics, previous_metrics)
     previous_record = read_batch_record(APP_DB, previous_batch_id) if previous_batch_id else {}
     st.caption(_comparison_caption(record, previous_record))
+
+    st.subheader("分渠道总览")
+    _render_channel_totals_table(channel_totals)
 
     status_metrics = _overview_status_metrics(items, totals, manifests, recap_items)
     status_columns = st.columns(len(status_metrics))
@@ -559,7 +704,14 @@ def _page_high_value_recap() -> None:
     manifests = list_harvester_asset_manifests(APP_DB, batch_id=batch_id)
     _render_channel_top_link_cards(top_pool, manifests=manifests)
     recap_tables = _build_local_recap_tables(APP_DB, batch_id, top_pool)
-    _render_local_recap_tables(recap_tables)
+    totals = list_period_channel_totals(APP_DB, batch_id=batch_id)
+    total_metrics = _overview_metrics(
+        totals,
+        items,
+        activation_weight=settings.activation_weight,
+        first_pay_weight=settings.first_pay_weight,
+    )
+    _render_local_recap_tables(recap_tables, total_metrics=total_metrics)
     _show_frame(_top_pool_display(top_pool), height=420)
     if top_pool.empty:
         st.info("当前周期没有达到数量排名或阈值条件的素材。")
@@ -1010,6 +1162,7 @@ def _render_recap_weight_settings(settings, *, key_prefix: str) -> None:
             step=0.1,
             key=f"{key_prefix}_first_pay_weight",
         )
+        c3.markdown('<div class="weight-button-spacer"></div>', unsafe_allow_html=True)
         if c3.button("保存权重", width="stretch", key=f"{key_prefix}_save_weights"):
             update_recap_settings(
                 APP_DB,
@@ -1019,7 +1172,11 @@ def _render_recap_weight_settings(settings, *, key_prefix: str) -> None:
             st.success("权重已保存。")
             st.rerun()
         if settings.updated_at:
-            st.caption(f"当前默认权重更新时间：{settings.updated_at}")
+            st.caption(_recap_weight_updated_at_caption(settings.updated_at))
+
+
+def _recap_weight_updated_at_caption(updated_at: object) -> str:
+    return f"当前默认权重更新时间：{format_beijing_datetime(updated_at)}"
 
 
 def _overview_metrics(
@@ -1125,12 +1282,45 @@ def _channel_totals_for_display(
     *,
     activation_weight: float = 1.0,
     first_pay_weight: float = 1.0,
+    previous_totals: pd.DataFrame | None = None,
+    previous_items: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    empty_columns = ["channel", "spend", "impressions", "activations", "first_pay_count", "activation_cost", "first_pay_cost", "value"]
     source = _without_total_rows(_metric_source_frame(totals, items))
     if source.empty:
-        return pd.DataFrame(
-            columns=["channel", "spend", "impressions", "activations", "first_pay_count", "activation_cost", "first_pay_cost", "value"]
+        return pd.DataFrame(columns=empty_columns)
+    grouped = _summarize_channel_totals_for_display(
+        source,
+        activation_weight=activation_weight,
+        first_pay_weight=first_pay_weight,
+        empty_columns=empty_columns,
+    )
+    if previous_totals is not None or previous_items is not None:
+        previous_source = _without_total_rows(
+            _metric_source_frame(
+                previous_totals if previous_totals is not None else pd.DataFrame(),
+                previous_items if previous_items is not None else pd.DataFrame(),
+            )
         )
+        previous_grouped = _summarize_channel_totals_for_display(
+            previous_source,
+            activation_weight=activation_weight,
+            first_pay_weight=first_pay_weight,
+            empty_columns=empty_columns,
+        )
+        grouped.attrs["metric_deltas"] = _channel_metric_delta_metadata(grouped, previous_grouped)
+    return grouped
+
+
+def _summarize_channel_totals_for_display(
+    source: pd.DataFrame,
+    *,
+    activation_weight: float,
+    first_pay_weight: float,
+    empty_columns: list[str],
+) -> pd.DataFrame:
+    if source.empty:
+        return pd.DataFrame(columns=empty_columns)
     frame = source.copy()
     for column in ["channel", *NUMERIC_COLUMNS]:
         if column not in frame.columns:
@@ -1138,9 +1328,9 @@ def _channel_totals_for_display(
     frame["channel"] = frame["channel"].map(_text)
     frame = frame[frame["channel"].ne("")].copy()
     if frame.empty:
-        return pd.DataFrame(
-            columns=["channel", "spend", "impressions", "activations", "first_pay_count", "activation_cost", "first_pay_cost", "value"]
-        )
+        return pd.DataFrame(columns=empty_columns)
+    for column in NUMERIC_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
     grouped = (
         frame.groupby("channel", dropna=False)
         .agg(
@@ -1157,7 +1347,91 @@ def _channel_totals_for_display(
         grouped["activations"].astype(float) * float(activation_weight)
         + grouped["first_pay_count"].astype(float) * float(first_pay_weight)
     )
-    return grouped.sort_values("spend", ascending=False)
+    return grouped.sort_values("spend", ascending=False).reset_index(drop=True)
+
+
+CHANNEL_TOTAL_DISPLAY_COLUMNS = [
+    ("channel", "渠道", 0),
+    ("spend", "消耗", 2),
+    ("impressions", "曝光量", 0),
+    ("activations", "激活数", 0),
+    ("first_pay_count", "付费数", 0),
+    ("activation_cost", "激活成本", 2),
+    ("first_pay_cost", "付费成本", 2),
+    ("value", "价值", 0),
+]
+
+
+def _channel_metric_delta_metadata(current: pd.DataFrame, previous: pd.DataFrame) -> dict[str, dict[str, dict[str, str]]]:
+    if current.empty or previous.empty or "channel" not in current.columns or "channel" not in previous.columns:
+        return {}
+    previous_by_channel = previous.set_index("channel", drop=False)
+    result: dict[str, dict[str, dict[str, str]]] = {}
+    for _, current_row in current.iterrows():
+        channel = _text(current_row.get("channel"))
+        if not channel or channel not in previous_by_channel.index:
+            continue
+        previous_row = previous_by_channel.loc[channel]
+        if isinstance(previous_row, pd.DataFrame):
+            previous_row = previous_row.iloc[0]
+        channel_deltas: dict[str, dict[str, str]] = {}
+        for metric, label, _decimals in CHANNEL_TOTAL_DISPLAY_COLUMNS:
+            if metric == "channel":
+                continue
+            delta_text = _metric_delta_text(current_row.get(metric), previous_row.get(metric))
+            if not delta_text.startswith(("+", "-")):
+                continue
+            delta_class = _channel_delta_css_class(label, current_row.get(metric), previous_row.get(metric))
+            if not delta_class:
+                continue
+            channel_deltas[metric] = {"text": delta_text, "class": delta_class}
+        result[channel] = channel_deltas
+    return result
+
+
+def _channel_delta_css_class(label: str, current: object, previous: object) -> str:
+    delta_color = _metric_delta_color(label, current, previous)
+    if delta_color == "inverse":
+        return "channel-delta-good" if _number(current) > _number(previous) else "channel-delta-bad"
+    if delta_color == "normal":
+        return "channel-delta-good" if _number(current) < _number(previous) else "channel-delta-bad"
+    return ""
+
+
+def _render_channel_totals_table(frame: pd.DataFrame) -> None:
+    if frame is None or frame.empty:
+        st.info("暂无数据。")
+        return
+    st.markdown(_channel_totals_table_html(frame), unsafe_allow_html=True)
+
+
+def _channel_totals_table_html(frame: pd.DataFrame) -> str:
+    headers = "".join(f"<th>{_safe_html(label)}</th>" for _column, label, _decimals in CHANNEL_TOTAL_DISPLAY_COLUMNS)
+    delta_metadata = frame.attrs.get("metric_deltas", {}) if hasattr(frame, "attrs") else {}
+    rows = []
+    for _, row in frame.iterrows():
+        channel = _text(row.get("channel"))
+        cells = []
+        for column, _label, decimals in CHANNEL_TOTAL_DISPLAY_COLUMNS:
+            if column == "channel":
+                cells.append(f"<td>{_safe_html(channel)}</td>")
+                continue
+            value = format_display_number(row.get(column), decimals)
+            delta = delta_metadata.get(channel, {}).get(column, {})
+            delta_html = ""
+            if delta.get("text") and delta.get("class"):
+                delta_html = (
+                    f'<span class="channel-delta {_safe_html(delta.get("class"))}">'
+                    f'（{_safe_html(delta.get("text"))}）'
+                    "</span>"
+                )
+            cells.append(f'<td><span class="channel-value">{_safe_html(value)}</span>{delta_html}</td>')
+        rows.append(f"<tr>{''.join(cells)}</tr>")
+    return (
+        '<div class="channel-overview-table-wrap">'
+        f'<table class="channel-overview-table"><thead><tr>{headers}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
+        "</div>"
+    )
 
 
 def _without_total_rows(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1231,7 +1505,7 @@ def _local_content_assets_display(assets: pd.DataFrame) -> pd.DataFrame:
         "published_date",
         "updated_at",
     ]
-    return _platform_type_display_columns(_select_display_columns(_dedupe_local_content_assets(assets), columns))
+    return _format_display_time_columns(_platform_type_display_columns(_select_display_columns(_dedupe_local_content_assets(assets), columns)))
 
 
 def _dedupe_local_content_assets(assets: pd.DataFrame) -> pd.DataFrame:
@@ -1284,7 +1558,7 @@ def _multimodal_recap_display(items: pd.DataFrame) -> pd.DataFrame:
         "summary",
         "updated_at",
     ]
-    return _clean_display_title_tags(_platform_type_display_columns(_select_display_columns(items, columns)))
+    return _clean_display_title_tags(_format_display_time_columns(_platform_type_display_columns(_select_display_columns(items, columns))))
 
 
 def _asset_cache_jobs_display(jobs: pd.DataFrame) -> pd.DataFrame:
@@ -1447,6 +1721,7 @@ def _localize_display_values(frame: pd.DataFrame) -> pd.DataFrame:
     if frame is None or frame.empty:
         return frame
     localized = frame.copy()
+    localized = _format_display_time_columns(localized)
     value_maps = {
         "status": {
             "succeeded": "已完成",
@@ -1471,6 +1746,19 @@ def _localize_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         if column in localized.columns:
             localized[column] = localized[column].map(lambda value: mapping.get(_text(value), _text(value)))
     return localized
+
+
+def _format_display_time_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    display = frame.copy()
+    for column in display.columns:
+        if _is_time_display_column(column):
+            display[column] = display[column].map(format_beijing_datetime)
+    return display
+
+
+def _is_time_display_column(column: object) -> bool:
+    text = str(column)
+    return text.endswith("_at") or text in {"created_at", "updated_at", "fetched_at", "metadata_fetched_at"}
 
 
 def _top_pool_with_value(
@@ -1656,24 +1944,19 @@ def _build_local_recap_tables(db_path: Path, batch_id: str, top_pool: pd.DataFra
     }
 
 
-def _render_local_recap_tables(tables: dict[str, pd.DataFrame]) -> None:
+def _render_local_recap_tables(tables: dict[str, pd.DataFrame], *, total_metrics: dict[str, float] | None = None) -> None:
     summary = tables.get("summary", pd.DataFrame())
     st.subheader("本地数据复盘")
     if summary.empty:
         st.info("暂无可复盘的本地高价值素材。")
         return
     row = summary.iloc[0]
-    columns = st.columns(6)
-    metrics = [
-        ("高价值素材", row.get("高价值素材数"), 0),
-        ("可复盘素材", row.get("可复盘素材数"), 0),
-        ("待补齐素材", row.get("待补齐素材数"), 0),
-        ("高价值消耗", row.get("高价值消耗"), 0),
-        ("高价值曝光", row.get("高价值曝光"), 0),
-        ("高价值价值", row.get("高价值价值"), 2),
-    ]
-    for column, (label, value, decimals) in zip(columns, metrics):
-        column.metric(label, format_display_number(value, decimals))
+    metrics = _local_recap_metric_items(row, total_metrics or {})
+    metric_values = {item["label"]: item for item in metrics}
+    for chunk in _metric_row_chunks(metric_values, max_columns=3):
+        columns = st.columns(len(chunk))
+        for column, (_, item) in zip(columns, chunk):
+            column.markdown(_local_recap_metric_html(item), unsafe_allow_html=True)
     channel_tab, type_tab = st.tabs(["渠道复盘", "内容类型复盘"])
     with channel_tab:
         _show_frame(tables.get("channel", pd.DataFrame()), height=260)
@@ -1685,6 +1968,50 @@ def _render_local_recap_tables(tables: dict[str, pd.DataFrame]) -> None:
             for label, frame in type_tables.items():
                 st.markdown(f"#### {label}")
                 _show_frame(frame, height=220)
+
+
+def _local_recap_metric_items(row: pd.Series, total_metrics: dict[str, float] | None = None) -> list[dict[str, str]]:
+    total_metrics = total_metrics or {}
+    definitions = [
+        ("高价值素材", row.get("高价值素材数"), 0, "", "高价值素材池总数"),
+        ("可复盘素材", row.get("可复盘素材数"), 0, "", "可进入复盘的高价值素材"),
+        ("待补齐素材", row.get("待补齐素材数"), 0, "", "高价值池内待补齐素材"),
+        ("高价值消耗", row.get("高价值消耗"), 0, "消耗", "高价值素材池 / 当前周期总消耗"),
+        ("高价值曝光", row.get("高价值曝光"), 0, "曝光", "高价值素材池 / 当前周期总曝光"),
+        ("高价值价值", row.get("高价值价值"), 0, "价值", "高价值素材池 / 当前周期总价值"),
+    ]
+    items: list[dict[str, str]] = []
+    for label, value, decimals, total_key, scope in definitions:
+        item = {
+            "label": label,
+            "value": format_display_number(value, decimals),
+            "share": _local_recap_share_text(value, total_metrics.get(total_key)) if total_key else "",
+            "scope": scope,
+        }
+        items.append(item)
+    return items
+
+
+def _local_recap_share_text(value: object, total: object) -> str:
+    total_value = _number(total)
+    if not total_value:
+        return ""
+    return f"占总量 {_number(value) / total_value:.1%}"
+
+
+def _local_recap_metric_html(item: dict[str, str]) -> str:
+    share = _text(item.get("share"))
+    share_html = f'<span class="local-recap-share">{_safe_html(share)}</span>' if share else ""
+    return (
+        '<div class="local-recap-metric">'
+        f'<div class="local-recap-label">{_safe_html(item.get("label"))}</div>'
+        '<div class="local-recap-value-line">'
+        f'<span class="local-recap-value">{_safe_html(item.get("value"))}</span>'
+        f"{share_html}"
+        "</div>"
+        f'<div class="local-recap-note">{_safe_html(item.get("scope"))}</div>'
+        "</div>"
+    )
 
 
 def _render_type_recap_result_tables(type_recap: pd.DataFrame) -> None:
@@ -1987,15 +2314,58 @@ def _frame_height_for_rows(frame: pd.DataFrame, requested_height: int, *, fit_al
     return min(requested_height, fitted_height)
 
 
+def _localized_column_label(column: str) -> str:
+    return localize_columns(pd.DataFrame(columns=[column])).columns[0]
+
+
+def _table_numeric_source_column(column: object) -> str:
+    text = str(column)
+    if text in TABLE_NUMERIC_COLUMNS:
+        return text
+    return LOCALIZED_TABLE_NUMERIC_COLUMNS.get(text, "")
+
+
+def _prepare_table_display(frame: pd.DataFrame) -> pd.DataFrame:
+    display = localize_columns(_format_display_time_columns(frame))
+    for raw_column in frame.columns:
+        source_column = _table_numeric_source_column(raw_column)
+        localized_column = _localized_column_label(raw_column)
+        if not source_column or localized_column not in display.columns:
+            continue
+        numeric = pd.to_numeric(display[localized_column], errors="coerce")
+        if source_column in PERCENT_DISPLAY_COLUMNS:
+            display[localized_column] = (numeric * 100).round(1)
+        elif source_column in INTEGER_DISPLAY_COLUMNS:
+            display[localized_column] = numeric.round().astype("Int64")
+        else:
+            display[localized_column] = numeric.round(2)
+    return display
+
+
+def _table_column_config(frame: pd.DataFrame) -> dict[str, object]:
+    column_config = {}
+    for raw_column in frame.columns:
+        source_column = _table_numeric_source_column(raw_column)
+        if not source_column:
+            continue
+        localized_column = _localized_column_label(raw_column)
+        if source_column in PERCENT_DISPLAY_COLUMNS:
+            column_config[localized_column] = st.column_config.NumberColumn(localized_column, format="%g%%")
+        else:
+            column_config[localized_column] = st.column_config.NumberColumn(localized_column, format="localized")
+    return column_config
+
+
 def _show_frame(frame: pd.DataFrame, *, height: int = 300, fit_all_rows: bool = False) -> None:
     if frame is None or frame.empty:
         st.info("暂无数据。")
         return
     st.dataframe(
-        localize_columns(frame),
+        _prepare_table_display(frame),
         width="stretch",
         hide_index=True,
         height=_frame_height_for_rows(frame, height, fit_all_rows=fit_all_rows),
+        column_config=_table_column_config(frame),
     )
 
 

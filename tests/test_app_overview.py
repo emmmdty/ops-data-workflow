@@ -13,9 +13,12 @@ from app import (
     _batch_options_for_level,
     _batch_period_value_label,
     _channel_top_link_card_rows,
+    _channel_totals_table_html,
     _channel_totals_for_display,
     _content_performance_display,
     _local_content_assets_display,
+    _local_recap_metric_html,
+    _local_recap_metric_items,
     _metric_delta_text,
     _metric_delta_color,
     _metric_row_chunks,
@@ -24,6 +27,7 @@ from app import (
     _overview_items_for_batch,
     _overview_period_level_options,
     _comparison_caption,
+    _render_channel_totals_table,
     _rollup_components_display,
     _render_metric_row,
     _split_type_recap_tables,
@@ -108,6 +112,111 @@ class AppOverviewTests(unittest.TestCase):
 
         self.assertEqual(metrics["价值"], 40.0)
         self.assertEqual(float(channels.iloc[0]["value"]), 40.0)
+
+    def test_channel_totals_display_attaches_previous_period_delta_metadata(self):
+        totals = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "spend": 120.0,
+                    "impressions": 800.0,
+                    "activations": 9.0,
+                    "first_pay_count": 4.0,
+                    "is_channel_total": True,
+                },
+                {
+                    "channel": "小红书商业化",
+                    "spend": 100.0,
+                    "impressions": 600.0,
+                    "activations": 5.0,
+                    "first_pay_count": 2.0,
+                    "is_channel_total": True,
+                },
+                {
+                    "channel": "B站市场部",
+                    "spend": 50.0,
+                    "impressions": 400.0,
+                    "activations": 4.0,
+                    "first_pay_count": 0.0,
+                    "is_channel_total": True,
+                },
+            ]
+        )
+        previous_totals = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "spend": 100.0,
+                    "impressions": 1000.0,
+                    "activations": 10.0,
+                    "first_pay_count": 2.0,
+                    "is_channel_total": True,
+                },
+                {
+                    "channel": "小红书商业化",
+                    "spend": 100.0,
+                    "impressions": 0.0,
+                    "activations": 5.0,
+                    "first_pay_count": 2.0,
+                    "is_channel_total": True,
+                },
+            ]
+        )
+
+        channels = _channel_totals_for_display(
+            totals,
+            pd.DataFrame(),
+            previous_totals=previous_totals,
+            previous_items=pd.DataFrame(),
+        )
+
+        deltas = channels.attrs["metric_deltas"]
+        self.assertEqual(deltas["抖音商业化"]["spend"]["text"], "+20.0%")
+        self.assertEqual(deltas["抖音商业化"]["spend"]["class"], "channel-delta-good")
+        self.assertEqual(deltas["抖音商业化"]["impressions"]["text"], "-20.0%")
+        self.assertEqual(deltas["抖音商业化"]["impressions"]["class"], "channel-delta-bad")
+        self.assertEqual(deltas["抖音商业化"]["first_pay_count"]["text"], "+100.0%")
+        self.assertEqual(deltas["抖音商业化"]["first_pay_count"]["class"], "channel-delta-good")
+        self.assertEqual(deltas["抖音商业化"]["activation_cost"]["text"], "+33.3%")
+        self.assertEqual(deltas["抖音商业化"]["activation_cost"]["class"], "channel-delta-bad")
+        self.assertEqual(deltas["抖音商业化"]["first_pay_cost"]["text"], "-40.0%")
+        self.assertEqual(deltas["抖音商业化"]["first_pay_cost"]["class"], "channel-delta-good")
+        self.assertEqual(deltas["抖音商业化"]["value"]["text"], "+8.3%")
+        self.assertEqual(deltas["抖音商业化"]["value"]["class"], "channel-delta-good")
+        self.assertNotIn("spend", deltas["小红书商业化"])
+        self.assertNotIn("impressions", deltas["小红书商业化"])
+        self.assertNotIn("B站市场部", deltas)
+
+    def test_channel_totals_table_html_colors_only_delta_brackets(self):
+        channels = pd.DataFrame(
+            [
+                {
+                    "channel": "抖音商业化",
+                    "spend": 120.0,
+                    "impressions": 800.0,
+                    "activations": 9.0,
+                    "first_pay_count": 3.0,
+                    "activation_cost": 13.3333,
+                    "first_pay_cost": 40.0,
+                    "value": 12.0,
+                }
+            ]
+        )
+        channels.attrs["metric_deltas"] = {
+            "抖音商业化": {
+                "spend": {"text": "+20.0%", "class": "channel-delta-good"},
+                "impressions": {"text": "-20.0%", "class": "channel-delta-bad"},
+                "activation_cost": {"text": "+33.3%", "class": "channel-delta-bad"},
+                "value": {"text": "+18.2%", "class": "channel-delta-good"},
+            }
+        }
+
+        html = _channel_totals_table_html(channels)
+
+        self.assertIn('<span class="channel-value">120</span><span class="channel-delta channel-delta-good">（+20.0%）</span>', html)
+        self.assertIn('<span class="channel-value">800</span><span class="channel-delta channel-delta-bad">（-20.0%）</span>', html)
+        self.assertIn('<span class="channel-value">13.33</span><span class="channel-delta channel-delta-bad">（+33.3%）</span>', html)
+        self.assertIn('<span class="channel-value">12</span><span class="channel-delta channel-delta-good">（+18.2%）</span>', html)
 
     def test_channel_totals_display_excludes_blank_channel_rows(self):
         totals = pd.DataFrame(
@@ -655,6 +764,44 @@ class AppOverviewTests(unittest.TestCase):
         self.assertEqual(summary["待补采"], 1)
         self.assertEqual(summary["已完成多模态"], 1)
         self.assertIn("登录状态失效", summary["失败原因"])
+
+    def test_local_recap_metric_items_add_total_share_and_scope_notes(self):
+        row = pd.Series(
+            {
+                "高价值素材数": 3,
+                "可复盘素材数": 2,
+                "待补齐素材数": 1,
+                "高价值消耗": 50.0,
+                "高价值曝光": 200.0,
+                "高价值价值": 75.0,
+            }
+        )
+        total_metrics = {"消耗": 100.0, "曝光": 800.0, "价值": 300.0}
+
+        items = _local_recap_metric_items(row, total_metrics)
+
+        by_label = {item["label"]: item for item in items}
+        self.assertEqual(by_label["高价值素材"]["scope"], "高价值素材池总数")
+        self.assertEqual(by_label["可复盘素材"]["scope"], "可进入复盘的高价值素材")
+        self.assertEqual(by_label["待补齐素材"]["scope"], "高价值池内待补齐素材")
+        self.assertEqual(by_label["高价值消耗"]["share"], "占总量 50.0%")
+        self.assertEqual(by_label["高价值曝光"]["share"], "占总量 25.0%")
+        self.assertEqual(by_label["高价值价值"]["share"], "占总量 25.0%")
+        self.assertEqual(by_label["高价值消耗"]["scope"], "高价值素材池 / 当前周期总消耗")
+
+    def test_local_recap_metric_html_stays_inline_for_streamlit_markdown(self):
+        html = _local_recap_metric_html(
+            {
+                "label": "高价值素材",
+                "value": "97",
+                "share": "",
+                "scope": "高价值素材池总数",
+            }
+        )
+
+        self.assertNotIn("\n", html)
+        self.assertIn('class="local-recap-metric"', html)
+        self.assertIn('class="local-recap-note">高价值素材池总数</div>', html)
 
     def test_top_asset_cache_entries_display_hides_paths_and_localizes_size(self):
         entries = pd.DataFrame(

@@ -53,8 +53,16 @@ class StreamlitCompatibilityTests(unittest.TestCase):
     def test_sidebar_navigation_is_not_hidden_by_header_css(self):
         theme_source = self._function_source("_inject_theme", "def _page_overview")
 
-        self.assertIn('initial_sidebar_state="expanded"', self.app_source)
+        self.assertIn('initial_sidebar_state="collapsed"', self.app_source)
         self.assertIn('position="sidebar"', self.app_source)
+        self.assertNotRegex(theme_source, r'(?m)^\s*\[data-testid="stToolbar"\],\s*$')
+        self.assertNotIn('header [data-testid="stToolbar"]', theme_source)
+        self.assertNotRegex(theme_source, r'\[data-testid="stSidebar"\]\s*\{[^}]*display:\s*none')
+        self.assertNotRegex(theme_source, r'\[data-testid="stSidebar"\]\s*\{[^}]*visibility:\s*hidden')
+        self.assertNotIn("collapsedControl", theme_source)
+        self.assertIn("stExpandSidebarButton", theme_source)
+        self.assertNotRegex(theme_source, r'\[data-testid="stExpandSidebarButton"\]\s*\{[^}]*display:\s*none')
+        self.assertNotRegex(theme_source, r'\[data-testid="stExpandSidebarButton"\]\s*\{[^}]*visibility:\s*hidden')
         self.assertNotIn("header button[kind]", theme_source)
         self.assertNotIn("header button[title]", theme_source)
 
@@ -171,15 +179,34 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         ]:
             self.assertIn(token, self.app_source)
 
+    def test_local_recap_metrics_wrap_to_two_rows(self):
+        recap_source = self._function_source("_render_local_recap_tables", "def _display_channel_recap_columns")
+        page_source = self._function_source("_page_high_value_recap", "_page_local_assets")
+
+        self.assertIn("_metric_row_chunks", recap_source)
+        self.assertIn("max_columns=3", recap_source)
+        self.assertNotIn("st.columns(6)", recap_source)
+        self.assertIn("local-recap-metric", recap_source)
+        self.assertIn("local-recap-share", recap_source)
+        self.assertIn("local-recap-note", recap_source)
+        self.assertIn("_overview_metrics(", page_source)
+        self.assertIn("total_metrics=", page_source)
+
     def test_overview_channel_section_renders_table_without_metric_cards(self):
         overview_source = self._function_source("_page_overview", "_page_upload_cleaning")
 
         self.assertIn("分渠道总览", overview_source)
-        self.assertIn("_show_frame(_display_value_columns(channel_totals)", overview_source)
-        self.assertLess(overview_source.index('st.subheader("分渠道总览")'), overview_source.index("_render_recap_weight_settings"))
+        self.assertIn("previous_totals=previous_totals", overview_source)
+        self.assertIn("previous_items=previous_items", overview_source)
+        self.assertIn("_render_channel_totals_table(channel_totals)", overview_source)
+        self.assertGreater(overview_source.index('st.subheader("分渠道总览")'), overview_source.index("_render_recap_weight_settings"))
+        self.assertGreater(overview_source.index('st.subheader("分渠道总览")'), overview_source.index("_render_metric_row(metrics, previous_metrics)"))
         self.assertLess(overview_source.index('st.subheader("分渠道总览")'), overview_source.index("status_metrics = _overview_status_metrics"))
         self.assertNotIn("_render_channel_total_cards", overview_source)
         self.assertNotIn("分渠道明细表", overview_source)
+        self.assertIn("channel-overview-table", self.app_source)
+        self.assertIn("channel-value", self.app_source)
+        self.assertIn("channel-delta", self.app_source)
 
     def test_trends_remain_core_metrics_only(self):
         trend_source = self._function_source("_page_trends", "PAGES =")
