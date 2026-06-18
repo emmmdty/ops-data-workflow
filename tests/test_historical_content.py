@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -13,6 +14,7 @@ from ops_data_workflow.historical_content import (
 from ops_data_workflow.storage import init_db, upsert_category_mappings
 from ops_data_workflow.title_matching import normalized_title_key
 from ops_data_workflow.workflow import run_archived_workflow
+from tests.test_workflow import _empty_feishu_ledger_fixture
 
 
 class HistoricalContentTests(unittest.TestCase):
@@ -116,19 +118,20 @@ class HistoricalContentTests(unittest.TestCase):
                 ),
             )
 
-            result = run_archived_workflow(
-                raw_dir,
-                "2026-05-15",
-                "2026-05-21",
-                output_root=tmp_path / "outputs",
-                archive_root=tmp_path / "archive",
-                db_path=db_path,
-                env_path=tmp_path / "missing.env",
-            )
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_empty_feishu_ledger_fixture()):
+                result = run_archived_workflow(
+                    raw_dir,
+                    "2026-05-15",
+                    "2026-05-21",
+                    output_root=tmp_path / "outputs",
+                    archive_root=tmp_path / "archive",
+                    db_path=db_path,
+                    env_path=tmp_path / "missing.env",
+                )
 
             row = result.canonical.iloc[0]
             self.assertEqual(row["analysis_status"], "不可分析")
-            self.assertEqual(row["unanalyzable_reason"], "未匹配飞书自有内容")
+            self.assertEqual(row["unanalyzable_reason"], "飞书台账缺失候选")
             self.assertEqual(row["category_l2"], "")
             self.assertEqual(row["category_l3"], "")
             self.assertEqual(row["review_status"], "不可分析")

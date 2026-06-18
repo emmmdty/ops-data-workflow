@@ -8,6 +8,7 @@ import unittest
 from io import BytesIO
 from zipfile import ZipFile
 from unittest.mock import patch
+import sys
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -28,7 +29,7 @@ from ops_data_workflow.upload_input import (
     materialize_uploaded_files,
 )
 from ops_data_workflow.workflow import run_archived_workflow
-from tests.test_workflow import _write_raw_fixture
+from tests.test_workflow import _feishu_ledger_fixture, _write_raw_fixture
 
 
 class FakeUpload:
@@ -372,7 +373,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
 
             completed = subprocess.run(
                 [
-                    ".venv/bin/python",
+                    sys.executable,
                     "main.py",
                     "--input",
                     str(raw_dir),
@@ -718,35 +719,37 @@ class ProductizedWorkflowTests(unittest.TestCase):
             raw_dir.mkdir()
             _write_raw_fixture(raw_dir)
 
-            upload_result = run_archived_workflow(
-                raw_dir,
-                "2026-04-01",
-                "2026-04-30",
-                output_root=tmp_path / "outputs",
-                archive_root=tmp_path / "archive",
-                db_path=db_path,
-                env_path=tmp_path / "missing.env",
-                enqueue_background_analysis=True,
-                background_trigger="upload",
-                top_analysis_prompt_hint="重点看爆量共性",
-            )
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_feishu_ledger_fixture()):
+                upload_result = run_archived_workflow(
+                    raw_dir,
+                    "2026-04-01",
+                    "2026-04-30",
+                    output_root=tmp_path / "outputs",
+                    archive_root=tmp_path / "archive",
+                    db_path=db_path,
+                    env_path=tmp_path / "missing.env",
+                    enqueue_background_analysis=True,
+                    background_trigger="upload",
+                    top_analysis_prompt_hint="重点看爆量共性",
+                )
             first_jobs = list_analysis_jobs(db_path, batch_id=upload_result.batch_id)
 
             self.assertGreater(len(first_jobs), 0)
             self.assertEqual(set(first_jobs["trigger"]), {"upload"})
             self.assertEqual(set(first_jobs["prompt_hint"]), {"重点看爆量共性"})
 
-            run_archived_workflow(
-                raw_dir,
-                "2026-04-01",
-                "2026-04-30",
-                output_root=tmp_path / "outputs",
-                archive_root=tmp_path / "archive",
-                db_path=db_path,
-                env_path=tmp_path / "missing.env",
-                enqueue_background_analysis=False,
-                background_trigger="page_refresh",
-            )
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_feishu_ledger_fixture()):
+                run_archived_workflow(
+                    raw_dir,
+                    "2026-04-01",
+                    "2026-04-30",
+                    output_root=tmp_path / "outputs",
+                    archive_root=tmp_path / "archive",
+                    db_path=db_path,
+                    env_path=tmp_path / "missing.env",
+                    enqueue_background_analysis=False,
+                    background_trigger="page_refresh",
+                )
             second_jobs = list_analysis_jobs(db_path, batch_id=upload_result.batch_id)
 
             self.assertEqual(len(second_jobs), len(first_jobs))

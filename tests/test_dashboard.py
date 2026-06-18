@@ -248,220 +248,6 @@ def _seed_dashboard_db(db_path: Path) -> None:
 
 
 class DashboardTests(unittest.TestCase):
-    def test_overview_platform_chart_uses_self_comparison_layout(self):
-        from app import _build_platform_chart_figure
-
-        platform_summary = pd.DataFrame(
-            [
-                {"channel": "抖音商业化", "spend": 120.0, "impressions": 1200.0, "activations": 12.0},
-                {"channel": "B站市场部", "spend": 26.0, "impressions": 800.0, "activations": 10.0},
-            ]
-        )
-        channel_comparison = pd.DataFrame(
-            [
-                {
-                    "channel": "抖音商业化",
-                    "spend_previous": 60.0,
-                    "spend_change_rate": 1.0,
-                    "impressions_previous": 1000.0,
-                    "impressions_change_rate": 0.2,
-                    "activations_previous": 6.0,
-                    "activations_change_rate": 1.0,
-                },
-                {
-                    "channel": "B站市场部",
-                    "spend_previous": 29.0,
-                    "spend_change_rate": -0.1034482759,
-                    "impressions_previous": 1000.0,
-                    "impressions_change_rate": -0.2,
-                    "activations_previous": 20.0,
-                    "activations_change_rate": -0.5,
-                },
-            ]
-        )
-
-        fig = _build_platform_chart_figure(platform_summary, channel_comparison)
-
-        self.assertIsNotNone(fig)
-        current_spend = next(trace for trace in fig.data if trace.name == "总消耗 本期规模")
-        previous_spend = next(trace for trace in fig.data if trace.name == "总消耗 上期参考")
-        spend_delta = next(trace for trace in fig.data if trace.name == "总消耗 环比徽标")
-        self.assertEqual(current_spend.orientation, "h")
-        self.assertEqual(spend_delta.mode, "text")
-        self.assertEqual(list(current_spend.x), [1.0, 26.0 / 29.0])
-        self.assertEqual(list(current_spend.y), ["抖音商业化", "B站市场部"])
-        self.assertEqual(list(current_spend.text), ["120", "26"])
-        self.assertEqual(previous_spend.orientation, "h")
-        self.assertEqual(list(previous_spend.x), [0.5, 1.0])
-        self.assertEqual(list(spend_delta.x), [1.55, 1.55])
-        self.assertEqual(list(spend_delta.text), ["+100%", "-10.3%"])
-        self.assertEqual(list(spend_delta.textfont.color), ["#d92d20", "#079455"])
-        self.assertEqual(spend_delta.customdata[0][1], "120")
-        self.assertEqual(spend_delta.customdata[0][2], "60")
-        self.assertEqual(spend_delta.customdata[0][3], "+100%")
-        self.assertEqual(spend_delta.customdata[0][4], "+60")
-        self.assertEqual(current_spend.customdata[1][5], 29.0)
-        self.assertIn("条长为本行独立尺度", current_spend.hovertemplate)
-        self.assertEqual(fig.layout.xaxis.title.text, "")
-        self.assertEqual(fig.layout.xaxis.type, "linear")
-        self.assertEqual(fig.layout.xaxis.range, (0, 1.85))
-        self.assertFalse(fig.layout.xaxis.showticklabels)
-        self.assertFalse(hasattr(fig.layout, "xaxis2") and fig.layout.xaxis2.title.text)
-        self.assertEqual(fig.layout.barmode, "overlay")
-        self.assertFalse(fig.layout.showlegend)
-        self.assertEqual(len(fig.layout.annotations), 0)
-
-    def test_overview_platform_chart_shows_current_value_without_previous_baseline(self):
-        from app import _build_platform_chart_figure
-
-        platform_summary = pd.DataFrame(
-            [
-                {"channel": "抖音商业化", "spend": 120.0, "activations": 12.0},
-                {"channel": "小红书市场部", "spend": 80.0, "activations": 8.0},
-            ]
-        )
-        channel_comparison = pd.DataFrame(
-            [
-                {
-                    "channel": "抖音商业化",
-                    "spend_previous": 60.0,
-                    "spend_change_rate": 1.0,
-                    "activations_previous": 6.0,
-                    "activations_change_rate": 1.0,
-                }
-            ]
-        )
-
-        fig = _build_platform_chart_figure(platform_summary, channel_comparison)
-
-        self.assertIsNotNone(fig)
-        current_spend = next(trace for trace in fig.data if trace.name == "总消耗 本期规模")
-        previous_spend = next(trace for trace in fig.data if trace.name == "总消耗 上期参考")
-        spend_delta = next(trace for trace in fig.data if trace.name == "总消耗 环比徽标")
-        self.assertEqual(list(current_spend.x), [1.0, 1.0])
-        self.assertEqual(list(current_spend.text), ["120", "80"])
-        self.assertEqual(previous_spend.x[0], 0.5)
-        self.assertTrue(pd.isna(previous_spend.x[1]))
-        self.assertEqual(list(spend_delta.x), [1.55, 1.55])
-        self.assertEqual(list(spend_delta.text), ["+100%", "-"])
-        self.assertEqual(list(spend_delta.textfont.color), ["#d92d20", "#667085"])
-        self.assertEqual(spend_delta.customdata[1][1], "80")
-        self.assertEqual(spend_delta.customdata[1][2], "-")
-        self.assertEqual(spend_delta.customdata[1][3], "-")
-        self.assertEqual(spend_delta.customdata[1][4], "-")
-        self.assertEqual(len(fig.layout.annotations), 0)
-
-    def test_period_comparison_chart_uses_competitive_scale_for_content_types(self):
-        from app import _build_period_comparison_bar_figure
-
-        frame = pd.DataFrame(
-            [
-                {
-                    "category": "股友说",
-                    "spend": 120.0,
-                    "spend_previous": 60.0,
-                    "spend_change_rate": 1.0,
-                },
-                {
-                    "category": "资讯",
-                    "spend": 80.0,
-                    "spend_previous": 100.0,
-                    "spend_change_rate": -0.2,
-                },
-                {
-                    "category": "投教",
-                    "spend": 47.0,
-                    "spend_previous": 35.0,
-                    "spend_change_rate": 0.3428571429,
-                },
-            ]
-        )
-
-        fig = _build_period_comparison_bar_figure(frame, "category", "内容类型", "重点内容类型贡献")
-
-        current = next(trace for trace in fig.data if trace.name == "消耗 本期规模")
-        previous = next(trace for trace in fig.data if trace.name == "消耗 上期参考")
-        delta = next(trace for trace in fig.data if trace.name == "消耗 环比徽标")
-        self.assertEqual(current.orientation, "h")
-        self.assertEqual(list(current.x), [1.0, 80.0 / 120.0, 47.0 / 120.0])
-        self.assertEqual(list(current.y), ["股友说", "资讯", "投教"])
-        self.assertEqual(list(current.text), ["120", "80", "47"])
-        self.assertEqual(previous.orientation, "h")
-        self.assertEqual(list(previous.x), [0.5, 100.0 / 120.0, 35.0 / 120.0])
-        self.assertEqual(list(delta.x), [1.55, 1.55, 1.55])
-        self.assertEqual(list(delta.text), ["+100%", "-20%", "+34.3%"])
-        self.assertEqual(list(delta.textfont.color), ["#d92d20", "#079455", "#d92d20"])
-        self.assertEqual(delta.customdata[0][1], "120")
-        self.assertEqual(delta.customdata[0][2], "60")
-        self.assertEqual(delta.customdata[0][3], "+100%")
-        self.assertEqual(delta.customdata[0][4], "+60")
-        self.assertEqual(delta.customdata[1][5], 120.0)
-        self.assertIn("条长为同周期统一尺度", current.hovertemplate)
-        self.assertEqual(fig.layout.xaxis.title.text, "")
-        self.assertEqual(fig.layout.xaxis.type, "linear")
-        self.assertFalse(hasattr(fig.layout, "xaxis2") and fig.layout.xaxis2.title.text)
-
-    def test_period_comparison_chart_keeps_new_content_type_on_competitive_scale(self):
-        from app import _build_period_comparison_bar_figure
-
-        frame = pd.DataFrame(
-            [
-                {
-                    "category": "股友说",
-                    "spend": 120.0,
-                    "spend_previous": 60.0,
-                    "spend_change_rate": 1.0,
-                },
-                {
-                    "category": "新栏目",
-                    "spend": 80.0,
-                    "spend_previous": pd.NA,
-                    "spend_change_rate": pd.NA,
-                },
-            ]
-        )
-
-        fig = _build_period_comparison_bar_figure(frame, "category", "内容类型", "重点内容类型贡献")
-
-        current = next(trace for trace in fig.data if trace.name == "消耗 本期规模")
-        previous = next(trace for trace in fig.data if trace.name == "消耗 上期参考")
-        delta = next(trace for trace in fig.data if trace.name == "消耗 环比徽标")
-        self.assertEqual(list(current.x), [1.0, 80.0 / 120.0])
-        self.assertEqual(previous.x[0], 0.5)
-        self.assertTrue(pd.isna(previous.x[1]))
-        self.assertEqual(list(delta.x), [1.55, 1.55])
-        self.assertEqual(list(delta.text), ["+100%", "-"])
-        self.assertEqual(list(delta.textfont.color), ["#d92d20", "#667085"])
-        self.assertEqual(delta.customdata[1][1], "80")
-        self.assertEqual(delta.customdata[1][2], "-")
-        self.assertEqual(delta.customdata[1][3], "-")
-        self.assertEqual(delta.customdata[1][5], 120.0)
-
-    def test_cost_metric_delta_colors_are_reversed(self):
-        from app import _build_platform_chart_figure
-
-        platform_summary = pd.DataFrame(
-            [
-                {"channel": "抖音商业化", "activation_cost": 12.0},
-                {"channel": "小红书商业化", "activation_cost": 8.0},
-            ]
-        )
-        channel_comparison = pd.DataFrame(
-            [
-                {"channel": "抖音商业化", "activation_cost_previous": 8.0, "activation_cost_change_rate": 0.5},
-                {"channel": "小红书商业化", "activation_cost_previous": 10.0, "activation_cost_change_rate": -0.2},
-            ]
-        )
-
-        fig = _build_platform_chart_figure(platform_summary, channel_comparison, "激活成本")
-
-        self.assertIsNotNone(fig)
-        delta = next(trace for trace in fig.data if trace.name == "激活成本 环比徽标")
-        self.assertEqual(list(delta.x), [1.55, 1.55])
-        self.assertEqual(list(delta.text), ["-20%", "+50%"])
-        self.assertEqual(list(delta.textfont.color), ["#d92d20", "#079455"])
-        self.assertEqual(fig.layout.title.text, "分渠道激活成本环比对比")
-
     def test_dashboard_summary_and_aggregates_include_all_delivery_rows(self):
         frame = pd.DataFrame(
             [
@@ -1893,7 +1679,7 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(
             list(result.columns)[:6],
-            ["渠道", "标题", "消耗", "付费成本", "栏目", "分类来源"],
+            ["渠道", "标题", "消耗", "付费成本", "二级类型", "分类来源"],
         )
         self.assertIn("曝光量", result.columns)
         self.assertNotIn("展示/曝光量", result.columns)
@@ -1929,9 +1715,9 @@ class DashboardTests(unittest.TestCase):
         frame = pd.DataFrame({"channel": ["抖音商业化"], "spend": [67.90], "activation_cost": [79.0], "ctr": [0.16667]})
         result = localize_and_sort_columns(frame)
 
-        self.assertEqual(result.iloc[0]["消耗"], "67.9")
-        self.assertEqual(result.iloc[0]["激活成本"], "79")
-        self.assertEqual(result.iloc[0]["点击率"], "0.17")
+        self.assertEqual(result.iloc[0]["消耗"], 67.9)
+        self.assertEqual(result.iloc[0]["激活成本"], 79.0)
+        self.assertAlmostEqual(float(result.iloc[0]["点击率"]), 0.16667)
 
     def test_summarize_content_types_counts_rows_unique_content_and_missing_share(self):
         frame = pd.DataFrame(

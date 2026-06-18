@@ -16,6 +16,7 @@ from ops_data_workflow.recap_dataset import build_cleaned_asset_table, build_con
 from ops_data_workflow.reference_tables import account_mapping_lookup, load_reference_tables, parse_period_from_raw_dir
 from ops_data_workflow.cleaning_pipeline import split_channel_total_rows
 from ops_data_workflow.top_asset_service import build_executable_top_content_pool
+from ops_data_workflow.title_matching import normalized_title_key
 
 
 CORE_ANALYSIS_SHEETS = ["清洗后素材表", "内容复盘表", "不可分析汇总", "匹配覆盖率", "已匹配账号类型分析", "未匹配归因"]
@@ -84,7 +85,7 @@ def _write_raw_fixture(raw_dir: Path) -> None:
             [
                 {
                     "视频标题": "什么样的人能成为交易高手？ #股友说 #股民",
-                    "视频id": "dy-1",
+                    "视频id": "7310000000000000001",
                     "素材ID": "mat-1",
                     "账号": "同花顺投资",
                     "消耗": 200.0,
@@ -92,11 +93,11 @@ def _write_raw_fixture(raw_dir: Path) -> None:
                     "点击数": 800,
                     "激活数": 50,
                     "付费次数": 20,
-                    "内容类型": "",
+                    "内容类型": "股友说",
                 },
                 {
                     "视频标题": "股市是仅次于高考最公平的竞争",
-                    "视频id": "dy-2",
+                    "视频id": "7310000000000000002",
                     "素材ID": "mat-2",
                     "账号": "同花顺投资",
                     "消耗": 100.0,
@@ -104,7 +105,7 @@ def _write_raw_fixture(raw_dir: Path) -> None:
                     "点击数": 400,
                     "激活数": 20,
                     "付费次数": 8,
-                    "内容类型": "股友说",
+                    "内容类型": "资讯",
                 },
             ]
         ).to_excel(writer, sheet_name="Sheet2", index=False)
@@ -116,7 +117,7 @@ def _write_raw_fixture(raw_dir: Path) -> None:
                     "创建时间": "2026-04-01",
                     "素材ID": "mat-3",
                     "视频标题": "是天才就来同花顺证明给我看 #同花顺进行曲",
-                    "视频id": "dy-m-1",
+                    "视频id": "7310000000000000003",
                     "账号": "同花顺投资",
                     "消耗": 120.0,
                     "展示数": 12000,
@@ -137,6 +138,124 @@ def _write_raw_fixture(raw_dir: Path) -> None:
     )
     with pd.ExcelWriter(raw_dir / "四月消耗，占比等总数据.xlsx", engine="openpyxl") as writer:
         total.to_excel(writer, sheet_name="Sheet1", index=False, startrow=5, startcol=8)
+
+
+def _feishu_ledger_fixture() -> pd.DataFrame:
+    frame = pd.DataFrame(
+        [
+            {
+                "platform": "抖音",
+                "published_date": "2026-04-01",
+                "content_url": "https://www.douyin.com/video/7310000000000000001",
+                "content_id": "7310000000000000001",
+                "account": "同花顺投资",
+                "title": "什么样的人能成为交易高手？ #股友说 #股民",
+                "tags": "#股友说 #股民",
+                "raw_content_type": "股友说",
+                "category_l1": "",
+                "category_l2": "股友说",
+                "bilibili_content_type": "",
+                "content_type": "股友说",
+                "content_type_review": "",
+                "filter_status": "",
+                "source_file": "harvester_feishu",
+                "source_sheet": "抖音渠道",
+                "source_row": 2,
+                "title_key": normalized_title_key("什么样的人能成为交易高手？ #股友说 #股民"),
+                "title_key_no_tags": normalized_title_key("什么样的人能成为交易高手？"),
+            },
+            {
+                "platform": "抖音",
+                "published_date": "2026-04-02",
+                "content_url": "https://www.douyin.com/video/7310000000000000002",
+                "content_id": "7310000000000000002",
+                "account": "同花顺投资",
+                "title": "股市是仅次于高考最公平的竞争",
+                "tags": "#资讯",
+                "raw_content_type": "资讯",
+                "category_l1": "",
+                "category_l2": "资讯",
+                "bilibili_content_type": "",
+                "content_type": "资讯",
+                "content_type_review": "",
+                "filter_status": "",
+                "source_file": "harvester_feishu",
+                "source_sheet": "抖音渠道",
+                "source_row": 3,
+                "title_key": normalized_title_key("股市是仅次于高考最公平的竞争"),
+                "title_key_no_tags": normalized_title_key("股市是仅次于高考最公平的竞争"),
+            },
+            {
+                "platform": "抖音",
+                "published_date": "2026-04-03",
+                "content_url": "https://www.douyin.com/video/7310000000000000003",
+                "content_id": "7310000000000000003",
+                "account": "同花顺投资",
+                "title": "是天才就来同花顺证明给我看 #同花顺进行曲",
+                "tags": "#同花顺进行曲",
+                "raw_content_type": "品牌活动",
+                "category_l1": "",
+                "category_l2": "品牌活动",
+                "bilibili_content_type": "",
+                "content_type": "品牌活动",
+                "content_type_review": "",
+                "filter_status": "",
+                "source_file": "harvester_feishu",
+                "source_sheet": "抖音渠道",
+                "source_row": 4,
+                "title_key": normalized_title_key("是天才就来同花顺证明给我看 #同花顺进行曲"),
+                "title_key_no_tags": normalized_title_key("是天才就来同花顺证明给我看"),
+            },
+        ]
+    )
+    frame.attrs["feishu_snapshot"] = {
+        "enabled": True,
+        "total_rows": int(len(frame)),
+        "platform_counts": {"抖音": int(len(frame))},
+        "sheet_row_counts": {"dySheet": int(len(frame))},
+        "field_completeness": {"content_id": 1.0},
+        "warnings": [],
+    }
+    frame.attrs["source_files"] = set()
+    return frame
+
+
+def _empty_feishu_ledger_fixture() -> pd.DataFrame:
+    frame = pd.DataFrame(
+        columns=[
+            "platform",
+            "published_date",
+            "content_url",
+            "content_id",
+            "account",
+            "title",
+            "tags",
+            "raw_content_type",
+            "category_l1",
+            "category_l2",
+            "bilibili_content_type",
+            "content_type",
+            "content_type_review",
+            "filter_status",
+            "source_file",
+            "source_sheet",
+            "source_row",
+            "title_key",
+            "title_key_no_tags",
+        ]
+    )
+    frame.attrs["feishu_enabled"] = False
+    frame.attrs["ledger_warnings"] = ["缺少飞书配置"]
+    frame.attrs["source_files"] = set()
+    frame.attrs["feishu_snapshot"] = {
+        "enabled": False,
+        "total_rows": 0,
+        "platform_counts": {},
+        "sheet_row_counts": {},
+        "field_completeness": {},
+        "warnings": ["缺少飞书配置"],
+    }
+    return frame
 
 
 def _remove_total_fixture(raw_dir: Path) -> None:
@@ -727,15 +846,16 @@ xiaohongshu:
                 ]
             ).to_csv(raw_dir / "抖音市场部.csv", index=False, encoding="utf-8-sig")
 
-            result = analyze_input_dir(
-                raw_dir,
-                "2026-04-01",
-                "2026-04-27",
-                category_matcher=lambda items, category_library, env_path: (_ for _ in ()).throw(
-                    AssertionError("不可分析素材不应进入 AI 分类")
-                ),
-                env_path=Path(tmp) / ".env",
-            )
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_empty_feishu_ledger_fixture()):
+                result = analyze_input_dir(
+                    raw_dir,
+                    "2026-04-01",
+                    "2026-04-27",
+                    category_matcher=lambda items, category_library, env_path: (_ for _ in ()).throw(
+                        AssertionError("不可分析素材不应进入 AI 分类")
+                    ),
+                    env_path=Path(tmp) / ".env",
+                )
 
             inferred = result.canonical[result.canonical["material_id"].eq("mat-unknown")].iloc[0]
             self.assertEqual(inferred["content_id"], "")
@@ -745,7 +865,7 @@ xiaohongshu:
             self.assertEqual(inferred["content_category"], "")
             self.assertEqual(inferred["category_status"], "不可分析")
             self.assertEqual(inferred["analysis_status"], "不可分析")
-            self.assertEqual(inferred["unanalyzable_reason"], "未匹配飞书自有内容")
+            self.assertEqual(inferred["unanalyzable_reason"], "飞书台账缺失候选")
             asset_table = build_cleaned_asset_table(result.canonical)
             self.assertTrue(build_content_recap_table(asset_table).empty)
 
@@ -803,7 +923,8 @@ xiaohongshu:
             raw_dir.mkdir()
             _write_raw_fixture(raw_dir)
 
-            result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_feishu_ledger_fixture()):
+                result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
 
             canonical = result.canonical
             self.assertEqual(len(canonical), 6)
@@ -908,7 +1029,8 @@ xiaohongshu:
             raw_dir.mkdir()
             _write_raw_fixture(raw_dir)
 
-            result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_feishu_ledger_fixture()):
+                result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
             canonical = result.canonical
 
             self.assertEqual(
@@ -949,7 +1071,8 @@ xiaohongshu:
             raw_dir.mkdir()
             _write_raw_fixture(raw_dir)
 
-            result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_feishu_ledger_fixture()):
+                result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
             canonical = result.canonical
 
             bilibili = canonical[canonical["content_id"].eq("bv1")].iloc[0]
@@ -1524,7 +1647,8 @@ xiaohongshu:
             raw_dir.mkdir()
             _write_raw_fixture(raw_dir)
 
-            result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_feishu_ledger_fixture()):
+                result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
 
             self.assertEqual(set(result.channel_summary["channel"]), {"B站市场部", "小红书商业化", "抖音商业化", "抖音市场部"})
             channel_spend = result.channel_summary.set_index("channel")["spend"]
@@ -1750,7 +1874,8 @@ xiaohongshu:
             raw_dir.mkdir()
             _write_raw_fixture(raw_dir)
 
-            result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=_feishu_ledger_fixture()):
+                result = run_workflow(raw_dir, "2026-04-01", "2026-04-27", output_dir)
 
             self.assertFalse(result.unanalyzable_summary.empty)
             self.assertIn("不可分析素材占比", result.unanalyzable_summary.columns)
