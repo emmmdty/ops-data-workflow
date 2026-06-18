@@ -162,4 +162,5 @@ class ChannelProfileConfigTests(unittest.TestCase):
         self.assertNotIn("_page_reference_tables", app_source)
         self.assertIn("channel_profiles.yml", docs_source)
         self.assertIn("字段别名优先于通用字段映射", docs_source)
-        self.assertIn("本地总表/素材缓存", docs_source)
+        self.assertIn("本地总表", docs_source)
+        self.assertIn("周期数据", docs_source)
