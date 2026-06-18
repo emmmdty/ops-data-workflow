@@ -116,6 +116,7 @@ def select_topic_candidates(
     if items.empty or not channel_name or limit <= 0 or metric not in items.columns:
         return pd.DataFrame()
     scoped = items[items.get("channel", pd.Series(dtype=object)).astype(str).eq(channel_name)].copy()
+    scoped = _filter_analyzable_items(scoped)
     if scoped.empty:
         return pd.DataFrame()
     scoped[metric] = pd.to_numeric(scoped[metric], errors="coerce")
@@ -128,6 +129,30 @@ def select_topic_candidates(
     candidates["rank_position"] = range(1, len(candidates) + 1)
     candidates["content_type"] = candidates.apply(_content_type_for_row, axis=1)
     return candidates
+
+
+def _filter_analyzable_items(items: pd.DataFrame) -> pd.DataFrame:
+    if items.empty:
+        return items.copy()
+    if "analysis_status" in items.columns:
+        status = items["analysis_status"].fillna("").astype(str).str.strip()
+        status_mask = status.eq("可分析")
+        status_blank = status.eq("")
+    else:
+        status_mask = pd.Series(False, index=items.index)
+        status_blank = pd.Series(True, index=items.index)
+    if "is_analyzable" in items.columns:
+        truthy = _truthy_analyzable(items["is_analyzable"])
+        return items[status_mask | (status_blank & truthy)].copy()
+    if "analysis_status" in items.columns:
+        return items[status_mask].copy()
+    return items.copy()
+
+
+def _truthy_analyzable(values: pd.Series) -> pd.Series:
+    if values.dtype == bool:
+        return values.fillna(False)
+    return values.fillna("").astype(str).str.lower().isin({"true", "1", "yes", "y", "是", "可分析"})
 
 
 def build_topic_label_frame(

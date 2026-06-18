@@ -11,10 +11,12 @@ from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 
-from .account_filters import apply_account_filters, load_account_filter_config
 from .categories import HIGH_SPEND_CATEGORY_RULES, category_from_tags, load_category_rules, suggest_category
-from .content_ledger import account_match_label, apply_content_ledger, load_content_ledger
+from .analysis_scope import apply_analysis_scope
+from .asset_matching import match_assets_to_ledger
+from .cleaning_pipeline import split_channel_total_rows
 from .field_mapping import load_field_mapping, standardize_content_form, standardize_content_type
+from .platform_normalizers import normalize_platform_identities
 from .reference_tables import (
     ReferenceTables,
     account_mapping_lookup,
@@ -22,6 +24,10 @@ from .reference_tables import (
 )
 from .title_matching import normalized_title_key
 from .source_channels import SOCIAL_PLATFORM_GROUP, normalize_channel_name, platform_from_channel_or_name, social_platform_from_name
+from .top_asset_service import (
+    build_high_spend_content_pool as build_top_asset_content_pool,
+    high_spend_content_identity_key,
+)
 
 
 TABULAR_SUFFIXES = {".csv", ".xls", ".xlsx"}
@@ -95,25 +101,7 @@ STANDARD_COLUMNS = [
 
 INTERNAL_COMPAT_COLUMNS = {"platform", "platform_group"}
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
-REVIEW_QUEUE_TOP_N = 20
-REVIEW_QUEUE_MAX_ITEMS = 49
-REVIEW_QUEUE_HIGH_SPEND_THRESHOLD = 2000.0
-REVIEW_QUEUE_CRITICAL_FIELDS = [
-    ("content_url", "内容链接"),
-    ("content_id", "内容ID"),
-    ("title", "标题"),
-    ("content_category", "内容类型"),
-]
-REVIEW_QUEUE_HIGH_RISK_PATTERNS = [
-    "同ID标题冲突",
-    "标题冲突",
-    "同标题多链接",
-    "投稿台账多候选",
-    "内容类型冲突",
-    "类型/台账冲突",
-    "内容ID冲突",
-    "高风险",
-]
+HIGH_SPEND_ABSOLUTE_THRESHOLD = 2000.0
 
 
 @dataclass(frozen=True)
@@ -130,7 +118,6 @@ class AnalysisData:
     top_content_items: pd.DataFrame
     cover_metrics: pd.DataFrame
     data_quality: pd.DataFrame
-    review_queue: pd.DataFrame
     preprocessing_report: pd.DataFrame
     duplicate_merge_details: pd.DataFrame
     conflict_retention_details: pd.DataFrame
@@ -169,23 +156,23 @@ def analyze_input_dir(
     category_mappings: Optional[CategoryMappings] = None,
     reference_tables_path: Optional[Path] = None,
     account_filters_path: Optional[Path] = None,
-    douyin_id_bridge: Optional[pd.DataFrame] = None,
     cleaned_output_dir: Optional[Path] = None,
     reference_root: Optional[Path] = None,
 ) -> AnalysisData:
     input_dir = Path(input_dir)
     raw_category_stats = collect_raw_category_stats(input_dir)
     from .periods import period_metadata_from_dates
-    from .raw_cleaning import clean_raw_period_dir, cleaned_workbook_in_dir, load_cleaned_canonical
+    from .raw_cleaning import clean_raw_period_dir, cleaned_workbook_in_dir, load_cleaned_canonical, load_cleaning_ledger
 
     cleaned_dir = Path(cleaned_output_dir) if cleaned_output_dir is not None else input_dir
     cleaned_workbook = cleaned_workbook_in_dir(cleaned_dir)
+    default_year = _default_year_from_period(period_start, period_end)
     if cleaned_workbook is None:
         period = period_metadata_from_dates(period_start, period_end)
         clean_raw_period_dir(
             input_dir,
             period,
-            default_year=_default_year_from_period(period_start, period_end),
+            default_year=default_year,
             output_dir=cleaned_dir,
             reference_root=reference_root,
         )
@@ -203,7 +190,12 @@ def analyze_input_dir(
         category_mappings=category_mappings or {},
         reference_tables_path=reference_tables_path,
         account_filters_path=account_filters_path,
-        douyin_id_bridge=douyin_id_bridge,
+        content_ledger=load_cleaning_ledger(
+            input_dir,
+            default_year=default_year,
+            reference_root=reference_root,
+            env_path=env_path,
+        ),
     )
     return replace(analysis, raw_category_stats=raw_category_stats)
 
@@ -219,11 +211,11 @@ def analyze_canonical_frame(
     category_mappings: Optional[CategoryMappings] = None,
     reference_tables_path: Optional[Path] = None,
     account_filters_path: Optional[Path] = None,
-    douyin_id_bridge: Optional[pd.DataFrame] = None,
+    content_ledger: Optional[pd.DataFrame] = None,
 ) -> AnalysisData:
     rules = load_category_rules(category_rules_path)
     references = load_reference_tables(reference_tables_path or Path("config/reference_tables.xlsx"))
-    account_filters = load_account_filter_config(account_filters_path or Path("config/account_filters.yml"))
+    del account_filters_path
     prepared = canonical.copy()
     had_account_raw = "account_raw" in prepared.columns
     for column in STANDARD_COLUMNS:
@@ -239,32 +231,53 @@ def analyze_canonical_frame(
     prepared["period_end"] = period_end
     prepared = _normalize_social_dimensions(prepared)
     prepared = _apply_account_mappings(prepared, references)
-    if douyin_id_bridge is not None and not douyin_id_bridge.empty:
-        prepared = apply_content_ledger(prepared, pd.DataFrame(), douyin_id_bridge=douyin_id_bridge)
-    prepared, account_filter_details = apply_account_filters(prepared, account_filters)
+    prepared = normalize_platform_identities(prepared)
+    prepared = match_assets_to_ledger(prepared, _frame_or_empty(content_ledger))
+    prepared = apply_analysis_scope(prepared)
+    prepared = _disable_account_filter_columns(prepared)
+    account_filter_details = pd.DataFrame()
     preprocessing = _preprocess_canonical(prepared)
     prepared = preprocessing["canonical"]
-    prepared = _complete_categories(
-        prepared,
+    analyzable_mask = prepared["analysis_status"].astype(str).eq("可分析")
+    analyzable_for_categories = prepared[analyzable_mask].copy()
+    categorized = _complete_categories(
+        analyzable_for_categories,
         rules,
         references=references,
         env_path=env_path,
         category_matcher=category_matcher,
         category_mappings=category_mappings or {},
     )
+    for column in categorized.columns:
+        if column not in prepared.columns:
+            prepared[column] = ""
+        prepared.loc[categorized.index, column] = categorized[column]
+    if not analyzable_mask.all():
+        for column in ["manual_category", "ai_category", "content_category", "category_status", "category_source", "category_l2", "category_l2_source", "review_status"]:
+            if column not in prepared.columns:
+                prepared[column] = ""
+        blocked = ~analyzable_mask
+        prepared.loc[blocked, ["ai_category", "content_category", "category_l2"]] = ""
+        prepared.loc[blocked, "category_status"] = prepared.loc[blocked, "analysis_status"]
+        prepared.loc[blocked, "category_source"] = prepared.loc[blocked, "analysis_status"]
+        prepared.loc[blocked, "category_l2_source"] = prepared.loc[blocked, "analysis_status"]
+        prepared.loc[blocked, "review_status"] = prepared.loc[blocked, "analysis_status"]
     prepared = _derive_metrics(prepared)
     data_quality = _build_data_quality_report(prepared)
     preprocessing_report = _build_preprocessing_report(prepared, preprocessing, data_quality, account_filter_details)
-    review_queue = _build_review_queue(prepared)
-    channel_summary = _summarize_channels(prepared)
-    platform_summary = _summarize_platforms(prepared)
-    platform_category_summary = _summarize_platform_categories(prepared)
-    total_summary = _make_total_summary(prepared)
-    category_summary = _summarize_categories(prepared)
-    pending = prepared[prepared["content_category"].map(_is_blank)].copy()
-    account_audit = _build_account_audit(prepared, expected_accounts=account_filters.expected_accounts_by_platform())
-    top_content_items = _summarize_top_content(prepared)
-    cover_metrics = _summarize_cover_metrics(prepared)
+    analyzable = prepared[prepared["analysis_status"].astype(str).eq("可分析")].copy()
+    summary_source = prepared.copy()
+    detail_source, _ = split_channel_total_rows(summary_source)
+    category_source = analyzable if not analyzable.empty else prepared.iloc[0:0].copy()
+    channel_summary = _summarize_channels(summary_source)
+    platform_summary = _summarize_platforms(summary_source)
+    platform_category_summary = _summarize_platform_categories(category_source)
+    total_summary = _make_total_summary(summary_source)
+    category_summary = _summarize_categories(category_source)
+    pending = _empty_frame()
+    account_audit = _build_account_audit(summary_source)
+    top_content_items = _summarize_top_content(detail_source)
+    cover_metrics = _summarize_cover_metrics(summary_source)
     return AnalysisData(
         canonical=prepared,
         category_summary=category_summary,
@@ -278,15 +291,32 @@ def analyze_canonical_frame(
         top_content_items=top_content_items,
         cover_metrics=cover_metrics,
         data_quality=data_quality,
-        review_queue=review_queue,
         preprocessing_report=preprocessing_report,
         duplicate_merge_details=preprocessing["duplicate_merge_details"],
         conflict_retention_details=preprocessing["conflict_retention_details"],
         missing_value_details=preprocessing["missing_value_details"],
-        account_filter_rules=account_filters.to_frame(),
+        account_filter_rules=pd.DataFrame(),
         account_filter_details=account_filter_details,
         reference_tables=references,
     )
+
+
+def _frame_or_empty(frame: Optional[pd.DataFrame]) -> pd.DataFrame:
+    return frame if frame is not None else pd.DataFrame()
+
+
+def _empty_frame() -> pd.DataFrame:
+    return pd.DataFrame()
+
+
+def _disable_account_filter_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    prepared = frame.copy()
+    for column in ["account_filter_status", "account_filter_reason", "account_normalized"]:
+        if column not in prepared.columns:
+            prepared[column] = ""
+        else:
+            prepared[column] = ""
+    return prepared
 
 
 def _normalize_replayed_canonical_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -655,9 +685,22 @@ def _preprocess_canonical(canonical: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 def _dedupe_key(row: pd.Series) -> str:
     channel = "" if _is_blank(row.get("channel")) else str(row.get("channel")).strip()
-    content_id = "" if _is_blank(row.get("content_id")) else str(row.get("content_id")).strip()
     if not channel:
         return ""
+    platform = platform_from_channel_or_name(str(row.get("platform", "")) or channel)
+    if platform == "抖音":
+        work_id = "" if _is_blank(row.get("work_id")) else str(row.get("work_id")).strip()
+        if work_id:
+            return f"{channel}::id::{work_id}"
+        work_url = _normalized_content_url_key(row.get("work_url", "")) or _normalized_content_url_key(row.get("content_url", ""))
+        if work_url:
+            return f"{channel}::url::{work_url}"
+        title = normalized_title_key(row.get("standard_title", "")) or normalized_title_key(row.get("title", ""))
+        account = "" if _is_blank(row.get("account")) else str(row.get("account")).strip()
+        if not title:
+            return ""
+        return f"{channel}::title_account::{account}::{title}"
+    content_id = "" if _is_blank(row.get("content_id")) else str(row.get("content_id")).strip()
     if content_id:
         return f"{channel}::id::{content_id}"
     content_url = _normalized_content_url_key(row.get("content_url", ""))
@@ -991,14 +1034,6 @@ def _build_preprocessing_report(
     duplicate_details = preprocessing["duplicate_merge_details"]
     conflict_details = preprocessing["conflict_retention_details"]
     missing_details = preprocessing["missing_value_details"]
-    account_filter_details = account_filter_details if account_filter_details is not None else pd.DataFrame()
-    filtered_count = int(len(account_filter_details))
-    filtered_spend = (
-        pd.to_numeric(account_filter_details.get("spend", pd.Series(dtype=float)), errors="coerce")
-        .fillna(0.0)
-        .sum()
-    )
-    total_before_filter = int(len(canonical) + filtered_count)
     rows = [
         {
             "metric": "标准化后行数",
@@ -1030,23 +1065,7 @@ def _build_preprocessing_report(
             "count": int(len(missing_details)),
             "total": int(len(canonical)),
             "status": "需处理" if not missing_details.empty else "通过",
-            "note": "关键字段缺失保留为空，并进入人工审核或质量扫描。",
-        },
-        {
-            "metric": "小红书账号过滤排除行数",
-            "value": filtered_count,
-            "count": filtered_count,
-            "total": total_before_filter,
-            "status": "需关注" if filtered_count else "通过",
-            "note": "只有存在账号或账号ID但未命中白名单的小红书行不进入汇总，空账号行默认记录。",
-        },
-        {
-            "metric": "小红书账号过滤排除消耗",
-            "value": float(filtered_spend),
-            "count": filtered_count,
-            "total": total_before_filter,
-            "status": "需关注" if filtered_count else "通过",
-            "note": "被过滤账号的消耗仅用于审计，不计入小红书汇总。",
+            "note": "关键字段缺失保留为空，并进入质量扫描或不可分析原因统计。",
         },
     ]
     if not data_quality.empty:
@@ -1179,7 +1198,12 @@ def _complete_categories(
     canonical.loc[~still_missing & canonical["category_status"].map(_is_blank), "category_status"] = "人工标记"
     canonical.loc[~still_missing & canonical["category_confidence"].eq(0.0), "category_confidence"] = 1.0
     canonical["primary_category"] = ""
-    canonical["category_l1"] = ""
+    existing_category_l1 = canonical["category_l1"].fillna("").astype(str)
+    if "matched_category_l1" in canonical.columns:
+        matched_category_l1 = canonical["matched_category_l1"].fillna("").astype(str)
+        canonical["category_l1"] = matched_category_l1.where(~matched_category_l1.map(_is_blank), existing_category_l1)
+    else:
+        canonical["category_l1"] = existing_category_l1
     canonical["category_l2"] = canonical["content_category"].fillna("").astype(str)
     canonical["category_l3"] = canonical["category_l3"].where(~canonical["category_l3"].map(_is_blank), canonical["title"])
     canonical["category_status"] = canonical["category_status"].fillna("").astype(str).astype(object)
@@ -1762,216 +1786,6 @@ def _build_data_quality_report(canonical: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["metric", "value", "count", "total", "status", "note"])
 
 
-def _build_review_queue(canonical: pd.DataFrame) -> pd.DataFrame:
-    prepared = canonical.copy()
-    for column in [
-        "period_start",
-        "period_end",
-        "channel",
-        "spend",
-        "activations",
-        "needs_manual_review",
-        "review_reasons",
-        "conflict_details",
-        "match_risk_level",
-        "match_risk_reason",
-        *[field for field, _ in REVIEW_QUEUE_CRITICAL_FIELDS],
-    ]:
-        if column not in prepared.columns:
-            prepared[column] = False if column == "needs_manual_review" else ""
-
-    spend = pd.to_numeric(prepared["spend"], errors="coerce").fillna(0.0)
-    prepared["__review_rank_in_channel"] = _review_queue_rank_in_channel(prepared, spend)
-    top_content = prepared["__review_rank_in_channel"].le(REVIEW_QUEUE_TOP_N)
-    high_spend = spend.ge(REVIEW_QUEUE_HIGH_SPEND_THRESHOLD)
-    high_risk = _review_queue_high_risk_mask(prepared)
-    missing_critical = _review_queue_missing_critical_mask(prepared)
-    candidate_mask = high_risk | high_spend | (top_content & missing_critical)
-    queue = prepared[candidate_mask].copy()
-    if queue.empty:
-        return pd.DataFrame(
-            columns=[
-                "review_status",
-                "rank_in_channel",
-                "needs_manual_review",
-                "review_reasons",
-                "channel",
-                "title",
-                "content_url",
-                "account_id",
-                "account_raw",
-                "account",
-                "account_mapping_source",
-                "content_id",
-                "material_id",
-                "dedupe_key",
-                "merged_row_count",
-                "conflict_details",
-                "manual_category",
-                "ai_category",
-                "content_category",
-                "category_l2",
-                "category_l3",
-                "category_source",
-                "category_confidence",
-                "ledger_match_source",
-                "ledger_content_type",
-                "ledger_source_file",
-                "ledger_source_sheet",
-                "ledger_source_row",
-                "match_risk_level",
-                "match_risk_reason",
-                "spend",
-                "activations",
-                "activation_cost",
-                "source_file",
-                "source_sheet",
-                "source_row",
-                "source_file_hash",
-                "duplicate_group_id",
-                "review_action",
-            ]
-        )
-    queue["__review_priority"] = _review_queue_priority(
-        high_spend.loc[queue.index],
-        high_risk.loc[queue.index],
-        missing_critical.loc[queue.index],
-        top_content.loc[queue.index],
-    )
-    queue["rank_in_channel"] = queue["__review_rank_in_channel"].astype("Int64")
-    queue["review_reasons"] = queue.apply(_review_queue_reasons, axis=1)
-    queue["needs_manual_review"] = True
-    columns = [
-        "review_status",
-        "rank_in_channel",
-        "needs_manual_review",
-        "review_reasons",
-        "channel",
-        "title",
-        "content_url",
-        "account_id",
-        "account_raw",
-        "account",
-        "account_mapping_source",
-        "content_id",
-        "material_id",
-        "dedupe_key",
-        "merged_row_count",
-        "conflict_details",
-        "manual_category",
-        "ai_category",
-        "content_category",
-        "category_l2",
-        "category_l3",
-        "category_source",
-        "category_confidence",
-        "ledger_match_source",
-        "ledger_content_type",
-        "ledger_source_file",
-        "ledger_source_sheet",
-        "ledger_source_row",
-        "match_risk_level",
-        "match_risk_reason",
-        "spend",
-        "activations",
-        "activation_cost",
-        "source_file",
-        "source_sheet",
-        "source_row",
-        "source_file_hash",
-        "duplicate_group_id",
-        "review_action",
-    ]
-    for column in columns:
-        if column not in queue.columns:
-            queue[column] = ""
-    queue = queue.sort_values(
-        ["__review_priority", "spend", "rank_in_channel", "activations"],
-        ascending=[True, False, True, False],
-    ).head(REVIEW_QUEUE_MAX_ITEMS)
-    return queue[columns].reset_index(drop=True)
-
-
-def _review_queue_rank_in_channel(canonical: pd.DataFrame, spend: pd.Series) -> pd.Series:
-    frame = canonical[["period_start", "period_end", "channel"]].copy()
-    frame["__spend"] = spend
-    return (
-        frame.groupby(["period_start", "period_end", "channel"], dropna=False)["__spend"]
-        .rank(method="first", ascending=False)
-        .astype("Int64")
-    )
-
-
-def _review_queue_high_risk_mask(canonical: pd.DataFrame) -> pd.Series:
-    text = pd.Series("", index=canonical.index, dtype=object)
-    for column in ["review_reasons", "conflict_details", "match_risk_level", "match_risk_reason"]:
-        if column in canonical.columns:
-            text = text.str.cat(canonical[column].fillna("").astype(str), sep="；")
-    matched = pd.Series(False, index=canonical.index)
-    for pattern in REVIEW_QUEUE_HIGH_RISK_PATTERNS:
-        matched = matched | text.str.contains(pattern, na=False)
-    return matched
-
-
-def _review_queue_priority(
-    high_spend: pd.Series,
-    high_risk: pd.Series,
-    missing_critical: pd.Series,
-    top_content: pd.Series,
-) -> pd.Series:
-    priority = pd.Series(5, index=high_spend.index, dtype="int64")
-    priority.loc[high_spend & high_risk] = 0
-    priority.loc[(priority == 5) & high_spend & missing_critical] = 1
-    priority.loc[(priority == 5) & top_content & missing_critical] = 2
-    priority.loc[(priority == 5) & high_spend] = 3
-    priority.loc[(priority == 5) & high_risk] = 4
-    return priority
-
-
-def _review_queue_missing_critical_mask(canonical: pd.DataFrame) -> pd.Series:
-    mask = pd.Series(False, index=canonical.index)
-    for column, _ in REVIEW_QUEUE_CRITICAL_FIELDS:
-        if column in canonical.columns:
-            mask = mask | canonical[column].map(_is_blank)
-    return mask
-
-
-def _review_queue_reasons(row: pd.Series) -> str:
-    reasons = _split_reasons(row.get("review_reasons", ""))
-    rank = parse_number(row.get("rank_in_channel"))
-    if not pd.isna(rank) and rank <= REVIEW_QUEUE_TOP_N:
-        reasons.append("分渠道消耗Top20")
-    spend = parse_number(row.get("spend"))
-    if not pd.isna(spend) and spend >= REVIEW_QUEUE_HIGH_SPEND_THRESHOLD:
-        reasons.append("单条消耗>=2000元")
-    for column, label in REVIEW_QUEUE_CRITICAL_FIELDS:
-        if _is_blank(row.get(column)):
-            reasons.append(f"{label}补齐失败")
-    if _review_row_has_high_risk_conflict(row):
-        reasons.append("高风险冲突")
-
-    unique_reasons = []
-    for reason in reasons:
-        text = str(reason or "").strip()
-        if text and text not in unique_reasons:
-            unique_reasons.append(text)
-    return "；".join(unique_reasons)
-
-
-def _review_row_has_high_risk_conflict(row: pd.Series) -> bool:
-    text = "；".join(
-        str(row.get(column, "") or "")
-        for column in ["review_reasons", "conflict_details", "match_risk_level", "match_risk_reason"]
-    )
-    return any(pattern in text for pattern in REVIEW_QUEUE_HIGH_RISK_PATTERNS)
-
-
-def _review_queue_truthy(value: object) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "是", "需复核", "待审核"}
-    return bool(value)
-
-
 def _build_account_audit(
     canonical: pd.DataFrame,
     *,
@@ -2023,12 +1837,52 @@ def _build_account_audit(
 
 
 def _summarize_top_content(canonical: pd.DataFrame) -> pd.DataFrame:
+    pool = build_high_spend_content_pool(canonical)
+    if pool.empty:
+        return pd.DataFrame(
+            columns=[
+                "channel",
+                "content_id",
+                "material_id",
+                "title",
+                "account_id",
+                "account",
+                "manual_category",
+                "ai_category",
+                "content_category",
+                "spend",
+                "impressions",
+                "clicks",
+                "activations",
+                "first_pay_count",
+                "activation_cost",
+                "first_pay_cost",
+                "ctr",
+                "cover_url",
+                "content_url",
+                "source_time",
+                "metadata_source",
+                "metadata_confidence",
+                "metadata_fetched_at",
+                "metadata_error",
+                "metadata_review_reason",
+                "metadata_tags",
+                "metadata_content_type_candidate",
+                "performance_flag",
+                "content_identity_key",
+                "rank_in_channel",
+                "high_spend_reason",
+                "missing_high_spend_link",
+                "merged_row_count",
+            ]
+        )
     rows = []
-    for channel, group in canonical.groupby("channel", sort=False):
-        ranked = group.sort_values("spend", ascending=False).head(15).copy()
-        spend_threshold = pd.to_numeric(group["spend"], errors="coerce").quantile(0.75)
-        activation_median = pd.to_numeric(group["activations"], errors="coerce").median()
-        cost_median = pd.to_numeric(group["activation_cost"], errors="coerce").median()
+    for channel, group in pool.groupby("channel", sort=False):
+        ranked = group.sort_values(["rank_in_channel", "spend"], ascending=[True, False]).copy()
+        source_group = canonical[canonical["channel"].astype(str).eq(str(channel))]
+        spend_threshold = pd.to_numeric(source_group["spend"], errors="coerce").quantile(0.75)
+        activation_median = pd.to_numeric(source_group["activations"], errors="coerce").median()
+        cost_median = pd.to_numeric(source_group["activation_cost"], errors="coerce").median()
         for _, item in ranked.iterrows():
             rows.append(
                 {
@@ -2062,6 +1916,11 @@ def _summarize_top_content(canonical: pd.DataFrame) -> pd.DataFrame:
                     "performance_flag": _content_performance_flag(
                         item, spend_threshold, activation_median, cost_median
                     ),
+                    "content_identity_key": item.get("content_identity_key", ""),
+                    "rank_in_channel": item.get("rank_in_channel", pd.NA),
+                    "high_spend_reason": item.get("high_spend_reason", ""),
+                    "missing_high_spend_link": item.get("missing_high_spend_link", False),
+                    "merged_row_count": item.get("merged_row_count", 1),
                 }
             )
     return pd.DataFrame(
@@ -2095,8 +1954,18 @@ def _summarize_top_content(canonical: pd.DataFrame) -> pd.DataFrame:
             "metadata_tags",
             "metadata_content_type_candidate",
             "performance_flag",
+            "content_identity_key",
+            "rank_in_channel",
+            "high_spend_reason",
+            "missing_high_spend_link",
+            "merged_row_count",
         ],
     )
+
+
+def build_high_spend_content_pool(canonical: pd.DataFrame) -> pd.DataFrame:
+    """Backward-compatible entrypoint for the Top asset pool service."""
+    return build_top_asset_content_pool(canonical, standard_columns=STANDARD_COLUMNS, numeric_columns=NUMERIC_COLUMNS)
 
 
 def _content_performance_flag(
@@ -2226,22 +2095,11 @@ def _iter_tabular_files(input_dir: Path) -> list[Path]:
         if path.is_file()
         and path.suffix.lower() in TABULAR_SUFFIXES
         and not path.name.startswith("~$")
-        and not _is_generated_channel_clean_file(path)
-        and "channel_clean" not in path.parts
     )
 
 
 def _is_csv(path: Path) -> bool:
     return Path(path).suffix.lower() == ".csv"
-
-
-def _is_generated_channel_clean_file(path: Path) -> bool:
-    return Path(path).stem.lower().endswith("_clean")
-
-
-def _default_content_ledger_config() -> Path | None:
-    candidate = Path("config/feishu_sources.yml")
-    return candidate if candidate.exists() else None
 
 
 def _default_year_from_period(period_start: str, period_end: str) -> int:

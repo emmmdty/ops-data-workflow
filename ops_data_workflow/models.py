@@ -24,7 +24,6 @@ class WorkflowResult:
     top_content_items: pd.DataFrame
     cover_metrics: pd.DataFrame
     data_quality: pd.DataFrame
-    review_queue: pd.DataFrame
     preprocessing_report: pd.DataFrame
     duplicate_merge_details: pd.DataFrame
     conflict_retention_details: pd.DataFrame
@@ -33,12 +32,13 @@ class WorkflowResult:
     channel_comparison: pd.DataFrame
     comparison_note: str
     ai_summary: str
-    report_html: Optional[Path]
-    analysis_xlsx: Optional[Path]
-    canonical_csv: Optional[Path]
-    total_summary_xlsx: Optional[Path]
     archive_dir: Path
-    cleaned_channels_workbook: Optional[Path] = None
-    channel_clean_workbooks: list[Path] = field(default_factory=list)
+    core_recap_xlsx: Optional[Path] = None
+    cleaned_asset_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+    content_recap_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+    unanalyzable_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
+    attribution_coverage: pd.DataFrame = field(default_factory=pd.DataFrame)
+    matched_attribution: pd.DataFrame = field(default_factory=pd.DataFrame)
+    unmatched_attribution: pd.DataFrame = field(default_factory=pd.DataFrame)
     account_filter_rules: pd.DataFrame = field(default_factory=pd.DataFrame)
     account_filter_details: pd.DataFrame = field(default_factory=pd.DataFrame)

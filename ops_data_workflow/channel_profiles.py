@@ -126,11 +126,10 @@ def render_channel_profiles_table(profiles: ChannelProfileConfig | None = None) 
                 "平台": profile.platform,
                 "文件名关键词": "、".join(profile.filename_keywords),
                 "字段别名": _format_field_aliases(profile.field_aliases),
-                "账号过滤": "启用" if profile.account_filter_enabled else "不启用",
                 "启用状态": "启用" if profile.active else "停用",
             }
         )
-    return pd.DataFrame(rows, columns=["渠道", "平台", "文件名关键词", "字段别名", "账号过滤", "启用状态"])
+    return pd.DataFrame(rows, columns=["渠道", "平台", "文件名关键词", "字段别名", "启用状态"])
 
 
 def compact_source_name(value: object) -> str:

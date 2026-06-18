@@ -15,7 +15,6 @@ from ops_data_workflow.dashboard import (
     build_period_comparison_for_batch,
     build_content_recommendations,
     build_dashboard_summary,
-    build_top_content_review_queue,
     compare_channel_topics,
     detect_high_metric_anomalies,
     filter_dashboard_items,
@@ -249,13 +248,13 @@ def _seed_dashboard_db(db_path: Path) -> None:
 
 
 class DashboardTests(unittest.TestCase):
-    def test_overview_platform_chart_bars_use_actual_values_with_log_axis_and_growth_labels(self):
+    def test_overview_platform_chart_uses_self_comparison_layout(self):
         from app import _build_platform_chart_figure
 
         platform_summary = pd.DataFrame(
             [
-                {"channel": "抖音商业化", "spend": 120.0, "activations": 12.0},
-                {"channel": "小红书商业化", "spend": 80.0, "activations": 10.0},
+                {"channel": "抖音商业化", "spend": 120.0, "impressions": 1200.0, "activations": 12.0},
+                {"channel": "B站市场部", "spend": 26.0, "impressions": 800.0, "activations": 10.0},
             ]
         )
         channel_comparison = pd.DataFrame(
@@ -264,13 +263,17 @@ class DashboardTests(unittest.TestCase):
                     "channel": "抖音商业化",
                     "spend_previous": 60.0,
                     "spend_change_rate": 1.0,
+                    "impressions_previous": 1000.0,
+                    "impressions_change_rate": 0.2,
                     "activations_previous": 6.0,
                     "activations_change_rate": 1.0,
                 },
                 {
-                    "channel": "小红书商业化",
-                    "spend_previous": 100.0,
-                    "spend_change_rate": -0.2,
+                    "channel": "B站市场部",
+                    "spend_previous": 29.0,
+                    "spend_change_rate": -0.1034482759,
+                    "impressions_previous": 1000.0,
+                    "impressions_change_rate": -0.2,
                     "activations_previous": 20.0,
                     "activations_change_rate": -0.5,
                 },
@@ -280,18 +283,33 @@ class DashboardTests(unittest.TestCase):
         fig = _build_platform_chart_figure(platform_summary, channel_comparison)
 
         self.assertIsNotNone(fig)
-        current_spend = next(trace for trace in fig.data if trace.name == "总消耗 本期")
-        previous_spend = next(trace for trace in fig.data if trace.name == "总消耗 上期")
-        self.assertEqual(list(current_spend.y), [120.0, 80.0])
-        self.assertEqual(list(previous_spend.y), [60.0, 100.0])
-        self.assertEqual(fig.layout.yaxis.title.text, "总消耗")
-        self.assertEqual(fig.layout.yaxis.type, "log")
-        self.assertEqual(fig.layout.yaxis.dtick, 1)
-        self.assertFalse(hasattr(fig.layout, "yaxis2") and fig.layout.yaxis2.title.text)
-        self.assertEqual(current_spend.customdata[0][1], "120")
-        self.assertEqual(current_spend.customdata[0][2], "60")
-        self.assertEqual(current_spend.customdata[0][3], "+100%")
-        self.assertEqual(list(current_spend.text), ["120<br>+100%", "80<br>-20%"])
+        current_spend = next(trace for trace in fig.data if trace.name == "总消耗 本期规模")
+        previous_spend = next(trace for trace in fig.data if trace.name == "总消耗 上期参考")
+        spend_delta = next(trace for trace in fig.data if trace.name == "总消耗 环比徽标")
+        self.assertEqual(current_spend.orientation, "h")
+        self.assertEqual(spend_delta.mode, "text")
+        self.assertEqual(list(current_spend.x), [1.0, 26.0 / 29.0])
+        self.assertEqual(list(current_spend.y), ["抖音商业化", "B站市场部"])
+        self.assertEqual(list(current_spend.text), ["120", "26"])
+        self.assertEqual(previous_spend.orientation, "h")
+        self.assertEqual(list(previous_spend.x), [0.5, 1.0])
+        self.assertEqual(list(spend_delta.x), [1.55, 1.55])
+        self.assertEqual(list(spend_delta.text), ["+100%", "-10.3%"])
+        self.assertEqual(list(spend_delta.textfont.color), ["#d92d20", "#079455"])
+        self.assertEqual(spend_delta.customdata[0][1], "120")
+        self.assertEqual(spend_delta.customdata[0][2], "60")
+        self.assertEqual(spend_delta.customdata[0][3], "+100%")
+        self.assertEqual(spend_delta.customdata[0][4], "+60")
+        self.assertEqual(current_spend.customdata[1][5], 29.0)
+        self.assertIn("条长为本行独立尺度", current_spend.hovertemplate)
+        self.assertEqual(fig.layout.xaxis.title.text, "")
+        self.assertEqual(fig.layout.xaxis.type, "linear")
+        self.assertEqual(fig.layout.xaxis.range, (0, 1.85))
+        self.assertFalse(fig.layout.xaxis.showticklabels)
+        self.assertFalse(hasattr(fig.layout, "xaxis2") and fig.layout.xaxis2.title.text)
+        self.assertEqual(fig.layout.barmode, "overlay")
+        self.assertFalse(fig.layout.showlegend)
+        self.assertEqual(len(fig.layout.annotations), 0)
 
     def test_overview_platform_chart_shows_current_value_without_previous_baseline(self):
         from app import _build_platform_chart_figure
@@ -317,14 +335,23 @@ class DashboardTests(unittest.TestCase):
         fig = _build_platform_chart_figure(platform_summary, channel_comparison)
 
         self.assertIsNotNone(fig)
-        current_spend = next(trace for trace in fig.data if trace.name == "总消耗 本期")
-        self.assertEqual(list(current_spend.y), [120.0, 80.0])
-        self.assertEqual(list(current_spend.text), ["120<br>+100%", "80"])
-        self.assertEqual(current_spend.customdata[1][1], "80")
-        self.assertEqual(current_spend.customdata[1][2], "-")
-        self.assertEqual(current_spend.customdata[1][3], "")
+        current_spend = next(trace for trace in fig.data if trace.name == "总消耗 本期规模")
+        previous_spend = next(trace for trace in fig.data if trace.name == "总消耗 上期参考")
+        spend_delta = next(trace for trace in fig.data if trace.name == "总消耗 环比徽标")
+        self.assertEqual(list(current_spend.x), [1.0, 1.0])
+        self.assertEqual(list(current_spend.text), ["120", "80"])
+        self.assertEqual(previous_spend.x[0], 0.5)
+        self.assertTrue(pd.isna(previous_spend.x[1]))
+        self.assertEqual(list(spend_delta.x), [1.55, 1.55])
+        self.assertEqual(list(spend_delta.text), ["+100%", "-"])
+        self.assertEqual(list(spend_delta.textfont.color), ["#d92d20", "#667085"])
+        self.assertEqual(spend_delta.customdata[1][1], "80")
+        self.assertEqual(spend_delta.customdata[1][2], "-")
+        self.assertEqual(spend_delta.customdata[1][3], "-")
+        self.assertEqual(spend_delta.customdata[1][4], "-")
+        self.assertEqual(len(fig.layout.annotations), 0)
 
-    def test_period_comparison_chart_uses_actual_values_with_log_axis_and_growth_labels(self):
+    def test_period_comparison_chart_uses_competitive_scale_for_content_types(self):
         from app import _build_period_comparison_bar_figure
 
         frame = pd.DataFrame(
@@ -341,24 +368,40 @@ class DashboardTests(unittest.TestCase):
                     "spend_previous": 100.0,
                     "spend_change_rate": -0.2,
                 },
+                {
+                    "category": "投教",
+                    "spend": 47.0,
+                    "spend_previous": 35.0,
+                    "spend_change_rate": 0.3428571429,
+                },
             ]
         )
 
         fig = _build_period_comparison_bar_figure(frame, "category", "内容类型", "重点内容类型贡献")
 
-        current = next(trace for trace in fig.data if trace.name == "本期消耗")
-        previous = next(trace for trace in fig.data if trace.name == "上期消耗")
-        self.assertEqual(list(current.y), [120.0, 80.0])
-        self.assertEqual(list(previous.y), [60.0, 100.0])
-        self.assertEqual(fig.layout.yaxis.title.text, "消耗")
-        self.assertEqual(fig.layout.yaxis.type, "log")
-        self.assertEqual(fig.layout.yaxis.dtick, 1)
-        self.assertEqual(current.customdata[0][1], "120")
-        self.assertEqual(current.customdata[0][2], "60")
-        self.assertEqual(current.customdata[0][3], "+100%")
-        self.assertEqual(list(current.text), ["120<br>+100%", "80<br>-20%"])
+        current = next(trace for trace in fig.data if trace.name == "消耗 本期规模")
+        previous = next(trace for trace in fig.data if trace.name == "消耗 上期参考")
+        delta = next(trace for trace in fig.data if trace.name == "消耗 环比徽标")
+        self.assertEqual(current.orientation, "h")
+        self.assertEqual(list(current.x), [1.0, 80.0 / 120.0, 47.0 / 120.0])
+        self.assertEqual(list(current.y), ["股友说", "资讯", "投教"])
+        self.assertEqual(list(current.text), ["120", "80", "47"])
+        self.assertEqual(previous.orientation, "h")
+        self.assertEqual(list(previous.x), [0.5, 100.0 / 120.0, 35.0 / 120.0])
+        self.assertEqual(list(delta.x), [1.55, 1.55, 1.55])
+        self.assertEqual(list(delta.text), ["+100%", "-20%", "+34.3%"])
+        self.assertEqual(list(delta.textfont.color), ["#d92d20", "#079455", "#d92d20"])
+        self.assertEqual(delta.customdata[0][1], "120")
+        self.assertEqual(delta.customdata[0][2], "60")
+        self.assertEqual(delta.customdata[0][3], "+100%")
+        self.assertEqual(delta.customdata[0][4], "+60")
+        self.assertEqual(delta.customdata[1][5], 120.0)
+        self.assertIn("条长为同周期统一尺度", current.hovertemplate)
+        self.assertEqual(fig.layout.xaxis.title.text, "")
+        self.assertEqual(fig.layout.xaxis.type, "linear")
+        self.assertFalse(hasattr(fig.layout, "xaxis2") and fig.layout.xaxis2.title.text)
 
-    def test_period_comparison_chart_shows_current_value_without_previous_baseline(self):
+    def test_period_comparison_chart_keeps_new_content_type_on_competitive_scale(self):
         from app import _build_period_comparison_bar_figure
 
         frame = pd.DataFrame(
@@ -380,69 +423,78 @@ class DashboardTests(unittest.TestCase):
 
         fig = _build_period_comparison_bar_figure(frame, "category", "内容类型", "重点内容类型贡献")
 
-        current = next(trace for trace in fig.data if trace.name == "本期消耗")
-        previous = next(trace for trace in fig.data if trace.name == "上期消耗")
-        self.assertEqual(list(current.y), [120.0, 80.0])
-        self.assertEqual(previous.y[0], 60.0)
-        self.assertTrue(pd.isna(previous.y[1]))
-        self.assertEqual(list(current.text), ["120<br>+100%", "80"])
-        self.assertEqual(current.customdata[1][1], "80")
-        self.assertEqual(current.customdata[1][2], "-")
-        self.assertEqual(current.customdata[1][3], "")
+        current = next(trace for trace in fig.data if trace.name == "消耗 本期规模")
+        previous = next(trace for trace in fig.data if trace.name == "消耗 上期参考")
+        delta = next(trace for trace in fig.data if trace.name == "消耗 环比徽标")
+        self.assertEqual(list(current.x), [1.0, 80.0 / 120.0])
+        self.assertEqual(previous.x[0], 0.5)
+        self.assertTrue(pd.isna(previous.x[1]))
+        self.assertEqual(list(delta.x), [1.55, 1.55])
+        self.assertEqual(list(delta.text), ["+100%", "-"])
+        self.assertEqual(list(delta.textfont.color), ["#d92d20", "#667085"])
+        self.assertEqual(delta.customdata[1][1], "80")
+        self.assertEqual(delta.customdata[1][2], "-")
+        self.assertEqual(delta.customdata[1][3], "-")
+        self.assertEqual(delta.customdata[1][5], 120.0)
 
-    def test_content_review_item_key_prefers_stable_content_identifiers(self):
-        from app import _content_review_item_key
+    def test_cost_metric_delta_colors_are_reversed(self):
+        from app import _build_platform_chart_figure
 
-        self.assertEqual(
-            _content_review_item_key(
-                {
-                    "content_id": "content-1",
-                    "material_id": "material-1",
-                    "channel": "抖音商业化",
-                    "title": "标题",
-                }
-            ),
-            "content_id:content-1",
-        )
-        self.assertEqual(
-            _content_review_item_key(
-                {
-                    "content_id": "",
-                    "material_id": "material-1",
-                    "channel": "抖音商业化",
-                    "title": "标题",
-                }
-            ),
-            "material_id:material-1",
-        )
-        self.assertEqual(
-            _content_review_item_key(
-                {
-                    "content_id": "",
-                    "material_id": "",
-                    "channel": "抖音商业化",
-                    "title": "标题",
-                }
-            ),
-            "channel-title:抖音商业化:标题",
-        )
-
-    def test_content_review_pending_sync_filter_and_index_bounds(self):
-        from app import _content_review_pending_sync_count, _filter_content_review_pending_queue
-
-        queue = pd.DataFrame(
+        platform_summary = pd.DataFrame(
             [
-                {"content_id": "saved", "material_id": "", "channel": "抖音商业化", "title": "已保存"},
-                {"content_id": "todo-1", "material_id": "", "channel": "抖音商业化", "title": "待处理1"},
-                {"content_id": "", "material_id": "todo-2", "channel": "抖音商业化", "title": "待处理2"},
+                {"channel": "抖音商业化", "activation_cost": 12.0},
+                {"channel": "小红书商业化", "activation_cost": 8.0},
+            ]
+        )
+        channel_comparison = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "activation_cost_previous": 8.0, "activation_cost_change_rate": 0.5},
+                {"channel": "小红书商业化", "activation_cost_previous": 10.0, "activation_cost_change_rate": -0.2},
             ]
         )
 
-        filtered, bounded_index = _filter_content_review_pending_queue(queue, {"content_id:saved"}, 5)
+        fig = _build_platform_chart_figure(platform_summary, channel_comparison, "激活成本")
 
-        self.assertEqual(list(filtered["title"]), ["待处理1", "待处理2"])
-        self.assertEqual(bounded_index, 1)
-        self.assertEqual(_content_review_pending_sync_count({"content_id:saved"}), 1)
+        self.assertIsNotNone(fig)
+        delta = next(trace for trace in fig.data if trace.name == "激活成本 环比徽标")
+        self.assertEqual(list(delta.x), [1.55, 1.55])
+        self.assertEqual(list(delta.text), ["-20%", "+50%"])
+        self.assertEqual(list(delta.textfont.color), ["#d92d20", "#079455"])
+        self.assertEqual(fig.layout.title.text, "分渠道激活成本环比对比")
+
+    def test_dashboard_summary_and_aggregates_include_all_delivery_rows(self):
+        frame = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "content_id": "dy-ok", "spend": 100.0, "impressions": 1000.0, "activations": 10.0, "first_pay_count": 2.0, "analysis_status": "可分析"},
+                {"channel": "抖音商业化", "content_id": "dy-no", "spend": 900.0, "impressions": 9000.0, "activations": 90.0, "first_pay_count": 9.0, "analysis_status": "不可分析"},
+                {"channel": "小红书商业化", "content_id": "xhs-pending", "spend": 500.0, "impressions": 5000.0, "activations": 50.0, "first_pay_count": 5.0, "analysis_status": "待补全"},
+            ]
+        )
+
+        summary = build_dashboard_summary(frame)
+        grouped = aggregate_dashboard(frame, ["channel"])
+
+        self.assertAlmostEqual(summary.total_spend, 1500.0)
+        self.assertAlmostEqual(summary.total_impressions, 15000.0)
+        self.assertAlmostEqual(summary.activations, 150.0)
+        self.assertAlmostEqual(summary.first_pay_count, 16.0)
+        self.assertEqual(grouped["channel"].tolist(), ["抖音商业化", "小红书商业化"])
+        self.assertAlmostEqual(grouped.iloc[0]["spend"], 1000.0)
+        self.assertAlmostEqual(grouped.iloc[0]["activations"], 100.0)
+        self.assertAlmostEqual(grouped.iloc[1]["spend"], 500.0)
+
+    def test_dashboard_summary_keeps_legacy_rows_without_analysis_status(self):
+        frame = pd.DataFrame(
+            [
+                {"channel": "抖音商业化", "content_id": "dy-1", "spend": 100.0, "activations": 10.0, "first_pay_count": 2.0},
+                {"channel": "小红书商业化", "content_id": "xhs-1", "spend": 50.0, "activations": 5.0, "first_pay_count": 1.0},
+            ]
+        )
+
+        summary = build_dashboard_summary(frame)
+
+        self.assertAlmostEqual(summary.total_spend, 150.0)
+        self.assertAlmostEqual(summary.activations, 15.0)
 
     def test_manual_recap_report_persists_separately_from_upload_reports(self):
         with TemporaryDirectory() as tmp:
@@ -718,7 +770,7 @@ class DashboardTests(unittest.TestCase):
             self.assertAlmostEqual(comparison.loc["抖音商业化", "first_pay_rate_previous"], 0.5)
             self.assertAlmostEqual(comparison.loc["抖音商业化", "first_pay_rate_change_rate"], 0.0)
 
-    def test_week_comparison_first_week_uses_previous_month_third_week_not_month(self):
+    def test_week_comparison_first_week_uses_latest_uploaded_previous_week_not_month(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "workflow.sqlite3"
             init_db(db_path)
@@ -748,7 +800,7 @@ class DashboardTests(unittest.TestCase):
             self.assertAlmostEqual(comparison.loc["总计", "spend_change_rate"], 1.0)
             self.assertEqual(previous_batch_id, "apr-w3")
 
-    def test_week_comparison_ignores_duplicate_reimport_batches_when_selecting_previous_month_week(self):
+    def test_week_comparison_ignores_duplicate_reimport_batches_when_selecting_previous_uploaded_week(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "workflow.sqlite3"
             init_db(db_path)
@@ -785,6 +837,108 @@ class DashboardTests(unittest.TestCase):
             self.assertAlmostEqual(comparison.loc["总计", "spend_previous"], 30.0)
             self.assertAlmostEqual(comparison.loc["总计", "spend_change_rate"], 1.0)
             self.assertEqual(previous_batch_id, "apr-w3")
+
+    def test_week_comparison_uses_latest_uploaded_week_without_hardcoded_month_index(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = [
+                    ("may-w3", "2026-05-15", "2026-05-21", "20260515-20260521", 30.0),
+                    ("may-w4-variable", "2026-05-26", "2026-05-29", "20260526-20260529", 90.0),
+                    ("jun-w1", "2026-06-05", "2026-06-11", "20260605-20260611", 60.0),
+                ]
+                for batch_id, start, end, key, spend in rows:
+                    _insert_period_batch(
+                        conn,
+                        batch_id,
+                        start,
+                        end,
+                        period_level=PERIOD_LEVEL_WEEK,
+                        period_key=key,
+                    )
+                    _append_single_metric_row(conn, batch_id, start, end, spend)
+                conn.commit()
+
+            comparison = build_period_comparison_for_batch(db_path, "jun-w1").set_index("channel")
+            previous_batch_id = previous_successful_batch_id_for_period(
+                db_path,
+                "2026-06-05",
+                PERIOD_LEVEL_WEEK,
+                "20260605-20260611",
+            )
+
+            self.assertEqual(previous_batch_id, "may-w4-variable")
+            self.assertIn("总计", comparison.index)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_previous"], 90.0)
+
+    def test_week_comparison_uses_latest_actual_uploaded_period_even_when_cross_month(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = [
+                    ("may-w3", "2026-05-15", "2026-05-21", "20260515-20260521", 30.0),
+                    ("may-w4-cross-month", "2026-05-26", "2026-06-04", "20260526-20260604", 90.0),
+                    ("jun-w1", "2026-06-05", "2026-06-11", "20260605-20260611", 60.0),
+                ]
+                for batch_id, start, end, key, spend in rows:
+                    _insert_period_batch(
+                        conn,
+                        batch_id,
+                        start,
+                        end,
+                        period_level=PERIOD_LEVEL_WEEK,
+                        period_key=key,
+                    )
+                    _append_single_metric_row(conn, batch_id, start, end, spend)
+                conn.commit()
+
+            comparison = build_period_comparison_for_batch(db_path, "jun-w1").set_index("channel")
+            previous_batch_id = previous_successful_batch_id_for_period(
+                db_path,
+                "2026-06-05",
+                PERIOD_LEVEL_WEEK,
+                "20260605-20260611",
+            )
+
+            self.assertEqual(previous_batch_id, "may-w4-cross-month")
+            self.assertIn("总计", comparison.index)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_previous"], 90.0)
+
+    def test_cross_month_week_can_compare_to_latest_normal_uploaded_week_when_selected(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = [
+                    ("may-w3", "2026-05-15", "2026-05-21", "20260515-20260521", 30.0),
+                    ("may-w4-cross-month", "2026-05-26", "2026-06-04", "20260526-20260604", 60.0),
+                ]
+                for batch_id, start, end, key, spend in rows:
+                    _insert_period_batch(
+                        conn,
+                        batch_id,
+                        start,
+                        end,
+                        period_level=PERIOD_LEVEL_WEEK,
+                        period_key=key,
+                    )
+                    _append_single_metric_row(conn, batch_id, start, end, spend)
+                conn.commit()
+
+            comparison = build_period_comparison_for_batch(db_path, "may-w4-cross-month").set_index("channel")
+            previous_batch_id = previous_successful_batch_id_for_period(
+                db_path,
+                "2026-05-26",
+                PERIOD_LEVEL_WEEK,
+                "20260526-20260604",
+            )
+
+            self.assertEqual(previous_batch_id, "may-w3")
+            self.assertIn("总计", comparison.index)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_previous"], 30.0)
+            self.assertAlmostEqual(comparison.loc["总计", "spend_change_rate"], 1.0)
 
     def test_first_week_without_previous_month_third_week_has_no_comparison(self):
         with TemporaryDirectory() as tmp:
@@ -1509,6 +1663,19 @@ class DashboardTests(unittest.TestCase):
             [
                 {
                     "channel": "抖音商业化",
+                    "title": "不可分析高消耗标题",
+                    "content_id": "dy-blocked",
+                    "cover_url": "https://img.example/douyin/blocked.jpg",
+                    "content_url": "https://douyin.example/blocked",
+                    "spend": 9999.0,
+                    "activations": 1.0,
+                    "first_pay_count": 0.0,
+                    "analysis_status": "不可分析",
+                },
+            ]
+            + [
+                {
+                    "channel": "抖音商业化",
                     "title": f"抖音标题{i:02d}",
                     "content_id": f"dy-{i:02d}",
                     "cover_url": f"https://img.example/douyin/{i:02d}.jpg",
@@ -1516,6 +1683,7 @@ class DashboardTests(unittest.TestCase):
                     "spend": float(100 - i),
                     "activations": 1.0,
                     "first_pay_count": 0.0,
+                    "analysis_status": "可分析",
                 }
                 for i in range(25)
             ]
@@ -1529,6 +1697,7 @@ class DashboardTests(unittest.TestCase):
                     "spend": float(50 - i),
                     "activations": 1.0,
                     "first_pay_count": 0.0,
+                    "analysis_status": "可分析",
                 }
                 for i in range(12)
             ]
@@ -1542,6 +1711,7 @@ class DashboardTests(unittest.TestCase):
                     "spend": float(20 - i),
                     "activations": 1.0,
                     "first_pay_count": 0.0,
+                    "analysis_status": "可分析",
                 }
                 for i in range(7)
             ]
@@ -1555,6 +1725,7 @@ class DashboardTests(unittest.TestCase):
                     "spend": 999.0,
                     "activations": 1.0,
                     "first_pay_count": 0.0,
+                    "analysis_status": "可分析",
                 }
             ]
         )
@@ -1569,160 +1740,10 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(bilibili), 5)
         self.assertEqual(len(other), 1)
         self.assertEqual(douyin.iloc[0]["title"], "抖音标题00")
+        self.assertNotIn("不可分析高消耗标题", set(douyin["title"]))
         self.assertEqual(douyin.iloc[0]["content_url"], "https://douyin.example/00")
         self.assertEqual(douyin.iloc[0]["cover_url"], "https://img.example/douyin/00.jpg")
         self.assertIn("cover_url", xhs.columns)
-
-    def test_build_top_content_review_queue_uses_period_channel_limits_and_flags_missing_links(self):
-        rows = []
-        for batch_id in ["upload:week:20260515-20260521", "upload:month:2026-05"]:
-            for channel, total in [
-                ("抖音商业化", 25),
-                ("抖音市场部", 24),
-                ("小红书商业化", 12),
-                ("小红书市场部", 11),
-                ("B站", 7),
-                ("其他渠道", 12),
-            ]:
-                for index in range(total):
-                    rows.append(
-                        {
-                            "batch_id": batch_id,
-                            "period_start": "2026-05-15",
-                            "period_end": "2026-05-21",
-                            "batch_period_start": "2026-05-15",
-                            "batch_period_end": "2026-05-21",
-                            "platform_group": channel.replace("商业化", "").replace("市场部", ""),
-                            "platform": channel,
-                            "channel": channel,
-                            "title": f"{channel}标题{index:02d}",
-                            "content_id": f"{batch_id}:{channel}:{index}",
-                            "material_id": "",
-                            "content_url": "" if index == 0 else f"https://example.com/{batch_id}/{channel}/{index}",
-                            "manual_category": "" if index == 1 else "资讯",
-                            "content_category": "" if index == 2 else "资讯",
-                            "spend": float(1000 - index),
-                            "activations": 1.0,
-                            "first_pay_count": 0.0,
-                        }
-                    )
-        queue = build_top_content_review_queue(pd.DataFrame(rows), include_auto_passed=True)
-
-        counts = queue.groupby(["batch_id", "channel"]).size().to_dict()
-        for batch_id in ["upload:week:20260515-20260521", "upload:month:2026-05"]:
-            self.assertEqual(counts[(batch_id, "抖音商业化")], 20)
-            self.assertEqual(counts[(batch_id, "抖音市场部")], 20)
-            self.assertEqual(counts[(batch_id, "小红书商业化")], 10)
-            self.assertEqual(counts[(batch_id, "小红书市场部")], 10)
-            self.assertEqual(counts[(batch_id, "B站市场部")], 5)
-            self.assertEqual(counts[(batch_id, "其他渠道")], 10)
-
-        missing_link = queue[queue["title"].eq("抖音商业化标题00")].iloc[0]
-        self.assertTrue(bool(missing_link["missing_content_url"]))
-        self.assertIn("缺链接", missing_link["audit_flags"])
-        self.assertEqual(int(missing_link["rank_in_channel"]), 1)
-
-    def test_build_top_content_review_queue_defaults_to_ai_review_exceptions(self):
-        rows = [
-            {
-                "batch_id": "upload:week:20260515-20260521",
-                "batch_period_start": "2026-05-15",
-                "batch_period_end": "2026-05-21",
-                "platform_group": "抖音",
-                "platform": "抖音商业化",
-                "channel": "抖音商业化",
-                "title": "自动通过素材",
-                "content_id": "auto-pass",
-                "content_url": "https://example.com/auto",
-                "content_category": "资讯",
-                "category_l2": "资讯",
-                "category_confidence": 0.95,
-                "spend": 1000.0,
-                "activations": 10.0,
-            },
-            {
-                "batch_id": "upload:week:20260515-20260521",
-                "batch_period_start": "2026-05-15",
-                "batch_period_end": "2026-05-21",
-                "platform_group": "抖音",
-                "platform": "抖音商业化",
-                "channel": "抖音商业化",
-                "title": "低置信素材",
-                "content_id": "low-confidence",
-                "content_url": "https://example.com/low",
-                "content_category": "资讯",
-                "category_l2": "资讯",
-                "category_confidence": 0.62,
-                "spend": 900.0,
-                "activations": 9.0,
-            },
-            {
-                "batch_id": "upload:week:20260515-20260521",
-                "batch_period_start": "2026-05-15",
-                "batch_period_end": "2026-05-21",
-                "platform_group": "抖音",
-                "platform": "抖音商业化",
-                "channel": "抖音商业化",
-                "title": "缺链接素材",
-                "content_id": "missing-url",
-                "content_url": "",
-                "content_category": "资讯",
-                "category_l2": "资讯",
-                "category_confidence": 0.95,
-                "spend": 800.0,
-                "activations": 8.0,
-            },
-            {
-                "batch_id": "upload:week:20260515-20260521",
-                "batch_period_start": "2026-05-15",
-                "batch_period_end": "2026-05-21",
-                "platform_group": "抖音",
-                "platform": "抖音商业化",
-                "channel": "抖音商业化",
-                "title": "链接格式异常素材",
-                "content_id": "invalid-url",
-                "content_url": "not-a-url",
-                "content_category": "资讯",
-                "category_l2": "资讯",
-                "category_confidence": 0.95,
-                "spend": 700.0,
-                "activations": 7.0,
-            },
-            {
-                "batch_id": "upload:week:20260515-20260521",
-                "batch_period_start": "2026-05-15",
-                "batch_period_end": "2026-05-21",
-                "platform_group": "抖音",
-                "platform": "抖音商业化",
-                "channel": "抖音商业化",
-                "title": "类型冲突素材",
-                "content_id": "type-risk",
-                "content_url": "https://example.com/risk",
-                "content_category": "资讯",
-                "category_l2": "资讯",
-                "category_confidence": 0.95,
-                "match_risk_reason": "投稿台账内容类型不一致",
-                "spend": 600.0,
-                "activations": 6.0,
-            },
-        ]
-
-        queue = build_top_content_review_queue(pd.DataFrame(rows))
-        titles = set(queue["title"])
-
-        self.assertNotIn("自动通过素材", titles)
-        self.assertEqual(titles, {"低置信素材", "缺链接素材", "链接格式异常素材", "类型冲突素材"})
-        self.assertTrue(queue["needs_review"].astype(bool).all())
-        self.assertTrue(queue["ai_review_status"].eq("需人工确认").all())
-        self.assertIn("低置信", queue[queue["title"].eq("低置信素材")]["ai_review_reason"].iloc[0])
-        self.assertIn("缺链接", queue[queue["title"].eq("缺链接素材")]["audit_flags"].iloc[0])
-        self.assertIn("链接格式异常", queue[queue["title"].eq("链接格式异常素材")]["audit_flags"].iloc[0])
-        self.assertIn("类型/台账冲突", queue[queue["title"].eq("类型冲突素材")]["audit_flags"].iloc[0])
-
-        all_top = build_top_content_review_queue(pd.DataFrame(rows), include_auto_passed=True)
-        passed = all_top[all_top["title"].eq("自动通过素材")].iloc[0]
-        self.assertEqual(passed["ai_review_status"], "自动通过")
-        self.assertIn("置信度达标", passed["ai_review_reason"])
 
     def test_summarize_topics_for_selection_keeps_blank_bilibili_category_unmatched(self):
         frame = pd.DataFrame(
@@ -1920,6 +1941,7 @@ class DashboardTests(unittest.TestCase):
                     "primary_category": "",
                     "content_category": "股友说",
                     "content_id": "dy-1",
+                    "analysis_status": "可分析",
                     "spend": 100.0,
                     "impressions": 1000.0,
                     "clicks": 100.0,
@@ -1931,6 +1953,7 @@ class DashboardTests(unittest.TestCase):
                     "primary_category": "",
                     "content_category": "股友说",
                     "content_id": "dy-1",
+                    "analysis_status": "可分析",
                     "spend": 50.0,
                     "impressions": 500.0,
                     "clicks": 25.0,
@@ -1942,11 +1965,24 @@ class DashboardTests(unittest.TestCase):
                     "primary_category": "",
                     "content_category": "",
                     "content_id": "note-1",
+                    "analysis_status": "可分析",
                     "spend": 25.0,
                     "impressions": 200.0,
                     "clicks": 10.0,
                     "activations": 1.0,
                     "first_pay_count": 0.0,
+                },
+                {
+                    "platform": "小红书",
+                    "primary_category": "",
+                    "content_category": "不可混入复盘",
+                    "content_id": "note-unmatched",
+                    "analysis_status": "不可分析",
+                    "spend": 900.0,
+                    "impressions": 9000.0,
+                    "clicks": 90.0,
+                    "activations": 90.0,
+                    "first_pay_count": 9.0,
                 },
             ]
         )
@@ -1961,6 +1997,7 @@ class DashboardTests(unittest.TestCase):
         self.assertAlmostEqual(row["activation_cost"], 10.0)
         self.assertAlmostEqual(row["first_pay_rate"], 3.0 / 15.0)
         self.assertAlmostEqual(missing["missing_spend_share"], 25.0 / 175.0)
+        self.assertNotIn("不可混入复盘", set(result["content_category"]))
 
     def test_summarize_unique_content_aggregates_duplicate_video_rows(self):
         frame = pd.DataFrame(
@@ -2053,7 +2090,23 @@ class DashboardTests(unittest.TestCase):
                                     "first_pay_count": first_pay_count,
                                     "activation_cost": 999.0,
                                     "first_pay_cost": 999.0,
-                                }
+                                    "analysis_status": "可分析",
+                                },
+                                {
+                                    "platform": "抖音",
+                                    "channel": "抖音商业化",
+                                    "period_start": start,
+                                    "period_end": end,
+                                    "content_id": f"{batch_id}-unmatched",
+                                    "spend": spend * 2,
+                                    "impressions": spend * 20,
+                                    "clicks": spend * 2,
+                                    "activations": activations * 2,
+                                    "first_pay_count": first_pay_count * 2,
+                                    "activation_cost": 999.0,
+                                    "first_pay_cost": 999.0,
+                                    "analysis_status": "不可分析",
+                                },
                             ]
                         ),
                     )
@@ -2066,7 +2119,7 @@ class DashboardTests(unittest.TestCase):
 
             self.assertEqual(result["batch_id"].tolist(), ["week-2", "week-3"])
             self.assertEqual(result["trend_period"].tolist(), ["2026-04-10 至 2026-04-16", "2026-04-17 至 2026-04-23"])
-            self.assertAlmostEqual(result.iloc[1]["spend"], 300.0)
+            self.assertAlmostEqual(result.iloc[1]["spend"], 900.0)
             self.assertAlmostEqual(result.iloc[1]["activation_cost"], 20.0)
             self.assertAlmostEqual(result.iloc[1]["first_pay_cost"], 60.0)
             self.assertAlmostEqual(result.iloc[1]["first_pay_rate"], 5.0 / 15.0)

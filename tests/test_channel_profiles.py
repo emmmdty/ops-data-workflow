@@ -129,7 +129,7 @@ class ChannelProfileConfigTests(unittest.TestCase):
 
         self.assertEqual(
             list(frame.columns),
-            ["渠道", "平台", "文件名关键词", "字段别名", "账号过滤", "启用状态"],
+            ["渠道", "平台", "文件名关键词", "字段别名", "启用状态"],
         )
         self.assertNotIn("平台组", frame.columns)
         self.assertIn("小红书商业化", frame["渠道"].tolist())
@@ -150,14 +150,16 @@ class ChannelProfileConfigTests(unittest.TestCase):
         self.assertIn("B站市场部", combined)
         self.assertIn("B站商业化", combined)
 
-    def test_app_reference_page_exposes_channel_profile_description(self):
+    def test_docs_keep_channel_profile_maintenance_contract_without_reference_page(self):
         app_source = Path("app.py").read_text(encoding="utf-8")
-        reference_source = app_source[
-            app_source.index("def _page_reference_tables") : app_source.index("def _content_review_type_options")
-        ]
+        docs_source = "\n".join(
+            [
+                Path("README.md").read_text(encoding="utf-8"),
+                Path("docs/同事使用说明.md").read_text(encoding="utf-8"),
+            ]
+        )
 
-        self.assertIn("load_channel_profiles", app_source)
-        self.assertIn("render_channel_profiles_table", app_source)
-        self.assertIn("渠道配置说明", reference_source)
-        self.assertIn("channel_profiles.yml", reference_source)
-        self.assertIn("字段别名优先于通用字段映射", reference_source)
+        self.assertNotIn("_page_reference_tables", app_source)
+        self.assertIn("channel_profiles.yml", docs_source)
+        self.assertIn("字段别名优先于通用字段映射", docs_source)
+        self.assertIn("本地总表/素材缓存", docs_source)

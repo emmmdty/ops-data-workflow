@@ -63,6 +63,19 @@ class TopicAnalysisTests(unittest.TestCase):
         self.assertNotIn("小红书商业化-content-2", set(result["content_id"]))
         self.assertNotIn("B站-content-1", set(result["content_id"]))
 
+    def test_select_topic_candidates_excludes_unanalyzable_rows(self):
+        frame = pd.DataFrame(
+            [
+                {**_row("抖音商业化", 1, 9999.0), "analysis_status": "不可分析"},
+                {**_row("抖音商业化", 2, 100.0), "analysis_status": "可分析"},
+                {**_row("抖音商业化", 3, 90.0), "is_analyzable": True},
+            ]
+        )
+
+        result = select_topic_candidates(frame, "抖音商业化")
+
+        self.assertEqual(list(result["content_id"]), ["抖音商业化-content-2", "抖音商业化-content-3"])
+
     def test_build_topic_label_frame_persists_ai_labels_for_focused_rows_only(self):
         frame = pd.DataFrame(
             [_row("抖音商业化", index, float(100 - index), "股友说") for index in range(25)]

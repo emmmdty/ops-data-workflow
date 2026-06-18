@@ -12,6 +12,7 @@ from typing import Optional
 
 import pandas as pd
 
+from .generated_artifacts import is_generated_tabular_artifact
 from .pipeline import TABULAR_SUFFIXES, _is_csv
 from .periods import ReviewPeriod, infer_review_period_from_text, review_period_from_dates
 from .raw_cleaning import reset_runtime_data
@@ -47,7 +48,7 @@ class SourceImportPlan:
 
     @property
     def copyable_entries(self) -> list[SourceImportEntry]:
-        return [entry for entry in self.entries if entry.kind in {"raw", "reference"} and entry.status == "ready"]
+        return [entry for entry in self.entries if entry.kind == "raw" and entry.status == "ready"]
 
     def to_frame(self) -> pd.DataFrame:
         return pd.DataFrame(
@@ -96,10 +97,10 @@ def build_source_import_plan(source_root: Path, data_root: Path, *, default_year
                 SourceImportEntry(
                     source_path=path,
                     relative_path=relative,
-                    target_path=data_root / "reference" / path.name,
-                    kind="reference",
-                    status="ready",
-                    message="识别为人工维护台账。",
+                    target_path=Path(""),
+                    kind="ignored",
+                    status="local_reference_disabled",
+                    message="内容台账以飞书实时读取为准，本地 reference 不再导入。",
                     sheet_names=sheet_names,
                 )
             )
@@ -174,7 +175,7 @@ def _iter_external_files(source_root: Path) -> list[Path]:
         and not path.name.startswith("~$")
         and not path.name.startswith("._")
         and "__MACOSX" not in path.parts
-        and not path.stem.lower().endswith("_clean")
+        and not is_generated_tabular_artifact(path, source_root)
     )
 
 
@@ -241,7 +242,6 @@ def _clear_source_and_runtime(project_root: Path, data_root: Path) -> None:
     for target in [
         data_root / "months",
         data_root / "weeks",
-        data_root / "reference",
         data_root / "raw",
         data_root / "file_backup",
         project_root / "processed",

@@ -45,6 +45,7 @@ def clean_douyin_share_title(value: object) -> str:
     text = _clean_text(value)
     if not text:
         return ""
+    text = re.sub(r"^\s*\d+(?:\.\d+)?\s+[A-Za-z0-9]{1,12}\s*[:：]/\s*", "", text)
     if ":/" in text:
         prefix, suffix = text.rsplit(":/", 1)
         prefix_text = prefix.strip()

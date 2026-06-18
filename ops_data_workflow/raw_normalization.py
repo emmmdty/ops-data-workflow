@@ -15,6 +15,7 @@ from zipfile import ZipFile
 
 from .periods import ReviewPeriod, infer_review_period_from_text, review_period_from_dates
 from .pipeline import TABULAR_SUFFIXES
+from .generated_artifacts import is_generated_tabular_artifact
 from .source_channels import infer_channel_from_path
 from .source_storage import source_dir_for_period
 
@@ -84,7 +85,7 @@ def normalize_uploaded_periods(
                 continue
             source_name = path.relative_to(staging_dir).as_posix()
             inferred = infer_review_period_from_text(source_name, default_year)
-            if _is_ignored_path(path) or path.suffix.lower() not in TABULAR_SUFFIXES:
+            if _is_ignored_path(path) or path.suffix.lower() not in TABULAR_SUFFIXES or is_generated_tabular_artifact(path, staging_dir):
                 if inferred is not None:
                     ignored_by_key[(inferred.period_level, inferred.period_key)] += 1
                 continue
@@ -166,7 +167,7 @@ def detect_normalized_upload_channel_conflicts(
         incoming_by_channel: dict[str, list[str]] = defaultdict(list)
         for source_path in bucket.source_paths:
             path = Path(source_path)
-            if path.suffix.lower() not in TABULAR_SUFFIXES or _is_ignored_path(path):
+            if path.suffix.lower() not in TABULAR_SUFFIXES or _is_ignored_path(path) or is_generated_tabular_artifact(path):
                 continue
             incoming_by_channel[infer_channel_from_path(source_path)].append(source_path)
         for channel in sorted(_existing_channels(raw_dir, set(incoming_by_channel))):
@@ -274,7 +275,7 @@ def _remove_existing_channels(raw_dir: Path, channels: set[str]) -> None:
     if not raw_dir.exists() or not channels:
         return
     for path in sorted(raw_dir.rglob("*")):
-        if not path.is_file() or path.name == "cleaned.xlsx" or path.name == "period_manifest.json":
+        if not path.is_file() or is_generated_tabular_artifact(path, raw_dir):
             continue
         if path.suffix.lower() not in TABULAR_SUFFIXES:
             continue
@@ -287,7 +288,7 @@ def _existing_channels(raw_dir: Path, channels: set[str]) -> set[str]:
         return set()
     existing: set[str] = set()
     for path in sorted(raw_dir.rglob("*")):
-        if not path.is_file() or path.name == "cleaned.xlsx" or path.name == "period_manifest.json":
+        if not path.is_file() or is_generated_tabular_artifact(path, raw_dir):
             continue
         if path.suffix.lower() not in TABULAR_SUFFIXES:
             continue
@@ -302,7 +303,7 @@ def _existing_files_for_channel(raw_dir: Path, channel: str) -> list[Path]:
         return []
     files: list[Path] = []
     for path in sorted(raw_dir.rglob("*")):
-        if not path.is_file() or path.name == "cleaned.xlsx" or path.name == "period_manifest.json":
+        if not path.is_file() or is_generated_tabular_artifact(path, raw_dir):
             continue
         if path.suffix.lower() not in TABULAR_SUFFIXES:
             continue

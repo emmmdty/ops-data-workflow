@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+import os
 from pathlib import Path
 import hashlib
 import json
@@ -13,11 +14,13 @@ import shutil
 from typing import Iterable, Optional
 
 import pandas as pd
+from dotenv import dotenv_values
 
-from .channel_clean import write_channel_clean_workbooks
-from .content_ledger import apply_content_ledger, load_content_ledger, load_latest_reference_ledger
-from .content_metadata import enrich_content_metadata
+from .content_ledger import load_content_ledger
+from .content_metadata import enrich_content_metadata, fetch_douyin_detail_from_harvester, fetch_xhs_downloader_detail
+from .feishu_ledger import load_feishu_content_ledger
 from .field_mapping import load_field_mapping
+from .generated_artifacts import is_generated_tabular_artifact
 from .periods import ReviewPeriod, infer_review_period_from_text, period_raw_dir_name
 from .pipeline import (
     NUMERIC_COLUMNS,
@@ -44,6 +47,7 @@ DUPLICATE_CONTENT_SHEET = "重复内容"
 CONFLICTS_SHEET = "冲突项"
 IGNORED_SHEETS_SHEET = "忽略sheet"
 IMPORT_LOG_SHEET = "导入日志"
+XHS_ENRICHMENT_REPORT_NAME = "xhs_enrichment_report.xlsx"
 REVIEW_ACTION_KEEP = "保留"
 REVIEW_ACTION_PENDING = "待审核"
 SYNTHETIC_ROW_ID_COLUMN = "__清洗行ID"
@@ -102,7 +106,7 @@ def clean_source_directory(
     original_root = raw_root / "uploaded_originals" / import_id
     original_root.mkdir(parents=True, exist_ok=True)
     raw_root.mkdir(parents=True, exist_ok=True)
-    ledger = load_content_ledger(source_root, default_year=default_year, config_path=_default_content_ledger_config())
+    ledger = load_content_ledger(source_root, default_year=default_year)
     ledger_source_files = {Path(path).resolve() for path in ledger.attrs.get("source_files", set())}
 
     grouped: dict[tuple[str, str], list[tuple[ReviewPeriod, Path, str, str]]] = defaultdict(list)
@@ -160,7 +164,6 @@ def clean_source_directory(
         canonical["period_start"] = period.period_start
         canonical["period_end"] = period.period_end
         canonical = _ensure_cleaning_columns(canonical)
-        canonical = apply_content_ledger(canonical, ledger)
         preprocessing = _preprocess_canonical(canonical)
         cleaned = _mark_title_conflicts(preprocessing["canonical"])
         metadata_stats = _empty_metadata_stats()
@@ -168,12 +171,11 @@ def clean_source_directory(
         cleaned["review_action"] = cleaned["needs_manual_review"].map(
             lambda value: REVIEW_ACTION_PENDING if bool(value) else REVIEW_ACTION_KEEP
         )
-        write_channel_clean_workbooks(
-            cleaned,
-            raw_dir,
-            period_label=period.period_label,
-            period_start=period.period_start,
-            period_end=period.period_end,
+        xhs_enrichment_report = _build_xhs_enrichment_report(cleaned)
+        _write_xhs_enrichment_artifacts(
+            xhs_enrichment_report,
+            clean_dir=raw_dir,
+            enrichment_queue_root=None,
         )
         duplicate_content = _build_duplicate_content_sheet(
             preprocessing["duplicate_merge_details"],
@@ -237,9 +239,10 @@ def clean_raw_period_dir(
     default_year: int,
     output_dir: Path | None = None,
     reference_root: Path | None = None,
-    write_channel_clean: bool = True,
     metadata_enrichment_mode: str = "off",
     metadata_cache_dir: Path | None = None,
+    enrichment_queue_root: Path | None = None,
+    env_path: Path | None = None,
     fetch_bilibili_metadata=None,
     allow_public_api_metadata: bool = True,
     resolve_douyin_shortlink=None,
@@ -248,7 +251,8 @@ def clean_raw_period_dir(
     raw_dir = Path(raw_dir)
     clean_dir = Path(output_dir) if output_dir is not None else raw_dir
     clean_dir.mkdir(parents=True, exist_ok=True)
-    ledger = _load_cleaning_ledger(raw_dir, default_year=default_year, reference_root=reference_root)
+    ledger = load_cleaning_ledger(raw_dir, default_year=default_year, reference_root=reference_root, env_path=env_path)
+    ledger_warnings = [str(value) for value in ledger.attrs.get("ledger_warnings", []) if str(value).strip()]
     ledger_source_files = {Path(path).resolve() for path in ledger.attrs.get("source_files", set())}
     source_paths = [
         path.relative_to(raw_dir).as_posix()
@@ -286,13 +290,14 @@ def clean_raw_period_dir(
     canonical["period_start"] = period.period_start
     canonical["period_end"] = period.period_end
     canonical = _ensure_cleaning_columns(canonical)
-    canonical = apply_content_ledger(canonical, ledger)
     metadata_cache_dir = metadata_cache_dir or (clean_dir / ".metadata_cache")
     canonical, metadata_stats = enrich_content_metadata(
         canonical,
         mode=metadata_enrichment_mode,
         cache_dir=metadata_cache_dir,
         fetch_bilibili=fetch_bilibili_metadata,
+        fetch_douyin_detail=fetch_douyin_detail_from_harvester,
+        fetch_xhs_detail=_xhs_downloader_fetcher(env_path),
         allow_public_api=allow_public_api_metadata,
         resolve_douyin_shortlink=resolve_douyin_shortlink,
     )
@@ -303,14 +308,12 @@ def clean_raw_period_dir(
     cleaned["review_action"] = cleaned["needs_manual_review"].map(
         lambda value: REVIEW_ACTION_PENDING if bool(value) else REVIEW_ACTION_KEEP
     )
-    if write_channel_clean:
-        write_channel_clean_workbooks(
-            cleaned,
-            clean_dir,
-            period_label=period.period_label,
-            period_start=period.period_start,
-            period_end=period.period_end,
-        )
+    xhs_enrichment_report = _build_xhs_enrichment_report(cleaned)
+    _write_xhs_enrichment_artifacts(
+        xhs_enrichment_report,
+        clean_dir=clean_dir,
+        enrichment_queue_root=enrichment_queue_root,
+    )
     duplicate_file_frame = pd.DataFrame(
         duplicate_files,
         columns=["original_file", "duplicate_file", "sha256", "period_key", "note"],
@@ -320,7 +323,7 @@ def clean_raw_period_dir(
         columns=["source_file", "sheet_name", "reason", "rows", "columns", "header_row"],
     )
     import_log = pd.DataFrame(
-        import_log_rows,
+        [*_ledger_warning_log_rows(ledger_warnings), *import_log_rows],
         columns=["source_file", "sheet_name", "status", "rows", "message"],
     )
     cleaned_workbook = clean_dir / CLEANED_WORKBOOK_NAME
@@ -342,6 +345,7 @@ def clean_raw_period_dir(
         ignored_frame,
         duplicate_file_frame,
         metadata_enrichment=metadata_stats,
+        ledger_warnings=ledger_warnings,
     )
     return CleanedPeriodBucket(
         review_period=period,
@@ -356,7 +360,17 @@ def clean_raw_period_dir(
 
 def load_cleaned_canonical(cleaned_workbook: Path) -> pd.DataFrame:
     cleaned_workbook = Path(cleaned_workbook)
-    return pd.read_excel(cleaned_workbook, sheet_name=CLEANED_DETAIL_SHEET)
+    return pd.read_excel(
+        cleaned_workbook,
+        sheet_name=CLEANED_DETAIL_SHEET,
+        converters={
+            "content_id": _excel_text,
+            "content_id_fallback": _excel_text,
+            "material_id": _excel_text,
+            "account_id": _excel_text,
+            "duplicate_group_id": _excel_text,
+        },
+    )
 
 
 def write_cleaned_workbook(
@@ -370,6 +384,7 @@ def write_cleaned_workbook(
 ) -> None:
     cleaned_workbook = Path(cleaned_workbook)
     cleaned_workbook.parent.mkdir(parents=True, exist_ok=True)
+    canonical = _excel_text_columns(canonical)
     with pd.ExcelWriter(cleaned_workbook, engine="openpyxl") as writer:
         canonical.to_excel(writer, sheet_name=CLEANED_DETAIL_SHEET, index=False)
         duplicate_files.to_excel(writer, sheet_name=DUPLICATE_FILES_SHEET, index=False)
@@ -382,7 +397,7 @@ def write_cleaned_workbook(
 def rewrite_cleaned_canonical(cleaned_workbook: Path, canonical: pd.DataFrame) -> None:
     cleaned_workbook = Path(cleaned_workbook)
     sheets = pd.read_excel(cleaned_workbook, sheet_name=None)
-    sheets[CLEANED_DETAIL_SHEET] = canonical
+    sheets[CLEANED_DETAIL_SHEET] = _excel_text_columns(canonical)
     with pd.ExcelWriter(cleaned_workbook, engine="openpyxl") as writer:
         for sheet_name in [
             CLEANED_DETAIL_SHEET,
@@ -403,6 +418,28 @@ def cleaned_workbook_in_dir(input_dir: Path) -> Path | None:
     return None
 
 
+def _excel_text_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    prepared = frame.copy()
+    for column in ["content_id", "content_id_fallback", "material_id", "account_id", "duplicate_group_id"]:
+        if column in prepared.columns:
+            prepared[column] = prepared[column].map(_excel_text)
+    return prepared
+
+
+def _excel_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
+
+
 def reset_runtime_data(project_root: Path = Path(".")) -> None:
     """Clear generated runtime data while preserving source data and configs."""
     project_root = Path(project_root)
@@ -419,7 +456,7 @@ def reset_runtime_data(project_root: Path = Path(".")) -> None:
     db_path = project_root / ".runtime" / "workflow.sqlite3"
     if db_path.exists():
         db_path.unlink()
-    for relative in ["data/reference", "data/months", "data/weeks", "processed", "outputs", "output/playwright", ".runtime"]:
+    for relative in ["data/months", "data/weeks", "processed", "outputs", "output/playwright", ".runtime"]:
         (project_root / relative).mkdir(parents=True, exist_ok=True)
     init_db(db_path)
 
@@ -628,7 +665,7 @@ def _standardize_xiaohongshu_commercial(raw: pd.DataFrame, source_file: str) -> 
         platform_group="小红书",
         channel="小红书商业化",
         source_file=source_file,
-        fields=FIELD_MAPPING.fields_for_source("xhs_commercial"),
+        fields=_xiaohongshu_fields("xhs_commercial"),
     )
 
 
@@ -639,8 +676,18 @@ def _standardize_xiaohongshu_market(raw: pd.DataFrame, source_file: str) -> pd.D
         platform_group="小红书",
         channel="小红书市场部",
         source_file=source_file,
-        fields=FIELD_MAPPING.fields_for_source("xhs_market"),
+        fields=_xiaohongshu_fields("xhs_market"),
     )
+
+
+def _xiaohongshu_fields(source_kind: str) -> dict[str, list[str]]:
+    fields = FIELD_MAPPING.fields_for_source(source_kind)
+    fields["title"] = [
+        column
+        for column in fields.get("title", [])
+        if column not in {"链接", "笔记链接", "笔记/素材链接", "内容链接"}
+    ]
+    return fields
 
 
 def _standardize_social(raw: pd.DataFrame, source_file: str, channel: str, *, platform: str = "") -> pd.DataFrame:
@@ -1167,6 +1214,7 @@ def _write_manifest(
     ignored_sheets: pd.DataFrame,
     duplicate_files: pd.DataFrame,
     metadata_enrichment: dict[str, int] | None = None,
+    ledger_warnings: list[str] | None = None,
 ) -> None:
     payload = {
         "period_level": period.period_level,
@@ -1184,8 +1232,142 @@ def _write_manifest(
         "files": [cleaned_workbook.name],
         "cleaned_workbook": cleaned_workbook.name,
         "metadata_enrichment": metadata_enrichment or _empty_metadata_stats(),
+        "ledger_warnings": ledger_warnings or [],
     }
     manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _ledger_warning_log_rows(warnings: list[str]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for warning in warnings:
+        if not str(warning).strip():
+            continue
+        rows.append(
+            {
+                "source_file": "飞书台账",
+                "sheet_name": "",
+                "status": "warning",
+                "rows": 0,
+                "message": str(warning),
+            }
+        )
+    return rows
+
+
+def _build_xhs_enrichment_report(canonical: pd.DataFrame) -> pd.DataFrame:
+    if canonical.empty:
+        return pd.DataFrame(columns=_xhs_enrichment_report_columns())
+    rows: list[dict[str, object]] = []
+    for _, row in canonical.iterrows():
+        if not _is_xhs_row(row):
+            continue
+        note_id = _clean_text(row.get("content_id", ""))
+        content_url = _clean_text(row.get("content_url", ""))
+        title = _clean_text(row.get("title", ""))
+        tags = _clean_text(row.get("metadata_tags", ""))
+        account = _clean_text(row.get("account", "")) or _clean_text(row.get("author", ""))
+        link_openability = _clean_text(row.get("link_openability", "")) or ("openable" if content_url else "missing")
+        reasons = _xhs_enrichment_reasons(row)
+        rows.append(
+            {
+                "渠道": _clean_text(row.get("channel", "")),
+                "笔记ID": note_id,
+                "标题": title,
+                "账号": account,
+                "tag词": tags,
+                "作品链接": content_url,
+                "占位链接": _clean_text(row.get("xhs_placeholder_url", "")),
+                "链接状态": link_openability,
+                "链接来源": _clean_text(row.get("link_source", "")),
+                "补齐来源": _clean_text(row.get("metadata_source", "")) or _clean_text(row.get("ledger_match_source", "")),
+                "补齐置信度": row.get("metadata_confidence", ""),
+                "消耗": _numeric_value(row.get("spend", 0)),
+                "待处理原因": "；".join(reasons),
+                "复核原因": _clean_text(row.get("metadata_review_reason", "")) or _clean_text(row.get("review_reasons", "")),
+            }
+        )
+    return pd.DataFrame(rows, columns=_xhs_enrichment_report_columns())
+
+
+def _write_xhs_enrichment_artifacts(
+    report: pd.DataFrame,
+    *,
+    clean_dir: Path,
+    enrichment_queue_root: Path | None,
+) -> None:
+    if report.empty:
+        return
+    report_path = Path(clean_dir) / XHS_ENRICHMENT_REPORT_NAME
+    report.to_excel(report_path, index=False)
+    if enrichment_queue_root is None:
+        return
+    pending = report[report["待处理原因"].map(_clean_text).astype(bool)].copy()
+    if pending.empty:
+        return
+    pending = pending.sort_values("消耗", ascending=False, kind="mergesort")
+    queue_dir = Path(enrichment_queue_root) / "xhs"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y%m%d")
+    pending.to_excel(queue_dir / f"pending_{today}.xlsx", index=False)
+
+
+def _xhs_enrichment_report_columns() -> list[str]:
+    return [
+        "渠道",
+        "笔记ID",
+        "标题",
+        "账号",
+        "tag词",
+        "作品链接",
+        "占位链接",
+        "链接状态",
+        "链接来源",
+        "补齐来源",
+        "补齐置信度",
+        "消耗",
+        "待处理原因",
+        "复核原因",
+    ]
+
+
+def _xhs_enrichment_reasons(row: pd.Series) -> list[str]:
+    reasons: list[str] = []
+    if not _clean_text(row.get("content_id", "")):
+        reasons.append("笔记ID缺失")
+    if not _clean_text(row.get("title", "")):
+        reasons.append("标题缺失")
+    if not _clean_text(row.get("account", "")) and not _clean_text(row.get("author", "")):
+        reasons.append("账号缺失")
+    if not _clean_text(row.get("metadata_tags", "")):
+        reasons.append("tag词缺失")
+    link_status = _clean_text(row.get("link_openability", ""))
+    if not _clean_text(row.get("content_url", "")) or link_status in {"placeholder_only", "missing", "failed"}:
+        reasons.append("可打开链接缺失")
+    return reasons
+
+
+def _is_xhs_row(row: pd.Series) -> bool:
+    text = " ".join(_clean_text(row.get(column, "")) for column in ["platform", "platform_group", "channel"])
+    lowered = text.lower()
+    return "小红书" in text or "xiaohongshu" in lowered or "xhs" in lowered
+
+
+def _numeric_value(value: object) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
 
 
 def _empty_metadata_stats() -> dict[str, int | str]:
@@ -1225,28 +1407,71 @@ def _iter_tabular_files(root: Path) -> list[Path]:
             if path.is_file()
             and path.suffix.lower() in TABULAR_SUFFIXES
             and not path.name.startswith("~$")
-            and not _is_generated_channel_clean_file(path)
-            and "channel_clean" not in path.parts
+            and not is_generated_tabular_artifact(path, root)
         ),
         key=lambda path: (_looks_like_duplicate_copy(path.name), path.as_posix()),
     )
 
 
-def _is_generated_channel_clean_file(path: Path) -> bool:
-    return Path(path).stem.lower().endswith("_clean")
+def load_cleaning_ledger(
+    raw_dir: Path,
+    *,
+    default_year: int,
+    reference_root: Path | None,
+    env_path: Path | None = None,
+) -> pd.DataFrame:
+    warnings: list[str] = []
+    frames: list[pd.DataFrame] = []
+    source_files: set[str] = set()
+    feishu_snapshot: dict[str, object] | None = None
+
+    try:
+        feishu_ledger = load_feishu_content_ledger(default_year=default_year, env_path=env_path)
+        raw_snapshot = feishu_ledger.attrs.get("feishu_snapshot")
+        if isinstance(raw_snapshot, dict):
+            feishu_snapshot = raw_snapshot
+        if bool(feishu_ledger.attrs.get("feishu_enabled", True)):
+            warnings.extend(str(value) for value in feishu_ledger.attrs.get("ledger_warnings", []))
+        if not feishu_ledger.empty:
+            frames.append(feishu_ledger)
+            source_files.update(str(value) for value in feishu_ledger.attrs.get("source_files", set()))
+    except Exception as exc:
+        warnings.append(f"飞书台账读取失败：{exc}")
+
+    if frames:
+        ledger = pd.concat(frames, ignore_index=True)
+    else:
+        from .content_ledger import LEDGER_COLUMNS
+
+        ledger = pd.DataFrame(columns=LEDGER_COLUMNS)
+    ledger.attrs["source_files"] = source_files
+    ledger.attrs["ledger_warnings"] = warnings
+    if feishu_snapshot is not None:
+        ledger.attrs["feishu_snapshot"] = feishu_snapshot
+    return ledger
 
 
-def _default_content_ledger_config() -> Path | None:
-    candidate = Path("config/feishu_sources.yml")
-    return candidate if candidate.exists() else None
+def _xhs_downloader_fetcher(env_path: Path | None):
+    base_url = _configured_xhs_downloader_base_url(env_path)
+    if not base_url:
+        return None
+    return lambda note_id, link: fetch_xhs_downloader_detail(note_id, link, base_url=base_url)
 
 
-def _load_cleaning_ledger(raw_dir: Path, *, default_year: int, reference_root: Path | None) -> pd.DataFrame:
-    if reference_root is not None:
-        ledger = load_latest_reference_ledger(reference_root, default_year=default_year)
-        if not ledger.empty:
-            return ledger
-    return load_content_ledger(raw_dir, default_year=default_year, config_path=_default_content_ledger_config())
+def _configured_xhs_downloader_base_url(env_path: Path | None) -> str:
+    values: dict[str, str] = {}
+    candidates: list[Path] = []
+    if env_path is not None:
+        candidates.append(Path(env_path))
+    candidates.extend([Path(".env"), Path(__file__).resolve().parents[1] / ".env"])
+    for path in candidates:
+        if path.exists():
+            values.update({str(key): str(value or "") for key, value in dotenv_values(path).items()})
+            break
+    env_value = os.environ.get("XHS_DOWNLOADER_BASE_URL")
+    if env_value is not None:
+        values["XHS_DOWNLOADER_BASE_URL"] = env_value
+    return _clean_text(values.get("XHS_DOWNLOADER_BASE_URL", "")).rstrip("/")
 
 
 def _reset_period_raw_dir(raw_dir: Path) -> None:

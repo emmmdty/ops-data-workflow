@@ -12,6 +12,7 @@ from ops_data_workflow.field_mapping import (
     standardize_content_form,
     standardize_content_type,
 )
+from ops_data_workflow.generated_artifacts import is_generated_tabular_artifact
 
 
 def _default_config() -> dict:
@@ -60,15 +61,9 @@ def _skip_local_data_workbook(path: Path, base: Path) -> bool:
         return True
     if path.name.startswith(".~") or path.name.startswith("~$"):
         return True
-    try:
-        relative = path.relative_to(base)
-    except ValueError:
-        relative = path
-    if path.name in {"cleaned.xlsx", "period_manifest.json"}:
+    if is_generated_tabular_artifact(path, base):
         return True
-    if path.stem.lower().endswith("_clean"):
-        return True
-    return "channel_clean" in relative.parts
+    return False
 
 
 class FieldMappingTests(unittest.TestCase):

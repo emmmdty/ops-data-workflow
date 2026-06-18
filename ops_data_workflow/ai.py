@@ -17,8 +17,29 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OVERVIEW_RECAP_SECTION_TITLES = ("核心判断", "数据证据", "原因判断", "下周期动作")
-CHANNEL_RECAP_SECTION_TITLES = ("表现判断", "有效素材", "原因判断", "下一周期执行动作")
+OVERVIEW_RECAP_SECTION_TITLES = ("核心结论", "变化来源", "增量内容", "拖累内容", "下周期动作")
+CHANNEL_RECAP_SECTION_TITLES = ("素材表现", "题材表现", "内容类型表现", "归因分析", "执行动作")
+OVERVIEW_RECAP_SECTION_ALIASES = {
+    "核心判断": "核心结论",
+    "数据证据": "变化来源",
+    "原因判断": "变化来源",
+}
+CHANNEL_RECAP_SECTION_ALIASES = {
+    "表现判断": "素材表现",
+    "有效素材": "素材表现",
+    "题材/内容类型": "内容类型表现",
+    "原因判断": "归因分析",
+    "下一周期执行动作": "执行动作",
+}
+VISIBLE_EVIDENCE_ID_PATTERN = re.compile(
+    r"\[\s*(?:evidence_id\s*[:：]\s*)?(?:overview\.metric|channel\.|gap\.)[^\]]+\]\s*"
+)
+VISIBLE_EVIDENCE_ID_LABEL_PATTERN = re.compile(
+    r"(?m)(^|\n)\s*evidence_id\s*[:：]\s*(?:overview\.metric|channel\.|gap\.)[A-Za-z0-9_.:-]+\s*"
+)
+VISIBLE_BARE_EVIDENCE_ID_PATTERN = re.compile(
+    r"(?m)(^|\n)\s*(?:overview\.metric|channel\.|gap\.)[A-Za-z0-9_.:-]+\s+"
+)
 
 
 @dataclass(frozen=True)
@@ -119,6 +140,8 @@ def generate_manual_recap_report(
     top_content_cases: pd.DataFrame,
     overview_recommendations: str = "",
     channel_topic_context: Optional[pd.DataFrame] = None,
+    change_driver_context: Optional[Mapping[str, Any]] = None,
+    historical_content_context: Optional[Mapping[str, Any]] = None,
     period_level: str = "week",
     env_path: Optional[Path] = None,
 ) -> dict[str, Any]:
@@ -134,35 +157,45 @@ def generate_manual_recap_report(
         "top_content_cases": _records(top_content_cases),
         "overview_recommendations": str(overview_recommendations or "").strip(),
         "channel_topic_context": _records(channel_topic_context if channel_topic_context is not None else pd.DataFrame()),
+        "change_driver_summary": change_driver_context if isinstance(change_driver_context, Mapping) else {},
+        "historical_content_context": historical_content_context if isinstance(historical_content_context, Mapping) else {},
         "period_level": str(period_level or "").strip() or "week",
     }
     prompt = (
-        "你是原生内容投放的周期复盘助手。请根据给定 JSON 写一份适合同事执行和对齐的周期复盘，"
+        "你是原生内容投放的周期复盘助手。请根据给定 JSON 写一份适合同事执行和对齐的跨周期变化归因复盘，"
         "重点不是展示文字写得多完整，而是清楚传递哪些素材的数据好、为什么好、下个周期可以向哪些方向调整。"
-        "必须从数据中进行复盘，正文要引用 JSON 中的消耗、激活、成本、付费、环比、素材案例和内容类型证据；"
-        "不要机械复述数据，禁止编造 JSON 之外的数据、封面或链接。"
-        "返回内容必须分模块，overview.sections 固定为：核心判断、数据证据、原因判断、下周期动作；"
-        "channels[].sections 固定为：表现判断、有效素材、原因判断、下一周期执行动作。"
-        "渠道页 AI 只负责执行建议，不要单独输出题材或内容类型分析模块；内容类型数据只作为证据嵌入表现、素材、原因或动作中。"
-        "每个模块输出 2-4 条短要点；每条短要点必须引用输入 JSON 里的指标、素材或内容类型证据；"
+        "必须从数据中进行复盘，内部使用 evidence_id 对齐 change_driver_summary 与 historical_content_context 的证据，"
+        "但最终 JSON 不得输出 evidence_id、不得输出方括号证据编号，"
+        "不得展示 overview.metric、channel、gap 这类机器编号；"
+        "外显内容只写自然业务语言，例如渠道、内容类型、题材、素材、消耗变化、激活变化、成本变化、增量或拖累判断。"
+        "再引用 JSON 中的消耗、激活、成本、付费、环比、素材案例和内容类型证据；"
+        "不要机械复述数据，禁止编造 JSON 之外的数据、封面或链接，禁止输出未在证据包出现的预算比例、目标阈值或外部原因。"
+        "返回内容必须分模块，overview.sections 固定为：核心结论、变化来源、增量内容、拖累内容、下周期动作；"
+        "channels[].sections 固定为：素材表现、题材表现、内容类型表现、归因分析、执行动作。"
+        "渠道页 AI 只负责执行建议，不要单独输出题材或内容类型分析模块；内容类型数据只作为证据嵌入素材、题材、内容类型、归因或动作中。"
+        "每个模块输出 2-4 条短要点；每条短要点必须基于输入 JSON 里的 evidence_id、指标、素材或内容类型证据生成，"
+        "但短要点文本不得展示 evidence_id 或 [overview.metric...]、[channel...]、[gap...]；"
         "证据不足时写“当前数据未提供足够证据”。"
         "总览只写一份整体结论和下周期总体方向，不要逐渠道展开，也不要把多个渠道写成竞争关系或排名关系。"
         "分渠道必须逐个渠道单独给出执行建议，覆盖表现判断、有效素材、原因判断、下一周期执行方向或调整。"
-        "多个渠道之间不要写成竞争关系；每个渠道只分析本渠道内部哪些素材或内容类型证据支持继续、暂停、复测或调整。"
+        "多个渠道之间不要写成竞争关系；每个渠道只分析本渠道内部哪些素材、题材或内容类型证据支持继续、暂停、复测或调整。"
+        "必须明确说明哪些内容带来增量、哪些内容拖累表现；如果无法从 historical_content_context 归因，必须写“当前数据未提供足够证据”。"
         "周周期建议要偏执行的内容，例如下周期具体补哪些素材方向、复测哪些内容、暂停哪些低效方向；"
         "月周期、季度、年度建议要偏策略、方案或预算结构调整，例如内容结构、渠道机制、投放方案、资源分配。"
-        "overview_recommendations 和 channel_topic_context 只作为证据输入；不要把它们改写成独立的内容类型建议模块。"
+        "overview_recommendations 和 channel_topic_context 只作为补充证据输入；不要把它们改写成独立的内容类型建议模块。"
         "返回严格 JSON，不要 Markdown，不要代码块。格式："
         "{\"overview\":{\"report\":\"一篇总览复盘正文...\",\"next_cycle_direction\":\"下周期总体方向...\","
-        "\"sections\":[{\"title\":\"核心判断\",\"items\":[\"要点1\",\"要点2\"]},"
-        "{\"title\":\"数据证据\",\"items\":[\"要点1\",\"要点2\"]},"
-        "{\"title\":\"原因判断\",\"items\":[\"要点1\",\"要点2\"]},"
+        "\"sections\":[{\"title\":\"核心结论\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"变化来源\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"增量内容\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"拖累内容\",\"items\":[\"要点1\",\"要点2\"]},"
         "{\"title\":\"下周期动作\",\"items\":[\"要点1\",\"要点2\"]}]},"
         "\"channels\":[{\"channel\":\"渠道名\",\"analysis\":\"AI 渠道复盘建议...\",\"next_cycle_direction\":\"下一周期执行方向...\","
-        "\"sections\":[{\"title\":\"表现判断\",\"items\":[\"要点1\",\"要点2\"]},"
-        "{\"title\":\"有效素材\",\"items\":[\"要点1\",\"要点2\"]},"
-        "{\"title\":\"原因判断\",\"items\":[\"要点1\",\"要点2\"]},"
-        "{\"title\":\"下一周期执行动作\",\"items\":[\"要点1\",\"要点2\"]}]}]}。"
+        "\"sections\":[{\"title\":\"素材表现\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"题材表现\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"内容类型表现\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"归因分析\",\"items\":[\"要点1\",\"要点2\"]},"
+        "{\"title\":\"执行动作\",\"items\":[\"要点1\",\"要点2\"]}]}]}。"
         f"\n\n{json.dumps(payload, ensure_ascii=False)}"
     )
     try:
@@ -516,11 +549,11 @@ def _normalize_manual_recap_report(data: Mapping[str, Any]) -> dict[str, Any]:
     channels = data.get("channels", []) if isinstance(data, Mapping) else []
     if not isinstance(channels, list):
         channels = []
-    overview_report = str(overview.get("report", "") or "").strip()
+    overview_report = _strip_visible_evidence_ids(overview.get("report", ""))
     if not overview_report:
         overview_parts = [
-            str(overview.get("summary", "") or "").strip(),
-            str(overview.get("cause", "") or "").strip(),
+            _strip_visible_evidence_ids(overview.get("summary", "")),
+            _strip_visible_evidence_ids(overview.get("cause", "")),
         ]
         overview_report = "\n\n".join(part for part in overview_parts if part)
     overview_direction = _strip_manual_recap_direction_label(overview.get("next_cycle_direction", ""))
@@ -530,10 +563,14 @@ def _normalize_manual_recap_report(data: Mapping[str, Any]) -> dict[str, Any]:
         "overview": {
             "report": overview_report,
             "next_cycle_direction": overview_direction,
-            "sections": _normalize_manual_recap_sections(overview.get("sections", []), OVERVIEW_RECAP_SECTION_TITLES),
-            "summary": str(overview.get("summary", "") or "").strip(),
-            "cause": str(overview.get("cause", "") or "").strip(),
-            "action": str(overview.get("action", "") or "").strip(),
+            "sections": _normalize_manual_recap_sections(
+                overview.get("sections", []),
+                OVERVIEW_RECAP_SECTION_TITLES,
+                OVERVIEW_RECAP_SECTION_ALIASES,
+            ),
+            "summary": _strip_visible_evidence_ids(overview.get("summary", "")),
+            "cause": _strip_visible_evidence_ids(overview.get("cause", "")),
+            "action": _strip_visible_evidence_ids(overview.get("action", "")),
         },
         "channels": [
             {
@@ -542,10 +579,14 @@ def _normalize_manual_recap_report(data: Mapping[str, Any]) -> dict[str, Any]:
                 "next_cycle_direction": _strip_manual_recap_direction_label(
                     item.get("next_cycle_direction", "") or item.get("action", "")
                 ),
-                "sections": _normalize_manual_recap_sections(item.get("sections", []), CHANNEL_RECAP_SECTION_TITLES),
-                "summary": str(item.get("summary", "") or "").strip(),
-                "cause": str(item.get("cause", "") or "").strip(),
-                "action": str(item.get("action", "") or "").strip(),
+                "sections": _normalize_manual_recap_sections(
+                    item.get("sections", []),
+                    CHANNEL_RECAP_SECTION_TITLES,
+                    CHANNEL_RECAP_SECTION_ALIASES,
+                ),
+                "summary": _strip_visible_evidence_ids(item.get("summary", "")),
+                "cause": _strip_visible_evidence_ids(item.get("cause", "")),
+                "action": _strip_visible_evidence_ids(item.get("action", "")),
             }
             for item in channels
             if isinstance(item, Mapping)
@@ -553,7 +594,11 @@ def _normalize_manual_recap_report(data: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalize_manual_recap_sections(value: object, allowed_titles: tuple[str, ...]) -> list[dict[str, object]]:
+def _normalize_manual_recap_sections(
+    value: object,
+    allowed_titles: tuple[str, ...],
+    title_aliases: Mapping[str, str] | None = None,
+) -> list[dict[str, object]]:
     if not isinstance(value, list):
         return []
 
@@ -562,22 +607,24 @@ def _normalize_manual_recap_sections(value: object, allowed_titles: tuple[str, .
         if not isinstance(section, Mapping):
             continue
         title = str(section.get("title", "") or "").strip()
+        if title_aliases:
+            title = str(title_aliases.get(title, title))
         if title not in allowed_titles:
             continue
         items = _normalize_manual_recap_items(section.get("items", []))
         if items:
-            by_title[title] = items
+            by_title.setdefault(title, []).extend(items)
 
     return [{"title": title, "items": by_title[title]} for title in allowed_titles if title in by_title]
 
 
 def _strip_manual_recap_direction_label(value: object) -> str:
-    text = str(value or "").strip()
+    text = _strip_visible_evidence_ids(value)
     for prefix in ("下一周期执行方向", "下周期总体方向", "下一周期方向", "下周期方向"):
         if text.startswith(prefix):
             text = text[len(prefix) :].lstrip("：: ").strip()
             break
-    return text
+    return _strip_visible_evidence_ids(text)
 
 
 def _normalize_manual_recap_items(value: object) -> list[str]:
@@ -587,21 +634,33 @@ def _normalize_manual_recap_items(value: object) -> list[str]:
         candidates = str(value or "").splitlines()
     items = []
     for item in candidates:
-        text = str(item or "").strip()
+        text = _strip_visible_evidence_ids(item)
         if text:
             items.append(text)
     return items[:6]
 
 
 def _channel_analysis_text(item: Mapping[str, Any]) -> str:
-    analysis = str(item.get("analysis", "") or "").strip()
+    analysis = _strip_visible_evidence_ids(item.get("analysis", ""))
     if analysis:
         return analysis
     parts = [
-        str(item.get("summary", "") or "").strip(),
-        str(item.get("cause", "") or "").strip(),
+        _strip_visible_evidence_ids(item.get("summary", "")),
+        _strip_visible_evidence_ids(item.get("cause", "")),
     ]
     return "\n\n".join(part for part in parts if part)
+
+
+def _strip_visible_evidence_ids(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = VISIBLE_EVIDENCE_ID_PATTERN.sub("", text)
+    text = VISIBLE_EVIDENCE_ID_LABEL_PATTERN.sub(lambda match: match.group(1) or "", text)
+    text = VISIBLE_BARE_EVIDENCE_ID_PATTERN.sub(lambda match: match.group(1) or "", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _load_env(env_path: Optional[Path]) -> dict[str, str]:

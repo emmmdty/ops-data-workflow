@@ -419,7 +419,6 @@ def _rebuild_target_period(
         db_path=db_path,
         category_rules_path=category_rules_path,
         env_path=env_path,
-        reference_root=Path(data_root) / "reference",
         period_level=period.period_level,
         period_key=period.period_key,
         period_label=period.period_label,

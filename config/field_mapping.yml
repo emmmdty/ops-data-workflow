@@ -2,7 +2,7 @@ fields:
   - display: 标题
     internal: title
     role: identity
-    source_columns: [视频标题, 标题, 单元名称, 创意名称, 名称, 计划名称, 内容标题, 笔记标题, 链接, 笔记/素材链接, __清洗行标题]
+    source_columns: [视频标题, 标题, 单元名称, 创意名称, 名称, 计划名称, 内容标题, 笔记标题, 笔记/素材名称, 链接, 笔记/素材链接, __清洗行标题]
   - display: 内容ID
     internal: content_id
     role: identity
@@ -26,7 +26,7 @@ fields:
   - display: 链接
     internal: content_url
     role: identity
-    source_columns: [链接, 内容链接, 视频链接, 笔记链接, 笔记/素材链接, 素材url, 落地页]
+    source_columns: [链接, 内容链接, 作品链接, 视频链接, 笔记链接, 笔记/素材链接, 素材url, 落地页]
   - display: 封面
     internal: cover_url
     role: identity
@@ -46,7 +46,7 @@ fields:
   - display: 内容类型
     internal: manual_category
     role: content
-    source_columns: [内容分类, 内容类型, 内容类型_映射, __分组内容类型]
+    source_columns: [内容分类, 内容类型, 二级, 内容类型_映射, __分组内容类型]
   - display: 消耗
     internal: spend
     role: additive_metric
@@ -70,11 +70,11 @@ fields:
   - display: 激活成本
     internal: activation_cost_raw
     role: derived_metric_raw
-    source_columns: [激活成本, 激活成本（元）, 激活成本(转化时间), 应用激活成本, APP激活成本]
+    source_columns: [激活成本, 激活成本（元）, 激活成本(元), 激活成本(转化时间), 应用激活成本, APP激活成本]
   - display: 付费成本
     internal: first_pay_cost_raw
     role: derived_metric_raw
-    source_columns: [首次付费成本, 首次付费成本(转化时间), 七日付费成本, 7日付费成本, 应用内首次付费成本, 付费成本, 注册次数成本]
+    source_columns: [首次付费成本, 首次付费成本(转化时间), 七日付费成本, 7日付费成本, 应用内首次付费成本, 付费成本, 付费成本(元), 注册次数成本]
   - display: 点击率
     internal: ctr_raw
     role: derived_metric_raw

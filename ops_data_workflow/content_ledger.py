@@ -1,10 +1,8 @@
-"""Parse harvester Feishu exports and enrich ad rows with content metadata."""
+"""Parse harvester Feishu exports into owned content ledger rows."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date, datetime
-from difflib import SequenceMatcher
 import os
 from pathlib import Path
 import re
@@ -14,7 +12,7 @@ import pandas as pd
 import yaml
 
 from .categories import category_from_tags
-from .field_mapping import load_field_mapping, standardize_content_form
+from .generated_artifacts import is_generated_tabular_artifact
 from .source_storage import latest_reference_workbook
 from .title_matching import extract_historical_title, normalized_title_key
 
@@ -29,6 +27,10 @@ LEDGER_COLUMNS = [
     "account",
     "title",
     "tags",
+    "raw_content_type",
+    "category_l1",
+    "category_l2",
+    "bilibili_content_type",
     "content_type",
     "content_type_review",
     "filter_status",
@@ -39,16 +41,6 @@ LEDGER_COLUMNS = [
     "title_key",
     "title_key_no_tags",
 ]
-
-
-@dataclass(frozen=True)
-class LedgerMatch:
-    row: pd.Series
-    source: str
-    key: str
-    duplicate_count: int
-    fill_allowed: bool = True
-    risk_reason: str = ""
 
 
 def load_content_ledger(
@@ -89,7 +81,7 @@ def load_content_ledger(
 
 
 def load_latest_reference_ledger(reference_dir: Path, *, default_year: int = 2026) -> pd.DataFrame:
-    """Load only the newest human-maintained content ledger from data/reference."""
+    """Load only the newest human-maintained content ledger from an explicit directory."""
     workbook = latest_reference_workbook(reference_dir)
     if workbook is None:
         empty = pd.DataFrame(columns=LEDGER_COLUMNS)
@@ -132,131 +124,6 @@ def parse_content_ledger_file(
     if not rows:
         return pd.DataFrame(columns=LEDGER_COLUMNS)
     return pd.DataFrame(rows, columns=LEDGER_COLUMNS)
-
-
-def apply_content_ledger(
-    canonical: pd.DataFrame,
-    ledger: pd.DataFrame,
-    *,
-    douyin_id_bridge: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """Backfill category/link/title fields from content-ledger rows."""
-    enriched = canonical.copy()
-    for column in [
-        "ledger_match_source",
-        "ledger_match_key",
-        "ledger_content_type",
-        "ledger_content_type_review",
-        "ledger_filter_status",
-        "ledger_source_file",
-        "ledger_source_sheet",
-        "ledger_source_row",
-        "match_risk_level",
-        "match_risk_reason",
-        "manual_category_source",
-        "review_reasons",
-    ]:
-        if column not in enriched.columns:
-            enriched[column] = ""
-    if "needs_manual_review" not in enriched.columns:
-        enriched["needs_manual_review"] = False
-    else:
-        enriched["needs_manual_review"] = enriched["needs_manual_review"].map(_review_flag_truthy).astype(bool)
-    if "content_form" not in enriched.columns:
-        enriched["content_form"] = ""
-    else:
-        enriched["content_form"] = enriched["content_form"].astype(object)
-
-    if ledger.empty and (douyin_id_bridge is None or douyin_id_bridge.empty):
-        return enriched
-
-    field_mapping = load_field_mapping()
-    lookup = _build_lookup(ledger)
-    fuzzy_rows = _fuzzy_ledger_rows(ledger)
-    bridge_lookup = _build_douyin_bridge_lookup(douyin_id_bridge)
-    for index, row in enriched.iterrows():
-        match = _match_row(row, lookup, fuzzy_rows, bridge_lookup)
-        if match is None:
-            continue
-        item = match.row
-        _record_match_metadata(enriched, index, match, item)
-        if not match.fill_allowed:
-            _mark_match_risk(enriched, index, match.risk_reason)
-            continue
-        if match.duplicate_count > 1:
-            _mark_match_risk(enriched, index, f"投稿台账存在 {match.duplicate_count} 条同键记录")
-
-        _fill_blank(enriched, index, "content_url", item.get("content_url", ""))
-        _fill_blank(enriched, index, "content_id", item.get("content_id", ""))
-        _fill_title(enriched, index, item.get("title", ""))
-        _fill_blank(enriched, index, "account", item.get("account", ""))
-        _fill_blank(enriched, index, "author", item.get("account", ""))
-
-        content_type = _clean_text(item.get("content_type", ""))
-        if content_type:
-            current = _clean_text(enriched.at[index, "manual_category"] if "manual_category" in enriched.columns else "")
-            if not current:
-                enriched.at[index, "manual_category"] = content_type
-                enriched.at[index, "manual_category_source"] = "投稿台账补全"
-            elif current != content_type:
-                _mark_match_risk(enriched, index, f"原始内容类型 {current} 与投稿台账 {content_type} 不一致")
-                enriched.at[index, "review_reasons"] = _append_text(
-                    enriched.at[index, "review_reasons"] if "review_reasons" in enriched.columns else "",
-                    "投稿台账分类冲突",
-                )
-                enriched.at[index, "needs_manual_review"] = True
-            _fill_content_form_from_type(enriched, index, content_type, field_mapping)
-        if match.risk_reason:
-            _mark_match_risk(enriched, index, match.risk_reason)
-    return enriched
-
-
-def account_match_label(platform: object, account: object) -> str:
-    text = _clean_text(account)
-    if not text:
-        return ""
-    platform_name = _platform_name(platform)
-    if platform_name == "抖音":
-        if re.search(r"达人|达人内容", text):
-            return "达人内容"
-        if re.search(r"福利官|新手福利", text):
-            return "福利官"
-        if re.search(r"(同花顺|同顺)?问财", text):
-            return "问财"
-        if re.search(r"同花顺投资|^投资号$", text):
-            return "投资号"
-        if re.search(r"(同花顺|同顺)财经|^财经号$", text):
-            return "财经号"
-        if re.search(r"同花顺财富|同花顺理财|^理财$", text):
-            return "理财"
-        if re.search(r"(同花顺|同顺)股民社区|^股民社区$", text):
-            return "股民社区"
-        if re.search(r"同花顺期货通|^期货通$", text):
-            return "期货通"
-    if platform_name == "小红书":
-        if re.search(r"研习社", text):
-            return "研习社"
-        if re.search(r"同花顺投资|^投资号$", text):
-            return "投资号"
-        if re.search(r"(同花顺|同顺)股民社区|^股民社区$", text):
-            return "股民社区"
-        if re.search(r"同花顺财富|同花顺理财|^理财$", text):
-            return "理财"
-        if re.search(r"(同花顺|同顺)财经|^财经号$", text):
-            return "财经号"
-        if re.search(r"(同花顺|同顺)?问财", text):
-            return "问财"
-        if re.search(r"喵懂投资", text):
-            return "喵懂投资"
-    if platform_name == "B站" and re.search(r"同花顺投资|^投资号$", text):
-        return "投资号"
-    return text
-
-
-def platform_match_label(row: pd.Series | object) -> str:
-    if isinstance(row, pd.Series):
-        return _platform_name(" ".join(str(row.get(column, "")) for column in ["platform_group", "platform", "channel"]))
-    return _platform_name(row)
 
 
 def _ledger_sheets(path: Path) -> list[tuple[str, pd.DataFrame, int]]:
@@ -321,10 +188,22 @@ def _ledger_record(
     tags = _first_value(row, ["tag词", "TAG词", "标签", "话题"])
     if not tags:
         tags = _tags_from_text(link_text)
-    content_type = _first_value(row, ["内容类型", "内容分类", "栏目"])
-    if not content_type:
-        content_type = category_from_tags(f"{tags} {link_text}")
-    content_id = _first_value(row, ["笔记ID", "短链id", "视频/笔记id", "内容ID"])
+    raw_content_type = _first_value(row, ["内容类型", "内容分类", "栏目"])
+    category_l1 = _first_value(row, ["一级类型", "一级内容类型", "一级分类"])
+    category_l2 = _first_value(row, ["二级类型", "二级内容类型", "二级分类"])
+    bilibili_content_type = raw_content_type if platform == "B站" else ""
+    content_type = _platform_content_type(
+        platform,
+        raw_content_type=raw_content_type,
+        category_l1=category_l1,
+        category_l2=category_l2,
+        bilibili_content_type=bilibili_content_type,
+        tags=tags,
+        link_text=link_text,
+    )
+    content_id = _extract_content_id(platform, content_url or link_text) if platform == "抖音" else ""
+    if not content_id:
+        content_id = _first_value(row, ["作品ID", "笔记ID", "短链id", "视频/笔记id", "内容ID"])
     if not content_id:
         content_id = _extract_content_id(platform, content_url or link_text)
     account = _first_value(row, ["账号", "账号名称", "发布作者"])
@@ -340,6 +219,10 @@ def _ledger_record(
         "account": account,
         "title": title,
         "tags": tags,
+        "raw_content_type": raw_content_type,
+        "category_l1": category_l1,
+        "category_l2": category_l2,
+        "bilibili_content_type": bilibili_content_type,
         "content_type": content_type,
         "content_type_review": _first_value(row, ["内容类型标签审核"]),
         "filter_status": _first_value(row, ["筛选状态", "是否投放成功"]),
@@ -350,232 +233,6 @@ def _ledger_record(
         "title_key": normalized_title_key(title),
         "title_key_no_tags": _normalized_tagless_title_key(title or link_text),
     }
-
-
-def _build_lookup(ledger: pd.DataFrame) -> dict[tuple[str, str, str, str], list[pd.Series]]:
-    lookup: dict[tuple[str, str, str, str], list[pd.Series]] = {}
-    if ledger.empty:
-        return lookup
-    for _, row in ledger.iterrows():
-        platform = platform_match_label(row.get("platform", ""))
-        account = account_match_label(platform, row.get("account", ""))
-        content_id = _clean_text(row.get("content_id", ""))
-        title_key = _clean_text(row.get("title_key", "")) or normalized_title_key(row.get("title", ""))
-        title_key_no_tags = _clean_text(row.get("title_key_no_tags", "")) or _normalized_tagless_title_key(
-            row.get("title", "")
-        )
-        if content_id:
-            lookup.setdefault((platform, account, "id", content_id), []).append(row)
-            if platform in {"小红书", "B站"} and account:
-                lookup.setdefault((platform, "", "id", content_id), []).append(row)
-        if platform == "抖音" and title_key_no_tags:
-            lookup.setdefault((platform, account, "title_no_tags", title_key_no_tags), []).append(row)
-            if account:
-                lookup.setdefault((platform, "", "title_no_tags", title_key_no_tags), []).append(row)
-        elif platform == "抖音" and title_key:
-            lookup.setdefault((platform, account, "title_no_tags", title_key), []).append(row)
-            if account:
-                lookup.setdefault((platform, "", "title_no_tags", title_key), []).append(row)
-    return lookup
-
-
-def _build_douyin_bridge_lookup(
-    bridge: pd.DataFrame | None,
-) -> dict[tuple[str, str], list[pd.Series]]:
-    lookup: dict[tuple[str, str], list[pd.Series]] = {}
-    if bridge is None or bridge.empty:
-        return lookup
-    for _, row in bridge.iterrows():
-        id_type = _clean_text(row.get("id_type", ""))
-        id_value = _clean_text(row.get("id_value", ""))
-        if id_type and id_value:
-            lookup.setdefault((id_type, id_value), []).append(row)
-    return lookup
-
-
-def _fuzzy_ledger_rows(ledger: pd.DataFrame) -> list[pd.Series]:
-    if ledger.empty:
-        return []
-    rows: list[pd.Series] = []
-    for _, row in ledger.iterrows():
-        if platform_match_label(row.get("platform", "")) != "抖音":
-            continue
-        title_key = _clean_text(row.get("title_key_no_tags", "")) or _normalized_tagless_title_key(row.get("title", ""))
-        if len(title_key) >= 6:
-            rows.append(row)
-    return rows
-
-
-def _match_row(
-    row: pd.Series,
-    lookup: dict[tuple[str, str, str, str], list[pd.Series]],
-    fuzzy_rows: list[pd.Series],
-    bridge_lookup: dict[tuple[str, str], list[pd.Series]],
-) -> LedgerMatch | None:
-    platform = platform_match_label(row)
-    account = account_match_label(platform, row.get("account", ""))
-    if platform == "抖音":
-        bridge_match = _match_douyin_bridge(row, bridge_lookup)
-        if bridge_match is not None:
-            return bridge_match
-
-    keys: list[tuple[str, str, str, str, str]] = []
-    content_id = _clean_text(row.get("content_id", ""))
-    if content_id:
-        keys.append(("id", platform, account, "id", content_id))
-        if platform in {"小红书", "B站"} and not account:
-            keys.append(("id", platform, "", "id", content_id))
-    title_key = _normalized_tagless_title_key(row.get("title", ""))
-    if platform == "抖音" and title_key and account:
-        keys.append(("账号+标题", platform, account, "title_no_tags", title_key))
-    for source, key_platform, key_account, key_type, key_value in keys:
-        matches = lookup.get((key_platform, key_account, key_type, key_value))
-        if matches:
-            if key_type == "title_no_tags":
-                return _select_title_match(row, matches, source, f"{key_platform}:{key_account}:{key_type}:{key_value}")
-            reason = _ambiguous_match_reason(matches, "同键")
-            if reason:
-                return LedgerMatch(
-                    matches[0],
-                    source,
-                    f"{key_platform}:{key_account}:{key_type}:{key_value}",
-                    len(matches),
-                    fill_allowed=False,
-                    risk_reason=reason,
-                )
-            return LedgerMatch(matches[0], source, f"{key_platform}:{key_account}:{key_type}:{key_value}", len(matches))
-    if platform == "抖音" and title_key:
-        if not account:
-            matches = lookup.get((platform, "", "title_no_tags", title_key))
-            if matches:
-                key = f"{platform}::title_no_tags::{title_key}"
-                return _select_title_match(row, matches, "唯一标题", key)
-        fuzzy_match = _match_fuzzy_title(row, fuzzy_rows)
-        if fuzzy_match is not None:
-            return fuzzy_match
-    return None
-
-
-def _match_douyin_bridge(
-    row: pd.Series,
-    bridge_lookup: dict[tuple[str, str], list[pd.Series]],
-) -> LedgerMatch | None:
-    for id_type, id_value in _douyin_feedback_keys(row):
-        matches = bridge_lookup.get((id_type, id_value), [])
-        if not matches:
-            continue
-        key = f"抖音::{id_type}::{id_value}"
-        reason = _ambiguous_bridge_reason(matches)
-        if reason:
-            return LedgerMatch(matches[0], "反馈ID桥表", key, len(matches), fill_allowed=False, risk_reason=reason)
-        return LedgerMatch(matches[0], "反馈ID桥表", key, len(matches))
-    return None
-
-
-def _douyin_feedback_keys(row: pd.Series) -> list[tuple[str, str]]:
-    keys: list[tuple[str, str]] = []
-    for column in ["content_id", "material_id"]:
-        value = _clean_text(row.get(column, ""))
-        if value and not value.startswith("row:") and (column, value) not in keys:
-            keys.append((column, value))
-    url_key = _douyin_url_key(row.get("content_url", ""))
-    if url_key and ("content_url", url_key) not in keys:
-        keys.append(("content_url", url_key))
-    return keys
-
-
-def _douyin_url_key(value: object) -> str:
-    text = _clean_text(value)
-    if not text:
-        return ""
-    token_match = re.search(r"[?&]token=([^&#\s]+)", text)
-    if token_match:
-        return f"token:{token_match.group(1)}"
-    return text
-
-
-def _select_title_match(row: pd.Series, matches: list[pd.Series], source: str, key: str) -> LedgerMatch:
-    if len(matches) <= 1:
-        return LedgerMatch(matches[0], source, key, len(matches))
-    selected = _choose_title_match_by_date(row, matches)
-    reason = "同标题多链接按日期选择"
-    return LedgerMatch(selected, source, key, len(matches), fill_allowed=True, risk_reason=reason)
-
-
-def _choose_title_match_by_date(row: pd.Series, matches: list[pd.Series]) -> pd.Series:
-    period_end = _parse_period_end(row)
-    dated: list[tuple[date, pd.Series]] = []
-    for candidate in matches:
-        parsed = _parse_published_date(candidate.get("published_date", ""), 2026)
-        if parsed is not None:
-            dated.append((parsed, candidate))
-    if not dated:
-        return matches[0]
-    if period_end is not None:
-        eligible = [(parsed, candidate) for parsed, candidate in dated if parsed <= period_end]
-        if eligible:
-            latest = max(parsed for parsed, _ in eligible)
-            return next(candidate for parsed, candidate in eligible if parsed == latest)
-    earliest = min(parsed for parsed, _ in dated)
-    return next(candidate for parsed, candidate in dated if parsed == earliest)
-
-
-def _parse_period_end(row: pd.Series) -> date | None:
-    for column in ["period_end", "batch_period_end", "data_end"]:
-        parsed = _parse_published_date(row.get(column, ""), 2026)
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def _match_fuzzy_title(row: pd.Series, ledger_rows: list[pd.Series]) -> LedgerMatch | None:
-    title_key = _normalized_tagless_title_key(row.get("title", ""))
-    if len(title_key) < 6:
-        return None
-    account = account_match_label("抖音", row.get("account", ""))
-    matches: list[tuple[float, pd.Series]] = []
-    for candidate in ledger_rows:
-        candidate_account = account_match_label("抖音", candidate.get("account", ""))
-        if account and candidate_account and account != candidate_account:
-            continue
-        candidate_key = _clean_text(candidate.get("title_key_no_tags", "")) or _normalized_tagless_title_key(
-            candidate.get("title", "")
-        )
-        if not candidate_key or candidate_key == title_key:
-            continue
-        score = _fuzzy_title_score(title_key, candidate_key)
-        if score >= 0.86:
-            matches.append((score, candidate))
-    if not matches:
-        return None
-    best_score = max(score for score, _ in matches)
-    best_matches = [candidate for score, candidate in matches if score == best_score]
-    candidate = _choose_title_match_by_date(row, best_matches)
-    candidate_key = _clean_text(candidate.get("title_key_no_tags", "")) or _normalized_tagless_title_key(
-        candidate.get("title", "")
-    )
-    reason = "标题近似匹配，需确认"
-    if len(best_matches) > 1:
-        reason = _append_text(reason, "同标题多链接按日期选择")
-    return LedgerMatch(
-        candidate,
-        "模糊标题",
-        f"抖音::fuzzy_title::{title_key}->{candidate_key}",
-        len(best_matches),
-        fill_allowed=True,
-        risk_reason=reason,
-    )
-
-
-def _is_fuzzy_title_match(left: str, right: str) -> bool:
-    return _fuzzy_title_score(left, right) >= 0.86
-
-
-def _fuzzy_title_score(left: str, right: str) -> float:
-    shorter, longer = sorted([left, right], key=len)
-    if len(shorter) >= 6 and shorter in longer:
-        return 1.0
-    return SequenceMatcher(None, left, right).ratio()
 
 
 def _dedupe_ledger_by_earliest_date(ledger: pd.DataFrame, *, default_year: int) -> pd.DataFrame:
@@ -609,8 +266,25 @@ def _dedupe_ledger_by_earliest_date(ledger: pd.DataFrame, *, default_year: int) 
     return ledger.loc[[index for index in ledger.index if index in keep]].reset_index(drop=True)
 
 
+def _platform_content_type(
+    platform: str,
+    *,
+    raw_content_type: str,
+    category_l1: str,
+    category_l2: str,
+    bilibili_content_type: str,
+    tags: str,
+    link_text: object,
+) -> str:
+    if platform in {"抖音", "小红书"}:
+        return category_l2 or category_l1 or raw_content_type or category_from_tags(f"{tags} {link_text}")
+    if platform == "B站":
+        return bilibili_content_type or raw_content_type or category_from_tags(f"{tags} {link_text}")
+    return raw_content_type or category_from_tags(f"{tags} {link_text}")
+
+
 def _ledger_duplicate_key(row: pd.Series) -> tuple[str, str, str] | None:
-    platform = platform_match_label(row.get("platform", ""))
+    platform = _platform_name(row.get("platform", ""))
     content_id = _clean_text(row.get("content_id", ""))
     content_url = _clean_text(row.get("content_url", ""))
     if platform == "抖音" and content_url:
@@ -685,7 +359,10 @@ def _configured_ledger_specs(config_path: Path | None) -> list[tuple[Path, Path 
             source_path = Path(path_text)
             if not source_path.is_absolute():
                 source_path = config_path.parent / source_path
-            if source_path.exists() and source_path.suffix.lower() in TABULAR_SUFFIXES:
+            if source_path.is_dir():
+                for child in _iter_tabular_files(source_path):
+                    specs.append((child, config_path.parent, path_text))
+            elif source_path.exists() and source_path.suffix.lower() in TABULAR_SUFFIXES:
                 specs.append((source_path, config_path.parent, path_text))
     return specs
 
@@ -723,60 +400,6 @@ def _normalized_tagless_title_key(value: object) -> str:
     return normalized_title_key(text)
 
 
-def _ambiguous_match_reason(matches: list[pd.Series], key_label: str) -> str:
-    if len(matches) <= 1:
-        return ""
-    accounts = {
-        account_match_label(row.get("platform", ""), row.get("account", ""))
-        for row in matches
-        if _clean_text(row.get("account", ""))
-    }
-    content_types = {
-        _clean_text(row.get("content_type", ""))
-        for row in matches
-        if _clean_text(row.get("content_type", ""))
-    }
-    if len(accounts) > 1 or len(content_types) > 1:
-        return f"投稿台账存在 {len(matches)} 条{key_label}记录"
-    return ""
-
-
-def _ambiguous_bridge_reason(matches: list[pd.Series]) -> str:
-    if len(matches) <= 1:
-        return ""
-    accounts = {
-        account_match_label("抖音", row.get("account", ""))
-        for row in matches
-        if _clean_text(row.get("account", ""))
-    }
-    content_types = {
-        _clean_text(row.get("content_type", ""))
-        for row in matches
-        if _clean_text(row.get("content_type", ""))
-    }
-    if len(accounts) > 1 or len(content_types) > 1:
-        return f"抖音ID桥表存在 {len(matches)} 条同ID记录"
-    return ""
-
-
-def _record_match_metadata(frame: pd.DataFrame, index: object, match: LedgerMatch, item: pd.Series) -> None:
-    frame.at[index, "ledger_match_source"] = match.source
-    frame.at[index, "ledger_match_key"] = match.key
-    frame.at[index, "ledger_content_type"] = item.get("content_type", "")
-    frame.at[index, "ledger_content_type_review"] = item.get("content_type_review", "")
-    frame.at[index, "ledger_filter_status"] = item.get("filter_status", "")
-    frame.at[index, "ledger_source_file"] = item.get("source_file", "")
-    frame.at[index, "ledger_source_sheet"] = item.get("source_sheet", "")
-    frame.at[index, "ledger_source_row"] = _clean_text(item.get("source_row", ""))
-
-
-def _mark_match_risk(frame: pd.DataFrame, index: object, reason: str) -> None:
-    frame.at[index, "match_risk_level"] = "需复核"
-    frame.at[index, "match_risk_reason"] = _append_text(frame.at[index, "match_risk_reason"], reason)
-    frame.at[index, "review_reasons"] = _append_text(frame.at[index, "review_reasons"], reason)
-    frame.at[index, "needs_manual_review"] = True
-
-
 def _iter_tabular_files(input_dir: Path) -> list[Path]:
     return sorted(
         path
@@ -784,17 +407,12 @@ def _iter_tabular_files(input_dir: Path) -> list[Path]:
         if path.is_file()
         and path.suffix.lower() in TABULAR_SUFFIXES
         and not path.name.startswith("~$")
-        and not _is_generated_channel_clean_file(path)
-        and "channel_clean" not in path.parts
+        and not is_generated_tabular_artifact(path, input_dir)
     )
 
 
 def _is_csv(path: Path) -> bool:
     return Path(path).suffix.lower() == ".csv"
-
-
-def _is_generated_channel_clean_file(path: Path) -> bool:
-    return Path(path).stem.lower().endswith("_clean")
 
 
 def _read_table(
@@ -840,6 +458,9 @@ def _extract_content_id(platform: str, value: object) -> str:
     if platform == "B站":
         match = re.search(r"(BV[0-9A-Za-z]+)", text)
         return match.group(1) if match else ""
+    if platform == "抖音":
+        match = re.search(r"/(?:video|note)/(\d{10,24})", text)
+        return match.group(1) if match else ""
     return ""
 
 
@@ -873,63 +494,11 @@ def _platform_name(value: object) -> str:
     return ""
 
 
-def _fill_blank(frame: pd.DataFrame, index: object, column: str, value: object) -> None:
-    if column not in frame.columns:
-        frame[column] = ""
-    if not _clean_text(frame.at[index, column]):
-        frame.at[index, column] = _clean_text(value)
-
-
-def _fill_title(frame: pd.DataFrame, index: object, value: object) -> None:
-    if "title" not in frame.columns:
-        frame["title"] = ""
-    current = _clean_text(frame.at[index, "title"])
-    replacement = _clean_text(value)
-    if replacement and (not current or _is_url_only(current)):
-        frame.at[index, "title"] = replacement
-
-
-def _fill_content_form_from_type(frame: pd.DataFrame, index: object, content_type: str, field_mapping) -> None:
-    if "content_form" not in frame.columns:
-        frame["content_form"] = ""
-    form = standardize_content_form(
-        pd.Series({"manual_category": content_type}),
-        channel=_clean_text(frame.at[index, "channel"] if "channel" in frame.columns else ""),
-        mapping=field_mapping,
-    )
-    if not form:
-        return
-    current = _clean_text(frame.at[index, "content_form"])
-    if not current or form == "图文":
-        frame.at[index, "content_form"] = form
-
-
-def _is_url_only(value: object) -> bool:
-    text = _clean_text(value)
-    return bool(re.fullmatch(r"https?://\S+", text))
-
-
-def _append_text(current: object, addition: str) -> str:
-    values = [part for part in str(current or "").split("；") if part]
-    if addition and addition not in values:
-        values.append(addition)
-    return "；".join(values)
-
-
-def _review_flag_truthy(value: object) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "是", "需复核", "待复核", "待审核"}
-    try:
-        if pd.isna(value):
-            return False
-    except (TypeError, ValueError):
-        pass
-    return bool(value)
-
-
 def _looks_like_separator(row: pd.Series) -> bool:
     text = " ".join(_clean_text(value) for value in row.tolist())
-    return "投稿视频" in text and not _extract_url(text)
+    if _extract_url(text):
+        return False
+    return bool(re.search(r"(?:20\d{2}年投稿|\d{3,4}\s*投稿(?:视频|图文)?|投稿视频|投稿图文)", text))
 
 
 def _clean_text(value: object) -> str:

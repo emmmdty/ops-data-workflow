@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import pandas as pd
 
 from .pipeline import TABULAR_SUFFIXES
+from .generated_artifacts import is_generated_tabular_artifact
 from .source_storage import discover_source_period_dirs
 from .workflow import run_archived_workflow
 
@@ -273,15 +274,4 @@ def _sha256(path: Path) -> str:
 
 
 def _is_generated_raw_artifact(path: Path, root: Path | None = None) -> bool:
-    item = Path(path)
-    relative = item
-    if root is not None:
-        try:
-            relative = item.relative_to(root)
-        except ValueError:
-            relative = item
-    if item.name == "cleaned.xlsx":
-        return True
-    if item.stem.lower().endswith("_clean"):
-        return True
-    return "channel_clean" in relative.parts
+    return is_generated_tabular_artifact(Path(path), root)

@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 
+from .generated_artifacts import is_generated_tabular_artifact
 from .periods import (
     PERIOD_LEVEL_MONTH,
     PERIOD_LEVEL_WEEK,
@@ -151,7 +152,7 @@ def migrate_legacy_raw_to_source_layout(data_root: Path, *, move: bool = False) 
     """One-time legacy data/raw migration.
 
     Only original tabular source files are migrated. Generated workbooks,
-    manifests, channel_clean outputs, and non-tabular artifacts are ignored.
+    manifests, and non-tabular artifacts are ignored.
     """
     data_root = Path(data_root)
     raw_root = data_root / "raw"
@@ -210,18 +211,7 @@ def _raw_tabular_files(period_dir: Path) -> list[Path]:
 
 
 def _is_generated_artifact(path: Path, root: Path | None = None) -> bool:
-    item = Path(path)
-    relative = item
-    if root is not None:
-        try:
-            relative = item.relative_to(root)
-        except ValueError:
-            relative = item
-    if item.name in {"cleaned.xlsx", "period_manifest.json"}:
-        return True
-    if item.stem.lower().endswith("_clean"):
-        return True
-    return "channel_clean" in relative.parts
+    return is_generated_tabular_artifact(Path(path), root)
 
 
 def _latest_date_token(name: str) -> str:

@@ -7,21 +7,20 @@ from tempfile import TemporaryDirectory
 import unittest
 from io import BytesIO
 from zipfile import ZipFile
+from unittest.mock import patch
 
 import pandas as pd
 from openpyxl import load_workbook
 
 from ops_data_workflow.ai import _build_payload, group_topic_labels, resolve_deepseek_settings
+from ops_data_workflow.content_ledger import LEDGER_COLUMNS
 from ops_data_workflow.categories import CATEGORY_TAG_MAP, category_from_tags
 from ops_data_workflow.source_channels import infer_channel_from_path
+from ops_data_workflow.analysis_jobs import list_analysis_jobs
 from ops_data_workflow.storage import init_db
 from ops_data_workflow.storage import (
-    load_category_mappings,
-    load_douyin_id_bridge,
-    load_topic_labels_for_batch,
     purge_history_state,
     read_batch_record,
-    upsert_category_mappings,
 )
 from ops_data_workflow.upload_input import (
     detect_upload_channel_conflicts,
@@ -100,7 +99,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertFalse((tmp_path / "uploaded_originals").exists())
             self.assertEqual(len(result.original_files), 2)
 
-    def test_materialize_uploaded_files_ignores_generated_channel_clean_workbooks(self):
+    def test_materialize_uploaded_files_keeps_clean_named_uploads_as_sources(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             result = materialize_uploaded_files(
@@ -117,10 +116,12 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 tmp_path / "raw",
             )
 
-            self.assertFalse((result.raw_dir / "小红书市场部_clean.xlsx").exists())
-            self.assertFalse((result.raw_dir.parent / "uploaded_originals" / "小红书市场部_clean.xlsx").exists())
+            self.assertTrue((result.raw_dir / "小红书市场部_clean.xlsx").exists())
             self.assertTrue((result.raw_dir / "小红书市场部.xlsx").exists())
-            self.assertEqual([path.name for path in result.original_files], ["小红书市场部.xlsx"])
+            self.assertEqual(
+                [path.name for path in result.original_files],
+                ["小红书市场部_clean.xlsx", "小红书市场部.xlsx"],
+            )
 
     def test_materialize_uploaded_files_replaces_same_channel_and_keeps_other_channels(self):
         with TemporaryDirectory() as tmp:
@@ -467,7 +468,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
         self.assertEqual(category_from_tags("给短线交易者的完美范例 #股友说"), "")
         self.assertEqual(category_from_tags("给短线交易者的完美范例 #同花顺股友说"), "股友说")
 
-    def test_archived_workflow_persists_batch_files_and_ai_fallback(self):
+    def test_archived_workflow_persists_batch_files_and_core_recap(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             raw_dir = tmp_path / "raw"
@@ -486,12 +487,18 @@ class ProductizedWorkflowTests(unittest.TestCase):
 
             self.assertTrue(result.batch_id)
             self.assertTrue(result.archive_dir.exists())
-            self.assertIn("未配置 DEEPSEEK_API_KEY", result.ai_summary)
+            self.assertEqual(result.ai_summary, "")
             self.assertIn("无历史对比数据", result.comparison_note)
             self.assertTrue((result.archive_dir / "cleaned.xlsx").exists())
             self.assertFalse((raw_dir / "cleaned.xlsx").exists())
-            output_dir = result.report_html.parent
-            self.assertTrue((output_dir / "report.html").exists())
+            output_dir = result.core_recap_xlsx.parent
+            self.assertTrue((output_dir / "content_recap_core.xlsx").exists())
+            workbook = load_workbook(result.core_recap_xlsx, read_only=True)
+            self.assertEqual(
+                workbook.sheetnames,
+                ["清洗后素材表", "内容复盘表", "不可分析汇总", "匹配覆盖率", "已匹配账号类型分析", "未匹配归因"],
+            )
+            workbook.close()
 
             record = read_batch_record(tmp_path / "workflow.sqlite3", result.batch_id)
             self.assertEqual(record["batch_id"], result.batch_id)
@@ -503,11 +510,19 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 file_count = conn.execute("select count(*) from uploaded_files").fetchone()[0]
                 item_count = conn.execute("select count(*) from canonical_items").fetchone()[0]
                 ai_count = conn.execute("select count(*) from ai_reports").fetchone()[0]
+                coverage_count = conn.execute("select count(*) from attribution_coverage_items").fetchone()[0]
+                matched_count = conn.execute("select count(*) from matched_attribution_items").fetchone()[0]
+                unmatched_count = conn.execute("select count(*) from unmatched_attribution_items").fetchone()[0]
 
             self.assertEqual(batch_count, 1)
             self.assertGreaterEqual(file_count, 4)
             self.assertEqual(item_count, len(result.canonical))
-            self.assertEqual(ai_count, 1)
+            self.assertEqual(ai_count, 0)
+            self.assertEqual(coverage_count, 4)
+            self.assertEqual(matched_count, len(result.matched_attribution))
+            self.assertEqual(unmatched_count, len(result.unmatched_attribution))
+            self.assertGreaterEqual(unmatched_count, 0)
+            self.assertIn("spend_share_of_total", result.attribution_coverage.columns)
 
     def test_archived_workflow_materializes_cleaned_workbook_before_analysis(self):
         with TemporaryDirectory() as tmp:
@@ -619,7 +634,122 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 ai_count = conn.execute("select count(*) from ai_reports").fetchone()[0]
             self.assertEqual(batch_count, 1)
             self.assertEqual(canonical_count, len(second.canonical))
-            self.assertEqual(ai_count, 1)
+            self.assertEqual(ai_count, 0)
+
+    def test_archived_workflow_persists_match_performance_and_feishu_snapshot_tables(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            _write_raw_fixture(raw_dir)
+            feishu_ledger = pd.DataFrame(
+                [
+                    {
+                        "platform": "小红书",
+                        "content_id": "note-1",
+                        "content_url": "https://www.xiaohongshu.com/explore/note-1",
+                        "title": "存储芯片板块再度爆发",
+                        "account": "同花顺投资",
+                        "tags": "财经",
+                        "raw_content_type": "图文",
+                        "category_l1": "投教",
+                        "category_l2": "方法论",
+                        "bilibili_content_type": "",
+                        "content_type": "方法论",
+                        "published_date": "2026-04-01",
+                        "source_file": "harvester_feishu",
+                        "source_sheet": "小红书",
+                        "source_row": 2,
+                    }
+                ],
+                columns=LEDGER_COLUMNS,
+            )
+            feishu_ledger.attrs["feishu_snapshot"] = {
+                "enabled": True,
+                "fetched_at": "2026-06-15T00:00:00+00:00",
+                "total_rows": 1,
+                "platform_counts": {"小红书": 1},
+                "sheet_row_counts": {"xhsSheet": 1},
+                "field_completeness": {"content_id": 1.0},
+                "warnings": [],
+            }
+            feishu_ledger.attrs["source_files"] = set()
+
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=feishu_ledger):
+                result = run_archived_workflow(
+                    raw_dir,
+                    "2026-04-01",
+                    "2026-04-30",
+                    output_root=tmp_path / "outputs",
+                    archive_root=tmp_path / "archive",
+                    db_path=db_path,
+                    env_path=tmp_path / "missing.env",
+                )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                canonical_count = conn.execute(
+                    "select count(*) from canonical_items where batch_id = ?",
+                    (result.batch_id,),
+                ).fetchone()[0]
+                performance_count = conn.execute(
+                    "select count(*) from content_performance_items where batch_id = ?",
+                    (result.batch_id,),
+                ).fetchone()[0]
+                match_count = conn.execute(
+                    "select count(*) from asset_match_results where batch_id = ?",
+                    (result.batch_id,),
+                ).fetchone()[0]
+                snapshot_count = conn.execute(
+                    "select count(*) from feishu_ledger_snapshots where batch_id = ? and total_rows = 1",
+                    (result.batch_id,),
+                ).fetchone()[0]
+
+            self.assertEqual(canonical_count, len(result.canonical))
+            self.assertGreater(performance_count, 0)
+            self.assertGreater(match_count, 0)
+            self.assertEqual(snapshot_count, 1)
+
+    def test_archived_workflow_enqueues_top_multimodal_jobs_only_for_upload_triggers(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            _write_raw_fixture(raw_dir)
+
+            upload_result = run_archived_workflow(
+                raw_dir,
+                "2026-04-01",
+                "2026-04-30",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=db_path,
+                env_path=tmp_path / "missing.env",
+                enqueue_background_analysis=True,
+                background_trigger="upload",
+                top_analysis_prompt_hint="重点看爆量共性",
+            )
+            first_jobs = list_analysis_jobs(db_path, batch_id=upload_result.batch_id)
+
+            self.assertGreater(len(first_jobs), 0)
+            self.assertEqual(set(first_jobs["trigger"]), {"upload"})
+            self.assertEqual(set(first_jobs["prompt_hint"]), {"重点看爆量共性"})
+
+            run_archived_workflow(
+                raw_dir,
+                "2026-04-01",
+                "2026-04-30",
+                output_root=tmp_path / "outputs",
+                archive_root=tmp_path / "archive",
+                db_path=db_path,
+                env_path=tmp_path / "missing.env",
+                enqueue_background_analysis=False,
+                background_trigger="page_refresh",
+            )
+            second_jobs = list_analysis_jobs(db_path, batch_id=upload_result.batch_id)
+
+            self.assertEqual(len(second_jobs), len(first_jobs))
 
     def test_archived_workflow_emits_progress_messages(self):
         with TemporaryDirectory() as tmp:
@@ -821,7 +951,7 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertEqual(list(output_root.iterdir()), [])
             self.assertEqual(list(processed_root.iterdir()), [])
 
-    def test_archived_workflow_persists_focused_topic_labels(self):
+    def test_archived_workflow_does_not_auto_generate_topic_or_ai_reports(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             db_path = tmp_path / "workflow.sqlite3"
@@ -839,161 +969,17 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 env_path=tmp_path / "missing.env",
             )
 
-            labels = load_topic_labels_for_batch(db_path, result.batch_id)
-
-            self.assertFalse(labels.empty)
-            self.assertIn("topic_name", labels.columns)
-            self.assertNotIn("达人数据", set(labels["channel"]))
-            self.assertTrue(labels["rank_position"].ge(1).all())
-
-    def test_category_mapping_overrides_are_reused_by_archived_workflow(self):
-        with TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            db_path = tmp_path / "workflow.sqlite3"
-            raw_dir = tmp_path / "raw"
-            raw_dir.mkdir()
-            pd.DataFrame(
-                [
-                    {
-                        "视频标题": "人工审核过的未知主题",
-                        "视频id": "dy-map",
-                        "素材ID": "mat-map",
-                        "账号": "同花顺投资",
-                        "消耗": 100.0,
-                        "展示数": 1000,
-                        "点击数": 100,
-                        "激活数": 10,
-                        "付费次数": 2,
-                        "内容类型": "",
-                    }
-                ]
-            ).to_csv(raw_dir / "抖音市场部.csv", index=False, encoding="utf-8-sig")
-
-            init_db(db_path)
-            upsert_category_mappings(
-                db_path,
-                pd.DataFrame(
-                    [
-                        {
-                            "platform": "抖音市场部",
-                            "platform_group": "抖音",
-                            "content_id": "dy-map",
-                            "material_id": "mat-map",
-                            "title": "人工审核过的未知主题",
-                            "category_l1": "",
-                            "category_l2": "人工复用类别",
-                            "category_l3": "人工复用主题",
-                        }
-                    ]
-                ),
-            )
-
-            mappings = load_category_mappings(db_path)
-            self.assertIn("content_id:dy-map", mappings)
-
-            result = run_archived_workflow(
-                raw_dir,
-                "2026-04-01",
-                "2026-04-27",
-                output_root=tmp_path / "outputs",
-                archive_root=tmp_path / "archive",
-                db_path=db_path,
-                env_path=tmp_path / "missing.env",
-            )
-
-            row = result.canonical.iloc[0]
-            self.assertEqual(row["category_l2"], "人工复用类别")
-            self.assertEqual(row["category_l3"], "人工复用主题")
-            self.assertEqual(row["category_source"], "历史审核映射")
-            self.assertEqual(row["review_status"], "已确认")
-
-    def test_archived_workflow_persists_and_reuses_douyin_id_bridge(self):
-        with TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            db_path = tmp_path / "workflow.sqlite3"
-            first_raw = tmp_path / "first_raw"
-            second_raw = tmp_path / "second_raw"
-            first_raw.mkdir()
-            second_raw.mkdir()
-            _write_xlsx(
-                first_raw / "原生内容投稿.xlsx",
-                {
-                    "抖音渠道": pd.DataFrame(
-                        [
-                            {
-                                "编号": 1,
-                                "投稿时间": "05 20",
-                                "内容链接": "1.28 tRk:/ 人和人的缘分就像炒股 # 同花顺股友说 https://v.douyin.com/abc/ 复制此链接，打开抖音搜索，直接观看视频！",
-                                "账号": "投资号",
-                                "内容类型": "股友说",
-                            }
-                        ]
-                    )
-                },
-            )
-            pd.DataFrame(
-                [
-                    {
-                        "视频标题": "人和人的缘分就像炒股 #投资",
-                        "视频id": "v02033g10000bridge",
-                        "素材ID": "mat-bridge",
-                        "账号": "同花顺投资",
-                        "消耗": 100.0,
-                        "展示数": 1000,
-                        "点击数": 100,
-                        "激活数": 10,
-                        "付费次数": 2,
-                    }
-                ]
-            ).to_csv(first_raw / "抖音商业化.csv", index=False, encoding="utf-8-sig")
-
-            first = run_archived_workflow(
-                first_raw,
-                "2026-05-15",
-                "2026-05-21",
-                output_root=tmp_path / "outputs",
-                archive_root=tmp_path / "archive",
-                db_path=db_path,
-                env_path=tmp_path / "missing.env",
-                category_matcher=lambda items, category_library, env_path: {},
-            )
-            bridge = load_douyin_id_bridge(db_path)
-            self.assertIn("v02033g10000bridge", set(bridge["id_value"]))
-            self.assertEqual(first.canonical.iloc[0]["ledger_match_source"], "账号+标题")
-
-            pd.DataFrame(
-                [
-                    {
-                        "视频标题": "第二次导出的投放标题已经完全改写",
-                        "视频id": "v02033g10000bridge",
-                        "素材ID": "mat-bridge",
-                        "账号": "同花顺投资",
-                        "消耗": 80.0,
-                        "展示数": 800,
-                        "点击数": 80,
-                        "激活数": 8,
-                        "付费次数": 1,
-                    }
-                ]
-            ).to_csv(second_raw / "抖音商业化.csv", index=False, encoding="utf-8-sig")
-
-            second = run_archived_workflow(
-                second_raw,
-                "2026-05-22",
-                "2026-05-28",
-                output_root=tmp_path / "outputs",
-                archive_root=tmp_path / "archive",
-                db_path=db_path,
-                env_path=tmp_path / "missing.env",
-                category_matcher=lambda items, category_library, env_path: {},
-            )
-
-            row = second.canonical.iloc[0]
-            self.assertEqual(row["account"], "同花顺投资")
-            self.assertEqual(row["manual_category"], "股友说")
-            self.assertEqual(row["content_url"], "https://v.douyin.com/abc/")
-            self.assertEqual(row["ledger_match_source"], "反馈ID桥表")
-            self.assertEqual(row["category_l2"], "股友说")
+            with closing(sqlite3.connect(db_path)) as conn:
+                topic_count = conn.execute(
+                    "select count(*) from topic_label_items where batch_id = ?",
+                    (result.batch_id,),
+                ).fetchone()[0]
+                ai_count = conn.execute(
+                    "select count(*) from ai_reports where batch_id = ?",
+                    (result.batch_id,),
+                ).fetchone()[0]
+            self.assertEqual(topic_count, 0)
+            self.assertEqual(ai_count, 0)
 
     def test_workflow_builds_account_audit_and_top_content_items(self):
         with TemporaryDirectory() as tmp:
@@ -1012,24 +998,16 @@ class ProductizedWorkflowTests(unittest.TestCase):
                 env_path=tmp_path / "missing.env",
             )
 
-            workbook = load_workbook(result.analysis_xlsx, read_only=True)
-            self.assertIn("人工审核表", workbook.sheetnames)
-            self.assertIn("账号映射表", workbook.sheetnames)
-            self.assertIn("账号过滤规则", workbook.sheetnames)
-            self.assertIn("账号过滤明细", workbook.sheetnames)
-            self.assertIn("分渠道总数据", workbook.sheetnames)
-            self.assertIn("分渠道栏目题材排名", workbook.sheetnames)
+            workbook = load_workbook(result.core_recap_xlsx, read_only=True)
+            self.assertEqual(
+                workbook.sheetnames,
+                ["清洗后素材表", "内容复盘表", "不可分析汇总", "匹配覆盖率", "已匹配账号类型分析", "未匹配归因"],
+            )
             workbook.close()
 
-            account_audit = result.account_audit.set_index(["channel", "expected_account"])
-            self.assertEqual(account_audit.loc[("小红书", "同花顺投资"), "status"], "缺失")
-            self.assertIn("同顺股民社区", set(result.account_audit["expected_account"]))
-            self.assertNotIn("研习社", set(result.account_audit["expected_account"]))
-            self.assertNotIn("同花顺新手福利官", set(result.account_audit["expected_account"]))
-
-            self.assertGreater(len(result.top_content_items), 0)
-            self.assertLessEqual(result.top_content_items.groupby("channel").size().max(), 15)
-            self.assertIn("performance_flag", result.top_content_items.columns)
+            self.assertEqual(len(result.cleaned_asset_table), len(result.canonical))
+            self.assertEqual(len(result.top_content_items), 6)
+            self.assertEqual(set(result.top_content_items["channel"]), {"B站市场部", "小红书商业化", "抖音商业化", "抖音市场部"})
 
 
 if __name__ == "__main__":

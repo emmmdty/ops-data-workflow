@@ -92,7 +92,6 @@ OVERVIEW_TABLE_COLUMNS = [
 ]
 
 COST_METRICS = {"activation_cost", "first_pay_cost"}
-AI_REVIEW_AUTO_PASS_THRESHOLD = 0.80
 BILIBILI_CHANNEL = "B站市场部"
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 BATCH_COLUMNS = [
@@ -152,51 +151,6 @@ DETAIL_COLUMNS = [
     "source_file_hash",
     "duplicate_group_id",
     "review_action",
-]
-
-TOP_CONTENT_REVIEW_COLUMNS = [
-    "batch_id",
-    "batch_period_start",
-    "batch_period_end",
-    "platform_group",
-    "platform",
-    "channel",
-    "rank_in_channel",
-    "ai_review_status",
-    "ai_review_reason",
-    "audit_flags",
-    "needs_review",
-    "missing_content_url",
-    "invalid_content_url",
-    "missing_manual_category",
-    "missing_content_category",
-    "low_category_confidence",
-    "type_conflict",
-    "title",
-    "content_id",
-    "material_id",
-    "account",
-    "content_url",
-    "manual_category",
-    "ai_category",
-    "content_category",
-    "category_l2",
-    "category_source",
-    "category_confidence",
-    "review_status",
-    "review_reasons",
-    "ledger_match_source",
-    "ledger_content_type",
-    "ledger_source_file",
-    "ledger_source_sheet",
-    "ledger_source_row",
-    "match_risk_level",
-    "match_risk_reason",
-    "spend",
-    "activations",
-    "activation_cost",
-    "source_file",
-    "source_sheet",
 ]
 
 NUMERIC_SOURCE_COLUMNS = [
@@ -370,16 +324,8 @@ def load_latest_data_quality(db_path: Path) -> pd.DataFrame:
     return _load_latest_auxiliary_table(db_path, "data_quality_items")
 
 
-def load_latest_review_queue(db_path: Path) -> pd.DataFrame:
-    return _load_latest_auxiliary_table(db_path, "review_queue_items")
-
-
 def load_data_quality_for_batch(db_path: Path, batch_id: str) -> pd.DataFrame:
     return _load_auxiliary_table_for_batch(db_path, "data_quality_items", batch_id)
-
-
-def load_review_queue_for_batch(db_path: Path, batch_id: str) -> pd.DataFrame:
-    return _load_auxiliary_table_for_batch(db_path, "review_queue_items", batch_id)
 
 
 def load_channel_comparison_for_batch(db_path: Path, batch_id: str) -> pd.DataFrame:
@@ -490,7 +436,7 @@ def _load_auxiliary_table_for_batch(db_path: Path, table_name: str, batch_id: st
     db_path = Path(db_path)
     if not db_path.exists():
         return pd.DataFrame()
-    allowed = {"data_quality_items", "review_queue_items"}
+    allowed = {"data_quality_items"}
     if table_name not in allowed:
         return pd.DataFrame()
     with closing(sqlite3.connect(db_path)) as conn:
@@ -589,7 +535,7 @@ def aggregate_dashboard(items: pd.DataFrame, dimensions: Sequence[str]) -> pd.Da
 
 def summarize_content_types(items: pd.DataFrame) -> pd.DataFrame:
     """Summarize all content types for the selected rows."""
-    normalized = _with_category_display(_normalize_items(items))
+    normalized = _with_category_display(_filter_analyzable_items(_normalize_items(items)))
     columns = [
         "content_category",
         "category_display",
@@ -633,7 +579,7 @@ def summarize_content_types(items: pd.DataFrame) -> pd.DataFrame:
 
 def summarize_unique_content(items: pd.DataFrame) -> pd.DataFrame:
     """Aggregate duplicate platform/video rows into a unique content reading view."""
-    normalized = _with_category_display(_normalize_items(items))
+    normalized = _with_category_display(_filter_analyzable_items(_normalize_items(items)))
     columns = [
         "platform",
         "content_id",
@@ -694,7 +640,7 @@ def summarize_content_type_trends(items: pd.DataFrame, period_start: str = "", p
         items,
         DashboardFilters(period_start=period_start or "", period_end=period_end or ""),
     )
-    normalized = _with_category_display(_normalize_items(filtered))
+    normalized = _with_category_display(_filter_analyzable_items(_normalize_items(filtered)))
     columns = [
         "batch_id",
         "batch_period_start",
@@ -854,7 +800,7 @@ def summarize_channel_categories(items: pd.DataFrame, channel: str) -> pd.DataFr
     if normalized.empty or not channel_name:
         return pd.DataFrame(columns=columns)
 
-    scoped = normalized[normalized["channel"].eq(channel_name)].copy()
+    scoped = _filter_analyzable_items(normalized[normalized["channel"].eq(channel_name)]).copy()
     if scoped.empty:
         return pd.DataFrame(columns=columns)
 
@@ -903,7 +849,7 @@ def summarize_channel_top_content_links(items: pd.DataFrame, channel: str) -> pd
     normalized = _normalize_items(items)
     if normalized.empty or "channel" not in normalized.columns:
         return pd.DataFrame(columns=columns)
-    scoped = normalized[normalized["channel"].eq(channel_name)].copy()
+    scoped = _filter_analyzable_items(normalized[normalized["channel"].eq(channel_name)]).copy()
     if scoped.empty:
         return pd.DataFrame(columns=columns)
     scoped["spend"] = pd.to_numeric(scoped["spend"], errors="coerce")
@@ -920,61 +866,6 @@ def summarize_channel_top_content_links(items: pd.DataFrame, channel: str) -> pd
     )
 
 
-def build_top_content_review_queue(
-    items: pd.DataFrame,
-    *,
-    include_auto_passed: bool = False,
-    confidence_threshold: float = AI_REVIEW_AUTO_PASS_THRESHOLD,
-) -> pd.DataFrame:
-    """Return per-period, per-channel Top rows that need human content review."""
-    if items.empty:
-        return pd.DataFrame(columns=TOP_CONTENT_REVIEW_COLUMNS)
-    normalized = _normalize_items(items)
-    for column in TOP_CONTENT_REVIEW_COLUMNS:
-        if column not in normalized.columns:
-            normalized[column] = ""
-    normalized["spend"] = pd.to_numeric(normalized["spend"], errors="coerce").fillna(0.0)
-    normalized["category_confidence"] = pd.to_numeric(normalized["category_confidence"], errors="coerce").fillna(0.0)
-    group_columns = ["batch_id", "batch_period_start", "batch_period_end", "platform_group", "channel"]
-    groups: list[pd.DataFrame] = []
-    for _, group in normalized.groupby(group_columns, dropna=False, sort=True):
-        channel = str(group["channel"].iloc[0] or "")
-        limit = _channel_top_content_limit(channel)
-        if limit <= 0:
-            continue
-        top = group.sort_values("spend", ascending=False, na_position="last").head(limit).copy()
-        top["rank_in_channel"] = range(1, len(top) + 1)
-        top["missing_content_url"] = top["content_url"].map(_is_blank_text)
-        top["invalid_content_url"] = ~top["missing_content_url"] & ~top["content_url"].map(_is_valid_content_url)
-        top["missing_manual_category"] = top["manual_category"].map(_is_blank_text)
-        top["missing_content_category"] = top["content_category"].map(_is_blank_text)
-        top["low_category_confidence"] = ~top["missing_content_category"] & top["category_confidence"].lt(confidence_threshold)
-        top["type_conflict"] = top["match_risk_level"].astype(str).str.strip().ne("") | top["match_risk_reason"].astype(str).str.strip().ne("")
-        top["needs_review"] = (
-            top["missing_content_url"]
-            | top["invalid_content_url"]
-            | top["missing_content_category"]
-            | top["low_category_confidence"]
-            | top["type_conflict"]
-        )
-        top["ai_review_status"] = top["needs_review"].map(lambda value: "需人工确认" if bool(value) else "自动通过")
-        top["audit_flags"] = top.apply(_content_review_flags, axis=1)
-        top["ai_review_reason"] = top.apply(_ai_review_reason, axis=1)
-        if not include_auto_passed:
-            top = top[top["needs_review"]].copy()
-        if top.empty:
-            continue
-        groups.append(top)
-    if not groups:
-        return pd.DataFrame(columns=TOP_CONTENT_REVIEW_COLUMNS)
-    result = pd.concat(groups, ignore_index=True)
-    result = result.sort_values(
-        ["batch_period_end", "batch_period_start", "platform_group", "channel", "rank_in_channel"],
-        ascending=[False, False, True, True, True],
-    )
-    return result[TOP_CONTENT_REVIEW_COLUMNS].reset_index(drop=True)
-
-
 def summarize_channel_top_topics(
     items: pd.DataFrame,
     channel: str,
@@ -989,7 +880,7 @@ def summarize_channel_top_topics(
     if normalized.empty or not channel_name or metric not in METRIC_COLUMNS:
         return pd.DataFrame(columns=columns)
 
-    scoped = normalized[normalized["channel"].eq(channel_name)].copy()
+    scoped = _filter_analyzable_items(normalized[normalized["channel"].eq(channel_name)]).copy()
     if scoped.empty:
         return pd.DataFrame(columns=columns)
 
@@ -1086,7 +977,7 @@ def summarize_topics_for_selection(
         return pd.DataFrame(columns=["category_name", "topic_name", *METRIC_COLUMNS])
 
     channel_name = _normalize_channel_value(channel)
-    scoped = normalized[normalized["channel"].eq(channel_name)].copy()
+    scoped = _filter_analyzable_items(normalized[normalized["channel"].eq(channel_name)]).copy()
     if category_l2:
         scoped = scoped[scoped["category_l2"].eq(str(category_l2).strip())].copy()
     if scoped.empty:
@@ -1114,7 +1005,7 @@ def detect_high_metric_anomalies(
     top_n: int = 15,
 ) -> dict[str, pd.DataFrame]:
     """Flag high-impact rows with missing labels or unusually high cost."""
-    normalized = _normalize_items(items)
+    normalized = _filter_analyzable_items(_normalize_items(items))
     empty = dashboard_detail_items(normalized.head(0))
     result = {
         "missing_title": empty.copy(),
@@ -1428,6 +1319,18 @@ def _normalize_items(items: pd.DataFrame) -> pd.DataFrame:
         "ledger_source_row",
         "match_risk_level",
         "match_risk_reason",
+        "analysis_status",
+        "is_analyzable",
+        "unanalyzable_reason",
+        "match_status",
+        "match_source",
+        "matched_ledger_title",
+        "matched_content_type",
+        "work_id",
+        "work_url",
+        "standard_title",
+        "original_title",
+        "ad_material_id",
     ]:
         if column not in normalized.columns:
             normalized[column] = ""
@@ -1444,6 +1347,35 @@ def _normalize_items(items: pd.DataFrame) -> pd.DataFrame:
     normalized["batch_period_end"] = normalized["batch_period_end"].fillna(normalized["period_end"]).astype(str)
     normalized = _add_rate_columns(normalized)
     return normalized
+
+
+def _filter_analyzable_items(items: pd.DataFrame) -> pd.DataFrame:
+    if items.empty:
+        return items.copy()
+    if "analysis_status" in items.columns:
+        status = items["analysis_status"].fillna("").astype(str).str.strip()
+        status_mask = status.eq("可分析")
+        status_blank = status.eq("")
+    else:
+        status_mask = pd.Series(False, index=items.index)
+        status_blank = pd.Series(True, index=items.index)
+    if "is_analyzable" in items.columns:
+        raw_analyzable = items["is_analyzable"].fillna("").astype(str).str.strip()
+        if bool(status_blank.all()) and bool(raw_analyzable.eq("").all()):
+            return items.copy()
+        truthy = _truthy_analyzable(items["is_analyzable"])
+        return items[status_mask | (status_blank & truthy)].copy()
+    if "analysis_status" in items.columns:
+        if bool(status_blank.all()):
+            return items.copy()
+        return items[status_mask].copy()
+    return items.copy()
+
+
+def _truthy_analyzable(values: pd.Series) -> pd.Series:
+    if values.dtype == bool:
+        return values.fillna(False)
+    return values.fillna("").astype(str).str.lower().isin({"true", "1", "yes", "y", "是", "可分析"})
 
 
 def _normalize_channel_comparison(comparison: pd.DataFrame) -> pd.DataFrame:
@@ -1723,41 +1655,6 @@ def _channel_top_content_limit(channel: str) -> int:
     if "B站" in name:
         return 5
     return 10
-
-
-def _is_blank_text(value: object) -> bool:
-    text = "" if value is None or pd.isna(value) else str(value).strip()
-    return text.lower() in {"", "nan", "none", "null", "<na>"}
-
-
-def _is_valid_content_url(value: object) -> bool:
-    text = "" if value is None or pd.isna(value) else str(value).strip().lower()
-    return text.startswith("http://") or text.startswith("https://")
-
-
-def _content_review_flags(row: pd.Series) -> str:
-    flags = []
-    if bool(row.get("missing_content_url", False)):
-        flags.append("缺链接")
-    if bool(row.get("invalid_content_url", False)):
-        flags.append("链接格式异常")
-    if bool(row.get("missing_content_category", False)):
-        flags.append("缺内容类型")
-    if bool(row.get("low_category_confidence", False)):
-        flags.append("低置信")
-    if bool(row.get("type_conflict", False)):
-        flags.append("类型/台账冲突")
-    return "；".join(flags) if flags else "AI自动通过"
-
-
-def _ai_review_reason(row: pd.Series) -> str:
-    flags = str(row.get("audit_flags", "") or "").strip()
-    if flags and flags != "AI自动通过":
-        return flags
-    confidence = pd.to_numeric(pd.Series([row.get("category_confidence", 0.0)]), errors="coerce").iloc[0]
-    if pd.isna(confidence):
-        confidence = 0.0
-    return f"置信度达标（{float(confidence):.2f}）且链接完整"
 
 
 def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:

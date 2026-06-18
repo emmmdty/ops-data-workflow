@@ -1,35 +1,25 @@
 # 原生内容投放清洗与复盘工作台
 
-这是一个局域网内使用的 Streamlit 工作台，用于把多个渠道导出的 Excel、CSV 或 ZIP 统一清洗、去重、补齐并入库，再用于图表分析和手动 AI 复盘。
+这是局域网内使用的 Streamlit 工作台，用于把各渠道投放数据统一清洗入库，再对抖音、小红书、B站的高价值内容做素材缓存和复盘。
 
-当前主流程固定为：
+当前产品入口只保留五个页面：
 
-1. 上传同一周期的一个或多个原始文件。
-2. 系统按周期和渠道保存原始文件；同周期同渠道再次上传时，可确认覆盖旧文件。
-3. 系统生成一个统一清洗 workbook：`processed/{period_key}/{batch_id}/cleaned_channels.xlsx`。
-4. 人工只审核最高优先级的少量重点内容：每个周期少于 50 条，完整冲突和补齐记录保留在清洗 workbook 的系统 sheet。
-5. 审核保存后，清洗 workbook、SQLite、图表和手动 AI 复盘输入同步刷新。
-6. 总览页手动触发 AI 复盘报告生成。
+- `总览`：查看本周期总数据、渠道总数据、清洗状态、复盘状态。
+- `上传清洗`：上传周/月/季度/年度数据，或根据本地月度数据生成季度/年度汇总。
+- `高价值内容复盘`：维护价值权重，筛选 Top 素材，复用 harvester 素材缓存并生成类型复盘。
+- `本地总表/素材缓存`：查看本地 `content_assets`、本周期明细、渠道总数据、素材 manifest 和复盘结果。
+- `历史趋势`：查看周、月、季度、年度核心指标趋势。
 
-页面模式下，`cleaned_channels.xlsx` 是主要业务交付物；`outputs/` 只保留给显式命令行导出，不作为网页默认产物。
+线上飞书只读。本项目会读取飞书台账并更新本地 SQLite，不会自动写回线上飞书。
 
 ## 启动
 
 同事日常使用推荐直接双击项目根目录的启动文件：
 
-- macOS Intel / Apple Silicon：`启动局域网.command`
+- macOS：`启动局域网.command`
 - Windows：`启动局域网.cmd`
 
-启动脚本会在前台自查环境，缺少 `uv`、Python 或项目依赖时会从大陆镜像自动下载。首次启动可能较慢，窗口里会持续显示中文进度，请不要直接关闭。
-
-默认从 `8501` 端口启动；如果 `8501` 已被占用，会自动尝试 `8502`、`8503` 等后续端口。请以启动窗口最后打印的地址为准，例如：
-
-```text
-本机访问：http://127.0.0.1:8502
-局域网访问：http://本机局域网IP:8502
-```
-
-服务在启动窗口前台运行。需要关闭时，回到启动窗口按 `Ctrl+C`，看到“服务已关闭，可以关闭窗口”后再关闭窗口。
+启动脚本会检查环境并启动 Streamlit。默认从 `8501` 端口启动；如果端口被占用，会自动尝试后续端口。以启动窗口最后打印的地址为准。
 
 命令行备用启动方式：
 
@@ -37,101 +27,87 @@
 uv run streamlit run app.py
 ```
 
-如果已创建 `.venv`：
+## 主流程
 
-```bash
-.venv/bin/streamlit run app.py
+1. 进入 `上传清洗`，上传同一周期的 Excel、CSV、ZIP 或文件夹。
+2. 选择周期维度：周、月、季度或年度。
+3. 系统标准化字段、识别单行渠道总数据、同渠道内去重聚合、读取飞书台账并回填缺失字段。
+4. 清洗完成后，本周期明细进入 `content_performance_items`，单行渠道总数据进入 `period_channel_totals`。
+5. 进入 `高价值内容复盘`，填写激活权重和付费权重；保存后会作为默认值复用，直到下次更新。
+6. 对抖音、小红书、B站高价值池复用 harvester 每日缓存，缺失素材再补采。
+7. 生成复盘后，素材结果写入 `multimodal_recap_items`，类型聚合写入 `type_recap_items`，新素材写入本地总表和 manifest，避免二次爬取。
+
+如果某渠道 Excel 只有一行数据，系统视为渠道总数据，只进入总览，不进入素材明细、去重、匹配或高价值复盘。
+
+## 数据口径
+
+清洗后素材明细保留核心字段：
+
+- 周期、渠道、平台 ID、账号、标题、tag 词。
+- 抖音/小红书一级类型、抖音/小红书二级类型、B站内容类型。
+- 链接、消耗、曝光、激活数、付费数、激活成本、付费成本。
+
+平台 ID 规则：
+
+- 抖音使用标准 URL 作品 ID；分享链接会尽量解析为标准 URL 和作品字段。
+- B站使用 BV 号。
+- 小红书使用笔记 ID。
+
+渠道内重复素材按稳定内容身份合并，指标值相加，成本重新计算。
+
+## 高价值复盘口径
+
+只分析抖音、小红书、B站：
+
+- 抖音：按渠道消耗 Top20、曝光 Top20。
+- 小红书/B站：按渠道消耗 Top10、曝光 Top10。
+- 任一平台单素材消耗 > 2000 或曝光 > 100000，也进入高价值池。
+
+价值公式：
+
+```text
+价值 = 激活数 * 激活权重 + 付费数 * 付费权重
 ```
 
-不要在同事正在使用时直接停止或替换现有服务；上线替换应另约窗口。
+抖音只有一级内容类型且一级类型为“长视频”或“说唱”时，二级类型沿用一级类型。
+
+第一版环比只基于本地上一周期数据；联网时间原因分析暂不实现。
 
 ## 目录口径
 
-- `data/months/`：月度原始源文件。
 - `data/weeks/`：周度原始源文件。
-- `data/reference/`：投稿台账、历史映射和人工参考表。
-- `config/channel_profiles.yml`：渠道配置，默认覆盖小红书商业化、小红书市场部、抖音市场部、抖音商业化、B站市场部、B站商业化、微信市场部、微信商业化。
+- `data/months/`：月度原始源文件。
+- `data/quarters/`：直接上传的季度原始源文件。
+- `data/years/`：直接上传的年度原始源文件。
+- `processed/`：清洗产物和核验 workbook。
+- `.runtime/workflow.sqlite3`：权威运行库。
+- `.runtime/top-assets/{platform}/{stable_asset_key}/`：本项目复用或补采的素材缓存，同一素材跨周期只存一份。
+- `config/channel_profiles.yml`：渠道识别配置；字段别名优先于通用字段映射。
 - `config/field_mapping.yml`：通用字段别名。
-- `processed/{period_key}/{batch_id}/`：清洗产物和诊断文件。
-- `.runtime/workflow.sqlite3`：页面批次、最终明细、图表和复盘输入。
-- `outputs/`：命令行显式导出目录，网页主流程不依赖它。
 
-`data/raw/`、旧 `archive/`、`output/playwright/` 不再作为网页运行入口。
+## harvester 与环境变量
 
-## 上传规范
+素材复制优先使用同级 `../harvester-THS` 的每日采集缓存；缺素材时才调用 harvester 的 TopN 补采。
 
-网页支持：
+如果本项目缺少飞书或 MiniMax 配置，会从 harvester 的 `.env` 补齐缺失项，不覆盖本项目已有值。
 
-- 单个或多个 `.xlsx`、`.xls`、`.csv` 文件。
-- ZIP 压缩包。
-- 文件夹上传。
-
-文件名应尽量包含渠道关键词，例如：
-
-- `小红书商业化.xlsx`
-- `小红书市场部-202605.xlsx`
-- `抖音商业化.csv`
-- `抖音市场部.xlsx`
-- `B站.xlsx`
-- `B站商业化.xlsx`
-- `微信市场部.xlsx`
-- `微信商业化.xlsx`
-
-系统会按 `config/channel_profiles.yml` 识别渠道。无法识别的文件会作为新渠道保留，平台写为“其他”，后续再通过配置归并。
-
-## 统一清洗 Workbook
-
-每次成功生成页面数据时，会在 `processed/{period_key}/{batch_id}/` 下写出：
-
-- `cleaned_channels.xlsx`：统一清洗 workbook，一个渠道一个 sheet。
-- `cleaned.xlsx`：内部标准明细和导入诊断，供系统回放与审核同步使用。
-- `period_manifest.json`：本次清洗清单。
-
-`cleaned_channels.xlsx` 固定包含系统 sheet：
-
-- `导入日志`
-- `重复内容`
-- `冲突项`
-- `补齐来源`
-- `审核记录`
-
-每个渠道 sheet 先展示统一字段，再展示原始剩余字段。未映射的原始字段按原表头保留，例如原表里叫“7日付费成本”，清洗结果里也叫“7日付费成本”；已映射到统一字段的原始列不重复输出。
-
-## 清洗和审核
-
-清洗规则：
-
-- 同渠道内优先按内容 ID 去重，其次按规范化链接，再按规范化标题。
-- 消耗、曝光、点击、激活、付费会累加。
-- 成本和率用合计值重新计算。
-- 投稿台账、历史映射和平台公开信息会尽量补齐标题、链接、内容 ID、内容类型等字段。
-- 平台公开信息补齐失败不会阻断清洗，会写入 `补齐来源` 和审核队列。
-
-内容审核页只展示重点内容，不再把普通低风险 AI 分类结果全量交给人工。
-
-## AI 复盘
-
-上传和清洗不会自动生成 AI 报告。进入“总览”页后，点击手动 AI 复盘按钮才会调用模型生成报告。
-
-可选环境变量：
+常用覆盖项：
 
 ```env
-DEEPSEEK_API_KEY=你的key
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
+HARVESTER_ROOT=/Users/tjk/Documents/Codex/harvester-THS
+MINIMAX_API_KEY=...
+MINIMAX_MODEL=...
 ```
-
-没有 key 时，数据清洗、图表和人工审核仍可正常使用。
 
 ## 常用命令
 
-运行测试：
+短测试示例：
 
 ```bash
-uv run python -m pytest -q
+uv run pytest tests/test_streamlit_compat.py tests/test_cleaning_pipeline.py tests/test_multimodal_recap.py tests/test_recap_settings.py -q
 ```
 
-命令行生成页面数据：
+命令行清洗示例：
 
 ```bash
 uv run python main.py \
@@ -143,17 +119,12 @@ uv run python main.py \
   --ui-only
 ```
 
-只看外部目录导入计划：
-
-```bash
-uv run python main.py --import-source ../data --dry-run --data-root data
-```
-
 ## 维护说明
 
 - 渠道新增或关键词调整：优先改 `config/channel_profiles.yml`。
 - 通用字段别名调整：改 `config/field_mapping.yml`。
-- 投稿台账或历史映射：放入 `data/reference/` 后重新生成对应周期。
-- 审核保存后会重新生成当前批次结果，并刷新图表和手动 AI 复盘输入。
+- 飞书台账更新后，在 `本地总表/素材缓存` 重新读取线上飞书并更新本地总表。
+- 清洗和复盘可以分开重跑：清洗成功不依赖多模态复盘，复盘失败不破坏已清洗数据。
+- 抖音历史台账维护命令：`uv run python scripts/douyin_history_ledger.py --help`。
 
 详细同事操作说明见 [docs/同事使用说明.md](docs/同事使用说明.md)。

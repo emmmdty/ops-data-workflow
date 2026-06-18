@@ -130,7 +130,6 @@ class RawSyncTests(unittest.TestCase):
                 env_path=tmp_path / "missing.env",
                 category_matcher=lambda items, category_library, env_path: {},
             )
-            (tmp_path / "processed" / "20260508-20260514" / first[0].batch_id / "channel_clean").mkdir(parents=True, exist_ok=True)
             second = sync_raw_periods(
                 data_root,
                 db_path=tmp_path / ".runtime" / "workflow.sqlite3",

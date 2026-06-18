@@ -88,7 +88,6 @@ class SourceStorageTests(unittest.TestCase):
             legacy_dir = data_root / "raw" / "20260501-20260525"
             _write_source_file(legacy_dir / "B站.xlsx")
             _write_source_file(legacy_dir / "cleaned.xlsx")
-            _write_source_file(legacy_dir / "channel_clean" / "B站_clean.xlsx")
             (legacy_dir / "period_manifest.json").write_text(
                 '{"period_start":"2026-05-01","period_end":"2026-05-31","period_level":"month","period_key":"2026-05","data_start":"2026-05-01","data_end":"2026-05-25"}',
                 encoding="utf-8",
@@ -100,7 +99,6 @@ class SourceStorageTests(unittest.TestCase):
             target = data_root / "months" / "202605"
             self.assertTrue((target / "B站.xlsx").exists())
             self.assertFalse((target / "cleaned.xlsx").exists())
-            self.assertFalse((target / "B站_clean.xlsx").exists())
 
 
 if __name__ == "__main__":

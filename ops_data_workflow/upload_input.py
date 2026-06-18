@@ -9,6 +9,7 @@ import re
 from tempfile import TemporaryDirectory
 from typing import Iterable, Protocol
 
+from .generated_artifacts import is_generated_tabular_artifact
 from .source_channels import infer_channel_from_path
 from .zip_input import extract_zip
 
@@ -80,9 +81,6 @@ def materialize_uploaded_files(
             if suffix not in SUPPORTED_UPLOAD_SUFFIXES:
                 supported = "、".join(sorted(SUPPORTED_UPLOAD_SUFFIXES))
                 raise ValueError(f"不支持的上传文件类型：{safe_name}。支持：{supported}")
-            if _is_generated_channel_clean_file(relative_path):
-                continue
-
             if suffix == ".zip":
                 staged_zip = staging_dir / relative_path.name
                 staged_zip.write_bytes(upload.getvalue())
@@ -149,7 +147,7 @@ def _incoming_channels(normalized_uploads: list[tuple[UploadedFileLike, Path]], 
     return {
         infer_channel_from_path(_strip_period_root(relative_path, period_root))
         for _, relative_path in normalized_uploads
-        if relative_path.suffix.lower() != ".zip" and not _is_generated_channel_clean_file(relative_path)
+        if relative_path.suffix.lower() != ".zip"
     }
 
 
@@ -164,7 +162,7 @@ def _channel_conflicts_for_channels(
     incoming_by_channel: dict[str, list[str]] = {channel: [] for channel in channels}
     if normalized_uploads is not None:
         for _, relative_path in normalized_uploads:
-            if relative_path.suffix.lower() == ".zip" or _is_generated_channel_clean_file(relative_path):
+            if relative_path.suffix.lower() == ".zip":
                 continue
             channel = infer_channel_from_path(_strip_period_root(relative_path, period_root))
             if channel in incoming_by_channel:
@@ -174,9 +172,7 @@ def _channel_conflicts_for_channels(
     for path in sorted(Path(target_dir).rglob("*")):
         if not path.is_file():
             continue
-        if path.name.startswith("~$") or path.name == "period_manifest.json" or path.name == "cleaned.xlsx":
-            continue
-        if _is_generated_channel_clean_file(path):
+        if path.name.startswith("~$") or is_generated_tabular_artifact(path, target_dir):
             continue
         if path.suffix.lower() not in SUPPORTED_UPLOAD_SUFFIXES - {".zip"}:
             continue
@@ -200,9 +196,7 @@ def _remove_channel_files(target_dir: Path, channels: set[str]) -> None:
     for path in sorted(Path(target_dir).rglob("*")):
         if not path.is_file():
             continue
-        if path.name.startswith("~$") or path.name == "period_manifest.json":
-            continue
-        if _is_generated_channel_clean_file(path):
+        if path.name.startswith("~$") or is_generated_tabular_artifact(path, target_dir):
             continue
         if path.suffix.lower() not in SUPPORTED_UPLOAD_SUFFIXES - {".zip"}:
             continue
@@ -214,9 +208,6 @@ def _invalidate_generated_period_artifacts(target_dir: Path) -> None:
     for name in ["cleaned.xlsx", "period_manifest.json"]:
         path = Path(target_dir) / name
         if path.exists():
-            path.unlink()
-    for path in sorted(Path(target_dir).rglob("*")):
-        if path.is_file() and _is_generated_channel_clean_file(path):
             path.unlink()
 
 
@@ -242,7 +233,3 @@ def _parse_folder_date(value: str) -> date | None:
         return date(int(value[0:4]), int(value[4:6]), int(value[6:8]))
     except ValueError:
         return None
-
-
-def _is_generated_channel_clean_file(path: Path) -> bool:
-    return Path(path).stem.lower().endswith("_clean")

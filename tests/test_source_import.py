@@ -34,7 +34,7 @@ class SourceImportTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "无法读取外部数据目录"):
                     build_source_import_plan(source_root, Path(tmp) / "project" / "data", default_year=2026)
 
-    def test_build_source_import_plan_maps_weeks_to_date_dirs_and_records_sheets(self):
+    def test_build_source_import_plan_maps_weeks_to_date_dirs_and_ignores_local_reference(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             source_root = tmp_path / "external"
@@ -46,16 +46,16 @@ class SourceImportTests(unittest.TestCase):
             plan = build_source_import_plan(source_root, data_root, default_year=2026)
 
             raw_entries = [entry for entry in plan.entries if entry.kind == "raw"]
-            reference_entries = [entry for entry in plan.entries if entry.kind == "reference"]
+            ignored_entries = [entry for entry in plan.entries if entry.kind == "ignored"]
             self.assertEqual(len(raw_entries), 1)
             self.assertEqual(raw_entries[0].relative_path, "0508-0514数据/小红书市场部.xlsx")
             self.assertEqual(raw_entries[0].period_key, "20260508-20260514")
             self.assertEqual(raw_entries[0].target_path, data_root / "weeks" / "20260508-20260514" / "小红书市场部.xlsx")
             self.assertEqual(raw_entries[0].sheet_names, ["新户", "老户"])
             self.assertEqual(raw_entries[0].channel, "小红书市场部")
-            self.assertEqual(len(reference_entries), 1)
-            self.assertEqual(reference_entries[0].target_path, data_root / "reference" / "原生内容投稿-20260527.xlsx")
-            self.assertEqual(reference_entries[0].sheet_names, ["小红书渠道", "B站渠道"])
+            self.assertEqual(len(ignored_entries), 1)
+            self.assertEqual(ignored_entries[0].relative_path, "原生内容投稿-20260527.xlsx")
+            self.assertEqual(ignored_entries[0].message, "内容台账以飞书实时读取为准，本地 reference 不再导入。")
 
     def test_build_source_import_plan_maps_month_directory_when_file_name_has_no_date(self):
         with TemporaryDirectory() as tmp:
@@ -95,9 +95,9 @@ class SourceImportTests(unittest.TestCase):
             plan = build_source_import_plan(source_root, data_root, default_year=2026)
             result = execute_source_import_plan(plan, project_root=project_root, replace_all=True)
 
-            self.assertEqual(result.copied_count, 2)
+            self.assertEqual(result.copied_count, 1)
             self.assertTrue((data_root / "weeks" / "20260508-20260514" / "B站.xlsx").exists())
-            self.assertTrue((data_root / "reference" / "原生内容投稿-20260527.xlsx").exists())
+            self.assertFalse((data_root / "reference").exists())
             self.assertFalse((data_root / "weeks" / "202605w2").exists())
             self.assertFalse((data_root / "raw").exists())
             self.assertFalse((project_root / "processed" / "stale").exists())

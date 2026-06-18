@@ -77,7 +77,7 @@ class HistoricalContentTests(unittest.TestCase):
             self.assertIn("content_id:note-conflict", conflict_keys)
             self.assertIn(f"title_key:{normalized_title_key('冲突标题')}", conflict_keys)
 
-    def test_workflow_reuses_title_key_mapping_and_overrides_ai_category(self):
+    def test_workflow_does_not_apply_title_mapping_before_feishu_match(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             db_path = tmp_path / "workflow.sqlite3"
@@ -127,10 +127,11 @@ class HistoricalContentTests(unittest.TestCase):
             )
 
             row = result.canonical.iloc[0]
-            self.assertEqual(row["category_l2"], "股友说")
-            self.assertEqual(row["category_l3"], "你会是那百分之几的股民？")
-            self.assertEqual(row["category_source"], "历史审核映射")
-            self.assertEqual(row["review_status"], "已确认")
+            self.assertEqual(row["analysis_status"], "不可分析")
+            self.assertEqual(row["unanalyzable_reason"], "未匹配飞书自有内容")
+            self.assertEqual(row["category_l2"], "")
+            self.assertEqual(row["category_l3"], "")
+            self.assertEqual(row["review_status"], "不可分析")
 
     @staticmethod
     def _write_history_workbook(path: Path) -> None:

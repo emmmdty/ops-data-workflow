@@ -8,7 +8,7 @@ from ops_data_workflow.reference_tables import parse_period_from_raw_dir
 from ops_data_workflow.raw_sync import sync_raw_periods
 from ops_data_workflow.source_import import build_source_import_plan, execute_source_import_plan
 from ops_data_workflow.source_storage import migrate_legacy_raw_to_source_layout, source_period_from_path
-from ops_data_workflow.workflow import run_archived_workflow, run_workflow
+from ops_data_workflow.workflow import run_archived_workflow
 
 
 def main() -> None:
@@ -21,11 +21,6 @@ def main() -> None:
     parser.add_argument("--data-root", default="data", help="Raw source data root.")
     parser.add_argument("--db", default=".runtime/workflow.sqlite3", help="SQLite database path.")
     parser.add_argument("--env", default=".env", help="Path to .env containing DEEPSEEK_API_KEY.")
-    parser.add_argument(
-        "--legacy-output-only",
-        action="store_true",
-        help="Generate files without writing the SQLite archive.",
-    )
     parser.add_argument(
         "--category-rules",
         default="config/category_rules.yml",
@@ -41,7 +36,7 @@ def main() -> None:
         action="store_true",
         help="One-time copy of legacy data/raw source files into data/months or data/weeks.",
     )
-    parser.add_argument("--import-source", help="Import an external data directory into data/months, data/weeks, and data/reference.")
+    parser.add_argument("--import-source", help="Import an external data directory into data/months and data/weeks.")
     parser.add_argument("--default-year", type=int, default=2026, help="Default year for date ranges without a year.")
     parser.add_argument("--replace-all", action="store_true", help="Clear current source/runtime data before --import-source.")
     parser.add_argument("--dry-run", action="store_true", help="Only print the --import-source plan without copying or generating.")
@@ -79,7 +74,6 @@ def main() -> None:
             processed_root=Path(args.processed_root),
             category_rules_path=Path(args.category_rules),
             env_path=Path(args.env),
-            reference_root=Path(args.data_root) / "reference",
             output_mode="ui_only" if args.ui_only else "full",
             enable_deepseek=not args.ui_only,
             enable_external_context=not args.ui_only,
@@ -104,39 +98,23 @@ def main() -> None:
             except ValueError:
                 parser.error(f"{exc}；或显式传入 --period-start 和 --period-end")
 
-    if args.legacy_output_only:
-        result = run_workflow(
-            Path(args.input),
-            period_start,
-            period_end,
-            Path(args.output),
-            Path(args.category_rules),
-        )
-    else:
-        result = run_archived_workflow(
-            Path(args.input),
-            period_start,
-            period_end,
-            output_root=Path(args.output),
-            processed_root=Path(args.processed_root),
-            db_path=Path(args.db),
-            category_rules_path=Path(args.category_rules),
-            env_path=Path(args.env),
-            reference_root=Path(args.data_root) / "reference",
-            output_mode="ui_only" if args.ui_only else "full",
-            enable_deepseek=not args.ui_only,
-            enable_external_context=not args.ui_only,
-        )
-        print(f"Period stored as {result.batch_id}")
-        print(f"Processed artifacts written to {result.archive_dir}")
-    if result.report_html is not None:
-        print(f"Report written to {result.report_html}")
-    if result.analysis_xlsx is not None:
-        print(f"Workbook written to {result.analysis_xlsx}")
-    if result.canonical_csv is not None:
-        print(f"Canonical CSV written to {result.canonical_csv}")
-    if result.total_summary_xlsx is not None:
-        print(f"Total summary written to {result.total_summary_xlsx}")
+    result = run_archived_workflow(
+        Path(args.input),
+        period_start,
+        period_end,
+        output_root=Path(args.output),
+        processed_root=Path(args.processed_root),
+        db_path=Path(args.db),
+        category_rules_path=Path(args.category_rules),
+        env_path=Path(args.env),
+        output_mode="ui_only" if args.ui_only else "full",
+        enable_deepseek=not args.ui_only,
+        enable_external_context=not args.ui_only,
+    )
+    print(f"Period stored as {result.batch_id}")
+    print(f"Processed artifacts written to {result.archive_dir}")
+    if result.core_recap_xlsx is not None:
+        print(f"Core recap workbook written to {result.core_recap_xlsx}")
 
 
 if __name__ == "__main__":

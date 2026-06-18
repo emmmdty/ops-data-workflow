@@ -2,6 +2,7 @@ from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 import pandas as pd
@@ -11,6 +12,7 @@ from ops_data_workflow.raw_cleaning import (
     _additive_metric_columns,
     clean_source_directory,
     clean_raw_period_dir,
+    load_cleaning_ledger,
     load_cleaned_canonical,
     reset_runtime_data,
 )
@@ -70,6 +72,52 @@ class RawCleaningTests(unittest.TestCase):
         )
 
         self.assertEqual(_additive_metric_columns(frame), ["求和项:总花费"])
+
+    def test_load_cleaning_ledger_preserves_feishu_snapshot_attrs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            feishu = pd.DataFrame(
+                [
+                    {
+                        "platform": "小红书",
+                        "content_id": "note-1",
+                        "content_url": "https://www.xiaohongshu.com/explore/note-1",
+                        "title": "飞书标题",
+                        "account": "示例账号",
+                        "tags": "",
+                        "raw_content_type": "图文",
+                        "category_l1": "投教",
+                        "category_l2": "方法论",
+                        "bilibili_content_type": "",
+                        "content_type": "方法论",
+                        "published_date": "2026-05-01",
+                        "source_file": "harvester_feishu",
+                        "source_sheet": "小红书",
+                        "source_row": 2,
+                    }
+                ]
+            )
+            snapshot = {
+                "enabled": True,
+                "total_rows": 1,
+                "platform_counts": {"小红书": 1},
+                "sheet_row_counts": {"xhsSheet": 1},
+                "field_completeness": {"content_id": 1.0},
+                "warnings": [],
+            }
+            feishu.attrs["feishu_snapshot"] = snapshot
+            feishu.attrs["source_files"] = {str(root / "feishu.xlsx")}
+
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger", return_value=feishu):
+                ledger = load_cleaning_ledger(
+                    root,
+                    default_year=2026,
+                    reference_root=None,
+                    env_path=root / "missing.env",
+                )
+
+            self.assertEqual(ledger.attrs["feishu_snapshot"], snapshot)
+            self.assertIn(str(root / "feishu.xlsx"), ledger.attrs["source_files"])
 
     def test_clean_source_directory_prefers_matching_sheet_and_records_ignored_wide_sheet(self):
         with TemporaryDirectory() as tmp:
@@ -235,6 +283,177 @@ class RawCleaningTests(unittest.TestCase):
             manifest = pd.read_json(bucket.manifest_path, typ="series").to_dict()
             self.assertEqual(manifest["metadata_enrichment"]["mode"], "safe_public")
             self.assertEqual(manifest["metadata_enrichment"]["filled_rows"], 1)
+
+    def test_clean_raw_period_dir_resolves_douyin_copied_shortlink_with_harvester_detail(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_dir = root / "raw"
+            _write_xlsx(
+                raw_dir / "抖音商业化.xlsx",
+                {
+                    "Sheet1": pd.DataFrame(
+                        [
+                            {
+                                "视频标题": "7.64 JiP:/ 但斌财富曲线 # 同顺图解 https://v.douyin.com/H7uau846bVI/ 复制此链接，打开Dou音搜索，直接观看视频！",
+                                "视频链接": "https://v.douyin.com/H7uau846bVI/",
+                                "素材ID": "mat-dy",
+                                "消耗": 3000.0,
+                                "展示数": 100000,
+                                "激活数": 10,
+                                "付费次数": 2,
+                            }
+                        ]
+                    )
+                },
+            )
+            period = review_period_from_dates(
+                pd.Timestamp("2026-05-08").date(),
+                pd.Timestamp("2026-05-14").date(),
+                PERIOD_LEVEL_WEEK,
+            )
+
+            with patch("ops_data_workflow.raw_cleaning.fetch_douyin_detail_from_harvester") as fake_detail:
+                fake_detail.return_value = {
+                    "id": "7637459543953345835",
+                    "link": "https://www.douyin.com/video/7637459543953345835",
+                    "title": "但斌财富曲线真实标题",
+                    "tags": "#同顺图解 #同花顺APP",
+                    "published_at": "2026-06-01",
+                    "account": "同花顺投资",
+                }
+                bucket = clean_raw_period_dir(
+                    raw_dir,
+                    period,
+                    default_year=2026,
+                    output_dir=root / "processed",
+                    metadata_enrichment_mode="safe_public",
+                    metadata_cache_dir=root / "metadata-cache",
+                )
+
+            cleaned = load_cleaned_canonical(bucket.cleaned_workbook)
+            row = cleaned.iloc[0]
+            self.assertEqual(row["content_id"], "7637459543953345835")
+            self.assertEqual(row["content_url"], "https://www.douyin.com/video/7637459543953345835")
+            self.assertEqual(row["title"], "但斌财富曲线真实标题")
+            self.assertEqual(row["metadata_tags"], "#同顺图解 #同花顺APP")
+            self.assertEqual(row["source_time"], "2026-06-01")
+            self.assertEqual(row["account"], "同花顺投资")
+
+    def test_clean_raw_period_dir_writes_xhs_enrichment_report_and_pending_queue(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_dir = root / "raw"
+            _write_xlsx(
+                raw_dir / "小红书商业化.xlsx",
+                {
+                    "Sheet1": pd.DataFrame(
+                        [
+                            {
+                                "时间": "2026-05-08",
+                                "笔记ID": "65f00000abcdef",
+                                "标题": "",
+                                "发布作者": "",
+                                "消费": 3000.0,
+                                "展现量": 100,
+                                "点击量": 10,
+                                "激活数": 2,
+                                "首次付费次数": 1,
+                            }
+                        ]
+                    )
+                },
+            )
+            period = review_period_from_dates(
+                pd.Timestamp("2026-05-08").date(),
+                pd.Timestamp("2026-05-14").date(),
+                PERIOD_LEVEL_WEEK,
+            )
+
+            bucket = clean_raw_period_dir(
+                raw_dir,
+                period,
+                default_year=2026,
+                output_dir=root / "processed",
+                metadata_enrichment_mode="safe_public",
+                metadata_cache_dir=root / "metadata-cache",
+                enrichment_queue_root=root / "data" / "enrichment_queue",
+            )
+
+            cleaned = load_cleaned_canonical(bucket.cleaned_workbook)
+            row = cleaned.iloc[0]
+            self.assertEqual(row["content_id"], "65f00000abcdef")
+            self.assertTrue(pd.isna(row["content_url"]) or row["content_url"] == "")
+            self.assertEqual(row["link_openability"], "placeholder_only")
+            self.assertEqual(row["link_source"], "derived_placeholder")
+
+            report = pd.read_excel(bucket.cleaned_workbook.parent / "xhs_enrichment_report.xlsx")
+            self.assertEqual(report.iloc[0]["笔记ID"], "65f00000abcdef")
+            self.assertEqual(report.iloc[0]["链接状态"], "placeholder_only")
+            self.assertIn("标题缺失", report.iloc[0]["待处理原因"])
+            self.assertIn("可打开链接缺失", report.iloc[0]["待处理原因"])
+
+            pending_files = sorted((root / "data" / "enrichment_queue" / "xhs").glob("pending_*.xlsx"))
+            self.assertEqual(len(pending_files), 1)
+            pending = pd.read_excel(pending_files[0])
+            self.assertEqual(pending.iloc[0]["笔记ID"], "65f00000abcdef")
+            self.assertEqual(pending.iloc[0]["消耗"], 3000.0)
+
+    def test_clean_raw_period_dir_uses_configured_xhs_downloader_sidecar(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_dir = root / "raw"
+            env_path = root / ".env"
+            env_path.write_text("XHS_DOWNLOADER_BASE_URL=http://127.0.0.1:18080\n", encoding="utf-8")
+            _write_xlsx(
+                raw_dir / "小红书商业化.xlsx",
+                {
+                    "Sheet1": pd.DataFrame(
+                        [
+                            {
+                                "时间": "2026-05-08",
+                                "笔记ID": "65f00000abcdef",
+                                "标题": "",
+                                "消费": 3000.0,
+                                "展现量": 100,
+                                "激活数": 2,
+                                "首次付费次数": 1,
+                            }
+                        ]
+                    )
+                },
+            )
+            period = review_period_from_dates(
+                pd.Timestamp("2026-05-08").date(),
+                pd.Timestamp("2026-05-14").date(),
+                PERIOD_LEVEL_WEEK,
+            )
+
+            def fake_detail(note_id, link, *, base_url):
+                return {
+                    "id": note_id,
+                    "link": "https://www.xiaohongshu.com/explore/65f00000abcdef?xsec_token=token",
+                    "title": "sidecar补齐标题",
+                    "tags": "#财经 #投教",
+                    "account": "问财",
+                }
+
+            with patch("ops_data_workflow.raw_cleaning.fetch_xhs_downloader_detail", fake_detail):
+                bucket = clean_raw_period_dir(
+                    raw_dir,
+                    period,
+                    default_year=2026,
+                    output_dir=root / "processed",
+                    metadata_enrichment_mode="safe_public",
+                    metadata_cache_dir=root / "metadata-cache",
+                    env_path=env_path,
+                )
+
+            cleaned = load_cleaned_canonical(bucket.cleaned_workbook)
+            row = cleaned.iloc[0]
+            self.assertEqual(row["title"], "sidecar补齐标题")
+            self.assertEqual(row["content_url"], "https://www.xiaohongshu.com/explore/65f00000abcdef?xsec_token=token")
+            self.assertEqual(row["metadata_source"], "xhs_downloader")
+            self.assertEqual(row["link_source"], "xhs_downloader")
 
     def test_clean_source_directory_dedupes_bilibili_duplicate_summary_sheets_by_unit_name(self):
         with TemporaryDirectory() as tmp:
@@ -512,7 +731,7 @@ class RawCleaningTests(unittest.TestCase):
             self.assertEqual(float(bilibili["activations"]), 5.0)
             self.assertEqual(float(bilibili["first_pay_count"]), 3.0)
 
-    def test_clean_source_directory_applies_ledger_and_writes_channel_clean_workbook(self):
+    def test_clean_source_directory_skips_ledger_and_writes_only_cleaned_workbook(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source"
@@ -555,47 +774,11 @@ class RawCleaningTests(unittest.TestCase):
             bucket = buckets[0]
             cleaned = load_cleaned_canonical(bucket.cleaned_workbook)
             row = cleaned.iloc[0]
-            self.assertEqual(row["account"], "投资号")
-            self.assertEqual(row["manual_category"], "股友说")
-            self.assertEqual(row["content_url"], "https://v.douyin.com/abc/")
-            self.assertEqual(row["ledger_match_source"], "唯一标题")
-            self.assertEqual(row["manual_category_source"], "投稿台账补全")
-
-            channel_clean = bucket.raw_dir / "channel_clean" / "抖音商业化_clean.xlsx"
-            self.assertTrue(channel_clean.exists())
-            display = pd.read_excel(channel_clean, sheet_name="清理后明细")
-            self.assertEqual(
-                list(display.columns),
-                [
-                    "周期",
-                    "渠道",
-                    "账号",
-                    "内容形式",
-                    "内容类型",
-                    "内容分类",
-                    "标题",
-                    "id/BV或者唯一标识",
-                    "内容链接",
-                    "消耗",
-                    "曝光量",
-                    "激活数",
-                    "激活成本",
-                    "付费",
-                    "付费成本",
-                    "匹配来源",
-                    "复核原因",
-                ],
-            )
-            display_row = display.iloc[0]
-            self.assertEqual(display_row["渠道"], "抖音商业化")
-            self.assertEqual(display_row["账号"], "投资号")
-            self.assertEqual(display_row["内容形式"], "视频")
-            self.assertEqual(display_row["内容类型"], "股友说")
-            self.assertEqual(display_row["内容分类"], "股友说")
-            self.assertEqual(display_row["id/BV或者唯一标识"], "人和人的缘分就像炒股")
-            self.assertEqual(display_row["内容链接"], "https://v.douyin.com/abc/")
-            self.assertEqual(display_row["匹配来源"], "唯一标题")
-            self.assertTrue(pd.isna(display_row["复核原因"]) or display_row["复核原因"] == "")
+            self.assertEqual(row["channel"], "抖音商业化")
+            self.assertEqual(row["title"], "人和人的缘分就像炒股 #投资")
+            self.assertEqual(float(row["spend"]), 90.0)
+            self.assertTrue(bucket.cleaned_workbook.exists())
+            self.assertEqual(bucket.source_paths, ["0508-0514 数据/抖音商业化.xlsx"])
 
     def test_clean_source_directory_generates_row_ids_for_identityless_social_details_and_excludes_total(self):
         with TemporaryDirectory() as tmp:
@@ -919,11 +1102,20 @@ class RawCleaningTests(unittest.TestCase):
             self.assertAlmostEqual(row["clicks"], 321.0)
             self.assertAlmostEqual(row["activations"], 11.0)
             self.assertAlmostEqual(row["first_pay_count"], 4.0)
+            self.assertEqual(row["analysis_status"], "不可分析")
             channel_summary = result.channel_summary.set_index("channel")
+            self.assertIn("B站市场部", channel_summary.index)
             self.assertAlmostEqual(channel_summary.loc["B站市场部", "spend"], 100.0)
             self.assertAlmostEqual(channel_summary.loc["B站市场部", "impressions"], 4321.0)
+            self.assertAlmostEqual(channel_summary.loc["B站市场部", "clicks"], 321.0)
             self.assertAlmostEqual(channel_summary.loc["B站市场部", "activations"], 11.0)
             self.assertAlmostEqual(channel_summary.loc["B站市场部", "first_pay_count"], 4.0)
+            asset_row = result.cleaned_asset_table.iloc[0]
+            self.assertAlmostEqual(asset_row["消耗"], 100.0)
+            self.assertAlmostEqual(asset_row["曝光"], 4321.0)
+            summary = result.unanalyzable_summary.set_index("渠道")
+            self.assertAlmostEqual(summary.loc["B站市场部", "不可分析消耗"], 100.0)
+            self.assertEqual(summary.loc["B站市场部", "不可分析素材数"], 1)
 
     def test_reset_runtime_data_clears_generated_runtime_dirs_and_reinitializes_db(self):
         with TemporaryDirectory() as tmp:
@@ -944,7 +1136,6 @@ class RawCleaningTests(unittest.TestCase):
             reset_runtime_data(root)
 
             self.assertTrue((root / ".runtime" / "workflow.sqlite3").exists())
-            self.assertTrue((root / "data" / "reference").exists())
             self.assertTrue((root / "data" / "months").exists())
             self.assertTrue((root / "data" / "weeks").exists())
             self.assertTrue((root / "data" / "raw" / "20260508-20260514" / "old.xlsx").exists())
