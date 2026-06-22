@@ -476,7 +476,7 @@ class ContentMetadataEnrichmentTests(unittest.TestCase):
         self.assertEqual(stats["hint_rows"], 1)
         self.assertEqual(stats["review_rows"], 0)
 
-    def test_safe_public_derives_douyin_url_from_scientific_material_id_without_id_conflict(self):
+    def test_safe_public_does_not_derive_douyin_url_from_material_id(self):
         frame = pd.DataFrame(
             [
                 {
@@ -499,11 +499,11 @@ class ContentMetadataEnrichmentTests(unittest.TestCase):
 
         row = enriched.iloc[0]
         self.assertEqual(row["content_id"], "v02033g10000d5i7evfog65sp8itt3k0")
-        self.assertEqual(row["content_url"], "https://www.douyin.com/video/7593368545867317248")
-        self.assertRegex(str(row["source_time"]), r"^20\d{2}-\d{2}-\d{2}$")
+        self.assertEqual(row["content_url"], "")
+        self.assertEqual(row["source_time"], "")
         self.assertFalse(row["needs_manual_review"])
         self.assertEqual(row["review_reasons"], "")
-        self.assertEqual(stats["filled_rows"], 1)
+        self.assertEqual(stats["filled_rows"], 0)
         self.assertEqual(stats["review_rows"], 0)
 
     def test_safe_public_records_douyin_shortlink_failure_without_blocking(self):

@@ -720,8 +720,8 @@ xiaohongshu:
                 {"note-included-1", "note-included-2", "note-excluded-etf", "note-included-blank", ""},
             )
             douyin = result.canonical[result.canonical["channel"].eq("抖音商业化")].iloc[0]
-            self.assertEqual(douyin["material_id"], "dy-kept")
-            self.assertEqual(douyin["ad_material_id"], "dy-kept")
+            self.assertEqual(douyin["material_id"], "")
+            self.assertEqual(douyin["ad_material_id"], "")
             self.assertEqual(
                 set(result.canonical[result.canonical["channel"].eq("小红书商业化")]["account"].fillna("")),
                 {"", "同顺股民社区", "同花顺ETF", "同花顺研习社"},
@@ -1566,6 +1566,8 @@ xiaohongshu:
                     "标准标题",
                     "作品链接",
                     "作品ID/BV号",
+                    "巨量链接",
+                    "巨量封面链接",
                     "巨量素材ID",
                     "消耗",
                     "曝光",
@@ -1792,8 +1794,8 @@ xiaohongshu:
 
             self.assertTrue(result.core_recap_xlsx.exists())
             self.assertEqual(list(result.canonical["content_id"]), [""])
-            self.assertEqual(list(result.canonical["material_id"]), ["dy-organic"])
-            self.assertEqual(list(result.canonical["ad_material_id"]), ["dy-organic"])
+            self.assertEqual(list(result.canonical["material_id"]), [""])
+            self.assertEqual(list(result.canonical["ad_material_id"]), [""])
 
     def test_core_tables_use_readable_chinese_column_names(self):
         with TemporaryDirectory() as tmp:

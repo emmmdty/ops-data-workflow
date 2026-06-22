@@ -13,7 +13,7 @@ from uuid import uuid4
 import pandas as pd
 
 from .comparison import build_channel_comparison
-from .analysis_jobs import enqueue_top_multimodal_jobs
+from .analysis_jobs import ANALYSIS_PURPOSE_STRATEGY_RECAP, enqueue_top_multimodal_jobs
 from .attribution import build_attribution_tables
 from .exports import write_core_recap_workbook
 from .generated_artifacts import is_generated_tabular_artifact
@@ -317,6 +317,7 @@ def run_archived_workflow(
             build_executable_top_content_pool(analysis.canonical),
             trigger=background_trigger or source_type or "manual",
             prompt_hint=top_analysis_prompt_hint,
+            analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
         )
     progress("页面数据生成完成")
     return WorkflowResult(

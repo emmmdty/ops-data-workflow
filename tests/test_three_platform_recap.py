@@ -121,7 +121,30 @@ class ThreePlatformRecapTests(unittest.TestCase):
         self.assertEqual(dy_ad_id_only["ad_material_id"], "7391234567890123456")
         self.assertIn("非真实作品标题", dy_ad_id_only["normalization_reason"])
         self.assertEqual(dy_url["work_id"], "7291234567890123456")
+        self.assertEqual(dy_url["ad_material_id"], "mat-1")
         self.assertEqual(dy_url["standard_title"], "抖音真实标题")
+
+    def test_platform_normalizer_does_not_copy_douyin_work_id_to_material_id(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音市场部",
+                    "content_id": "7632278691925609769",
+                    "material_id": "",
+                    "title": "存多少钱才可以提前退休",
+                    "content_url": "https://www.douyin.com/video/7632278691925609769",
+                }
+            ]
+        )
+
+        normalized = normalize_platform_identities(frame)
+        row = normalized.iloc[0]
+
+        self.assertEqual(row["content_id"], "7632278691925609769")
+        self.assertEqual(row["work_id"], "7632278691925609769")
+        self.assertEqual(row["material_id"], "")
+        self.assertEqual(row["ad_material_id"], "")
 
     def test_platform_normalizer_standardizes_douyin_copied_share_text(self):
         frame = pd.DataFrame(
@@ -203,6 +226,33 @@ class ThreePlatformRecapTests(unittest.TestCase):
         self.assertEqual(row["normalization_status"], "pending_enrichment")
         self.assertIn("抖音URL解析失败", row["normalization_reason"])
 
+    def test_platform_normalizer_separates_douyin_work_and_ad_material_links(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "material_id": "7631242926141521926",
+                    "title": "只有巨量素材链接",
+                    "content_url": "",
+                    "ad_material_url": "https://巨量.example/video.mp4",
+                    "ad_cover_url": "https://巨量.example/cover.jpg",
+                }
+            ]
+        )
+
+        normalized = normalize_platform_identities(frame)
+        row = normalized.iloc[0]
+
+        self.assertEqual(row["work_id"], "")
+        self.assertEqual(row["work_url"], "")
+        self.assertEqual(row["content_id"], "")
+        self.assertEqual(row["content_url"], "")
+        self.assertEqual(row["ad_material_id"], "7631242926141521926")
+        self.assertEqual(row["ad_material_url"], "https://巨量.example/video.mp4")
+        self.assertEqual(row["ad_cover_url"], "https://巨量.example/cover.jpg")
+
     def test_asset_matching_uses_platform_identity_and_never_douyin_ad_id(self):
         frame = normalize_platform_identities(
             pd.DataFrame(
@@ -251,6 +301,68 @@ class ThreePlatformRecapTests(unittest.TestCase):
         self.assertEqual(matched.iloc[2]["match_reason"], "未匹配飞书自有内容")
         self.assertEqual(matched.iloc[3]["match_source"], "标准标题")
         self.assertEqual(matched.iloc[3]["matched_content_type"], "股友说")
+
+    def test_asset_matching_does_not_match_douyin_plain_material_id_as_work_id(self):
+        ledger = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "content_id": "7626286546770968627",
+                    "content_url": "https://www.douyin.com/video/7626286546770968627",
+                    "title": "台账真实作品",
+                    "account": "投资号",
+                    "content_type": "资讯",
+                    "title_key": "",
+                    "title_key_no_tags": "",
+                },
+                {
+                    "platform": "抖音",
+                    "content_id": "7594830477777751338",
+                    "content_url": "https://www.douyin.com/video/7594830477777751338",
+                    "title": "高价值真实选题",
+                    "account": "投资号",
+                    "content_type": "股友说",
+                    "category_l1": "股友说",
+                    "category_l2": "股民教学",
+                    "title_key": "",
+                    "title_key_no_tags": "",
+                },
+            ]
+        )
+        frame = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "7626286546770968627",
+                    "material_id": "7626286546770968627",
+                    "work_id": "",
+                    "work_url": "",
+                    "title": "投放侧改写标题",
+                    "content_url": "",
+                },
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "7626286546770968627",
+                    "material_id": "7626286546770968627",
+                    "work_id": "",
+                    "work_url": "",
+                    "title": "高价值真实选题 #财经",
+                    "content_url": "",
+                },
+            ]
+        )
+
+        matched = match_assets_to_ledger(frame, ledger)
+
+        self.assertEqual(matched.iloc[0]["match_status"], "未匹配")
+        self.assertEqual(matched.iloc[0]["match_reason"], "未匹配飞书自有内容")
+        self.assertEqual(matched.iloc[1]["match_status"], "已匹配")
+        self.assertEqual(matched.iloc[1]["match_source"], "标准标题")
+        self.assertEqual(matched.iloc[1]["work_id"], "7594830477777751338")
+        self.assertEqual(matched.iloc[1]["work_url"], "https://www.douyin.com/video/7594830477777751338")
+        self.assertEqual(matched.iloc[1]["content_id"], "7594830477777751338")
 
     def test_asset_matching_allows_douyin_title_prefix_and_punctuation_drift(self):
         frame = normalize_platform_identities(

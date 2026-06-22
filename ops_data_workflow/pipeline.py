@@ -41,6 +41,11 @@ STANDARD_COLUMNS = [
     "content_id",
     "content_id_fallback",
     "material_id",
+    "ad_material_id",
+    "work_id",
+    "work_url",
+    "ad_material_url",
+    "ad_cover_url",
     "title",
     "account_raw",
     "account_id",
@@ -321,7 +326,7 @@ def _disable_account_filter_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _normalize_replayed_canonical_columns(frame: pd.DataFrame) -> pd.DataFrame:
     normalized = frame.copy()
-    identifier_columns = {"content_id", "material_id", "account_id"}
+    identifier_columns = {"content_id", "material_id", "ad_material_id", "work_id", "account_id"}
     text_columns = [
         "platform",
         "platform_group",
@@ -331,6 +336,11 @@ def _normalize_replayed_canonical_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "content_id",
         "content_id_fallback",
         "material_id",
+        "ad_material_id",
+        "work_id",
+        "work_url",
+        "ad_material_url",
+        "ad_cover_url",
         "title",
         "account_raw",
         "account_id",
@@ -460,6 +470,13 @@ def _standardize(
 
     normalized["content_id"] = normalized["content_id"].fillna("").astype(str)
     normalized["material_id"] = normalized["material_id"].fillna("").astype(str)
+    normalized["ad_material_id"] = normalized["ad_material_id"].fillna("").astype(str)
+    if platform_group == "抖音":
+        normalized["material_id"] = _clean_douyin_material_ids(raw, normalized)
+        normalized["ad_material_id"] = normalized["ad_material_id"].where(
+            ~normalized["ad_material_id"].map(_is_blank),
+            normalized["material_id"],
+        )
     normalized["title"] = normalized["title"].fillna("").astype(str)
     normalized["account_id"] = normalized["account_id"].map(_clean_identifier)
     normalized["account"] = normalized["account"].map(lambda value: "" if _is_blank(value) else str(value))
@@ -473,6 +490,15 @@ def _standardize(
     if not raw_extra.empty:
         normalized = pd.concat([normalized.reset_index(drop=True), raw_extra.loc[normalized.index].reset_index(drop=True)], axis=1)
     return _ordered_columns(normalized)
+
+
+def _clean_douyin_material_ids(raw: pd.DataFrame, normalized: pd.DataFrame) -> pd.Series:
+    material = normalized["material_id"].fillna("").astype(str)
+    true_material_columns = [column for column in ["素材ID", "素材id", "素材中心id", "素材中心ID"] if column in raw.columns]
+    if true_material_columns:
+        return _first_non_blank(raw, true_material_columns).fillna("").astype(str)
+    content_id = normalized["content_id"].fillna("").astype(str)
+    return material.where(content_id.eq("") | material.ne(content_id), "")
 
 
 def _expanded_field_candidates(raw: pd.DataFrame, fields: Mapping[str, List[str]]) -> dict[str, list[str]]:

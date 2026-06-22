@@ -11,11 +11,13 @@ import hashlib
 import re
 import shutil
 import sqlite3
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 import pandas as pd
 
+from .platform_taxonomy import normalize_platform_classification
 from .platform_normalizers.bilibili import extract_bvid
+from .platform_normalizers.douyin import extract_douyin_item_id
 from .title_matching import normalized_title_key
 from .periods import (
     PERIOD_LEVEL_MONTH,
@@ -72,13 +74,20 @@ PERSISTED_RESULT_TABLES = [
     "top_asset_cache_refs",
     "multimodal_recap_items",
     "type_recap_items",
+    "strategy_recap_items",
     "recap_settings",
+    "manual_high_value_supplements",
 ]
 CONTENT_ASSET_COLUMNS = [
     "asset_key",
     "platform",
     "content_id",
     "content_url",
+    "work_id",
+    "work_url",
+    "ad_material_id",
+    "ad_material_url",
+    "ad_cover_url",
     "title",
     "account",
     "tags",
@@ -100,6 +109,16 @@ CONTENT_ASSET_COLUMNS = [
     "created_at",
     "updated_at",
 ]
+_FEISHU_CONTENT_ASSET_CHANGE_COLUMNS = [
+    "platform",
+    "content_id",
+    "content_url",
+    "title",
+    "asset_key",
+    "field",
+    "old_value",
+    "new_value",
+]
 CONTENT_PERFORMANCE_COLUMNS = [
     "performance_key",
     "batch_id",
@@ -111,6 +130,11 @@ CONTENT_PERFORMANCE_COLUMNS = [
     "asset_key",
     "content_id",
     "material_id",
+    "work_id",
+    "work_url",
+    "ad_material_id",
+    "ad_material_url",
+    "ad_cover_url",
     "content_url",
     "title",
     "account",
@@ -119,6 +143,7 @@ CONTENT_PERFORMANCE_COLUMNS = [
     "category_l2",
     "bilibili_content_type",
     "content_type",
+    "analysis_status",
     "match_status",
     "match_source",
     "match_key",
@@ -139,6 +164,10 @@ CONTENT_PERFORMANCE_COLUMNS = [
 ]
 MULTIMODAL_RECAP_COLUMNS = [
     "content_identity_key",
+    "analysis_purpose",
+    "evidence_source",
+    "classification_write_status",
+    "classification_write_reason",
     "platform",
     "channel",
     "content_id",
@@ -173,6 +202,21 @@ TYPE_RECAP_COLUMNS = [
     "value",
     "share",
 ]
+STRATEGY_RECAP_COLUMNS = [
+    "batch_id",
+    "channel",
+    "platform",
+    "type_level",
+    "content_type",
+    "item_count",
+    "metrics",
+    "common_patterns",
+    "reuse_points",
+    "avoid_points",
+    "next_period_actions",
+    "supporting_content_identity_keys",
+    "updated_at",
+]
 TOP_ASSET_CACHE_ENTRY_COLUMNS = [
     "asset_key",
     "content_id",
@@ -193,6 +237,23 @@ TOP_ASSET_CACHE_REF_COLUMNS = [
     "used_at",
     "retained",
 ]
+MANUAL_HIGH_VALUE_SUPPLEMENT_COLUMNS = [
+    "supplement_id",
+    "batch_id",
+    "platform",
+    "channel",
+    "content_id",
+    "content_url",
+    "title",
+    "account",
+    "category_l1",
+    "category_l2",
+    "bilibili_content_type",
+    "evidence_path",
+    "reason",
+    "created_at",
+    "updated_at",
+]
 
 
 @dataclass(frozen=True)
@@ -201,6 +262,14 @@ class ArchivedFile:
     archive_path: Path
     sha256: str
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class FeishuContentAssetDiff:
+    summary: dict[str, int]
+    added: pd.DataFrame
+    changed: pd.DataFrame
+    unchanged: pd.DataFrame
 
 
 def init_db(db_path: Path) -> None:
@@ -585,6 +654,23 @@ def persist_manual_recap_report(
         conn.commit()
 
 
+def persist_oral_recap_report(
+    db_path: Path,
+    batch_id: str,
+    *,
+    provider: str,
+    model: str,
+    report: dict[str, object],
+) -> None:
+    persist_manual_recap_report(
+        db_path,
+        batch_id,
+        provider=provider,
+        model=model,
+        report=report,
+    )
+
+
 def load_manual_recap_report(db_path: Path, batch_id: str) -> dict[str, object]:
     if not batch_id or not Path(db_path).exists():
         return {}
@@ -612,6 +698,126 @@ def load_manual_recap_report(db_path: Path, batch_id: str) -> dict[str, object]:
         "created_at": str(created_at or ""),
         "report": report if isinstance(report, dict) else {},
     }
+
+
+def load_manual_recap_status(db_path: Path, batch_id: str) -> dict[str, object]:
+    if not batch_id or not Path(db_path).exists():
+        return {"batch_id": str(batch_id or ""), "has_report": False}
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            select 1
+            from ai_reports
+            where batch_id = ? and report_type = 'manual_recap'
+            limit 1
+            """,
+            (batch_id,),
+        ).fetchone()
+    return {"batch_id": str(batch_id or ""), "has_report": row is not None}
+
+
+def clear_manual_recap_report(db_path: Path, batch_id: str) -> None:
+    if not batch_id:
+        return
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "delete from ai_reports where batch_id = ? and report_type = 'manual_recap'",
+            (batch_id,),
+        )
+        conn.commit()
+
+
+def upsert_manual_high_value_supplement(
+    db_path: Path,
+    batch_id: str,
+    supplement: dict[str, object],
+) -> str:
+    if not batch_id:
+        raise ValueError("batch_id is required")
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    identity = "||".join(
+        [
+            batch_id,
+            _clean_text(supplement.get("platform")),
+            _clean_text(supplement.get("content_id")),
+            _clean_text(supplement.get("content_url")),
+            _clean_text(supplement.get("title")),
+        ]
+    )
+    supplement_id = hashlib.sha1(identity.encode("utf-8")).hexdigest()
+    values = {
+        "supplement_id": supplement_id,
+        "batch_id": batch_id,
+        "platform": _clean_text(supplement.get("platform")),
+        "channel": _clean_text(supplement.get("channel")),
+        "content_id": _clean_text(supplement.get("content_id")),
+        "content_url": _clean_text(supplement.get("content_url")),
+        "title": _clean_text(supplement.get("title")),
+        "account": _clean_text(supplement.get("account")),
+        "category_l1": _clean_text(supplement.get("category_l1")),
+        "category_l2": _clean_text(supplement.get("category_l2")),
+        "bilibili_content_type": _clean_text(supplement.get("bilibili_content_type")),
+        "evidence_path": _clean_text(supplement.get("evidence_path")),
+        "reason": _clean_text(supplement.get("reason")),
+        "created_at": now,
+        "updated_at": now,
+    }
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            insert into manual_high_value_supplements (
+                supplement_id, batch_id, platform, channel, content_id, content_url, title,
+                account, category_l1, category_l2, bilibili_content_type, evidence_path,
+                reason, created_at, updated_at
+            )
+            values (
+                :supplement_id, :batch_id, :platform, :channel, :content_id, :content_url, :title,
+                :account, :category_l1, :category_l2, :bilibili_content_type, :evidence_path,
+                :reason, :created_at, :updated_at
+            )
+            on conflict(supplement_id) do update set
+                platform = excluded.platform,
+                channel = excluded.channel,
+                content_id = excluded.content_id,
+                content_url = excluded.content_url,
+                title = excluded.title,
+                account = excluded.account,
+                category_l1 = excluded.category_l1,
+                category_l2 = excluded.category_l2,
+                bilibili_content_type = excluded.bilibili_content_type,
+                evidence_path = excluded.evidence_path,
+                reason = excluded.reason,
+                updated_at = excluded.updated_at
+            """,
+            values,
+        )
+        conn.commit()
+    return supplement_id
+
+
+def list_manual_high_value_supplements(db_path: Path, *, batch_id: str = "") -> pd.DataFrame:
+    columns = MANUAL_HIGH_VALUE_SUPPLEMENT_COLUMNS
+    if not Path(db_path).exists():
+        return pd.DataFrame(columns=columns)
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        sql = "select * from manual_high_value_supplements"
+        params: list[object] = []
+        if batch_id:
+            sql += " where batch_id = ?"
+            params.append(batch_id)
+        sql += " order by updated_at desc, platform, channel, title"
+        try:
+            frame = pd.read_sql_query(sql, conn, params=params)
+        except Exception:
+            return pd.DataFrame(columns=columns)
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = ""
+    return frame[columns]
 
 
 def list_recent_batches(db_path: Path, limit: int = 20) -> pd.DataFrame:
@@ -1038,46 +1244,55 @@ def upsert_content_assets_from_feishu(db_path: Path, batch_id: str, ledger: pd.D
                 incoming["updated_at"] = now
                 incoming["last_seen_batch_id"] = batch_id
             conn.execute(
-                """
-                insert into content_assets (
-                    asset_key, platform, content_id, content_url, title, account,
-                    tags, raw_content_type, category_l1, category_l2,
-                    bilibili_content_type, content_type, content_type_review,
-                    filter_status, published_date, source_file, source_sheet,
-                    source_row, title_key, title_key_no_tags, first_seen_batch_id,
-                    last_seen_batch_id, created_at, updated_at
-                )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                on conflict(asset_key) do update set
-                    platform = excluded.platform,
-                    content_id = excluded.content_id,
-                    content_url = excluded.content_url,
-                    title = excluded.title,
-                    account = excluded.account,
-                    tags = excluded.tags,
-                    raw_content_type = excluded.raw_content_type,
-                    category_l1 = excluded.category_l1,
-                    category_l2 = excluded.category_l2,
-                    bilibili_content_type = excluded.bilibili_content_type,
-                    content_type = excluded.content_type,
-                    content_type_review = excluded.content_type_review,
-                    filter_status = excluded.filter_status,
-                    published_date = excluded.published_date,
-                    source_file = excluded.source_file,
-                    source_sheet = excluded.source_sheet,
-                    source_row = excluded.source_row,
-                    title_key = excluded.title_key,
-                    title_key_no_tags = excluded.title_key_no_tags,
-                    first_seen_batch_id = excluded.first_seen_batch_id,
-                    last_seen_batch_id = excluded.last_seen_batch_id,
-                    created_at = excluded.created_at,
-                    updated_at = excluded.updated_at
-                """,
+                _content_asset_upsert_sql(),
                 tuple(incoming[column] for column in CONTENT_ASSET_COLUMNS),
             )
             count += 1
         conn.commit()
     return count
+
+
+def build_feishu_content_asset_diff(db_path: Path, batch_id: str, ledger: pd.DataFrame) -> FeishuContentAssetDiff:
+    init_db(db_path)
+    columns = CONTENT_ASSET_COLUMNS
+    added_rows: list[dict[str, object]] = []
+    changed_rows: list[dict[str, object]] = []
+    unchanged_rows: list[dict[str, object]] = []
+    if ledger is None or ledger.empty:
+        return FeishuContentAssetDiff(
+            summary={"新增": 0, "修改": 0, "无变化": 0},
+            added=pd.DataFrame(columns=columns),
+            changed=pd.DataFrame(columns=_FEISHU_CONTENT_ASSET_CHANGE_COLUMNS),
+            unchanged=pd.DataFrame(columns=columns),
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(db_path)) as conn:
+        table_columns = [item[1] for item in conn.execute("pragma table_info(content_assets)").fetchall()]
+        for _, row in ledger.iterrows():
+            asset_key = _content_asset_key(row)
+            if not asset_key:
+                continue
+            diff_incoming = _content_asset_record_for_diff(asset_key, batch_id, row, now)
+            existing_row = conn.execute(
+                "select * from content_assets where asset_key = ?",
+                (asset_key,),
+            ).fetchone()
+            if existing_row is None:
+                added_rows.append(diff_incoming)
+                continue
+            existing = {column: existing_row[index] for index, column in enumerate(table_columns)}
+            row_changes = _content_asset_changes(existing, diff_incoming)
+            if row_changes:
+                changed_rows.extend(row_changes)
+            else:
+                unchanged_rows.append({column: existing.get(column, "") for column in columns})
+    changed_asset_count = len({_clean_text(row.get("asset_key")) for row in changed_rows if _clean_text(row.get("asset_key"))})
+    return FeishuContentAssetDiff(
+        summary={"新增": len(added_rows), "修改": changed_asset_count, "无变化": len(unchanged_rows)},
+        added=pd.DataFrame(added_rows, columns=columns),
+        changed=pd.DataFrame(changed_rows, columns=_FEISHU_CONTENT_ASSET_CHANGE_COLUMNS),
+        unchanged=pd.DataFrame(unchanged_rows, columns=columns),
+    )
 
 
 def list_local_content_assets(db_path: Path) -> pd.DataFrame:
@@ -1122,6 +1337,53 @@ def list_content_performance_items(db_path: Path, *, batch_id: str = "") -> pd.D
         frame = pd.read_sql_query(sql, conn, params=params)
         frame = _backfill_performance_fields_with_conn(conn, frame, batch_id=batch_id)
     return _coerce_content_performance_numbers(_normalize_performance_title_tags(_normalize_platform_type_frame(frame, columns)))
+
+
+def fill_missing_content_performance_types(
+    db_path: Path,
+    batch_id: str,
+    updates: Iterable[Mapping[str, object]],
+) -> int:
+    """Fill empty local classification fields for persisted performance rows."""
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    changed = 0
+    with closing(sqlite3.connect(db_path)) as conn:
+        _ensure_table_columns(conn, "content_performance_items", pd.DataFrame(columns=CONTENT_PERFORMANCE_COLUMNS))
+        for update in updates:
+            identity = _clean_text(update.get("content_identity_key"))
+            if not identity:
+                continue
+            assignments: list[str] = []
+            params: list[object] = []
+            for column in ["category_l1", "category_l2", "bilibili_content_type", "content_type"]:
+                value = _clean_text(update.get(column))
+                if not value:
+                    continue
+                assignments.append(f'"{column}" = case when coalesce("{column}", "") = "" then ? else "{column}" end')
+                params.append(value)
+            if not assignments:
+                continue
+            assignments.append('"updated_at" = ?')
+            params.extend([now, batch_id, identity])
+            cursor = conn.execute(
+                f"""
+                update content_performance_items
+                set {", ".join(assignments)}
+                where batch_id = ?
+                  and content_identity_key = ?
+                  and (
+                    coalesce(category_l1, '') = ''
+                    or coalesce(category_l2, '') = ''
+                    or coalesce(bilibili_content_type, '') = ''
+                    or coalesce(content_type, '') = ''
+                  )
+                """,
+                params,
+            )
+            changed += int(cursor.rowcount or 0)
+        conn.commit()
+    return changed
 
 
 def list_period_channel_totals(db_path: Path, *, batch_id: str = "") -> pd.DataFrame:
@@ -1193,7 +1455,15 @@ def persist_multimodal_recap_items(db_path: Path, batch_id: str, items: pd.DataF
             frame[column] = ""
     frame = _normalize_platform_type_frame(frame[MULTIMODAL_RECAP_COLUMNS], MULTIMODAL_RECAP_COLUMNS)
     with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute("delete from multimodal_recap_items where batch_id = ?", (batch_id,))
+        purposes = sorted({_clean_text(value) for value in frame.get("analysis_purpose", pd.Series(dtype=object)).tolist() if _clean_text(value)})
+        if purposes:
+            placeholders = ",".join("?" for _ in purposes)
+            conn.execute(
+                f"delete from multimodal_recap_items where batch_id = ? and analysis_purpose in ({placeholders})",
+                [batch_id, *purposes],
+            )
+        else:
+            conn.execute("delete from multimodal_recap_items where batch_id = ?", (batch_id,))
         _append_frame(conn, "multimodal_recap_items", batch_id, frame)
         conn.commit()
     return int(len(frame))
@@ -1222,6 +1492,24 @@ def persist_type_recap_items(db_path: Path, batch_id: str, items: pd.DataFrame) 
 
 def list_type_recap_items(db_path: Path, *, batch_id: str = "") -> pd.DataFrame:
     return _read_batch_table(db_path, "type_recap_items", TYPE_RECAP_COLUMNS, batch_id=batch_id)
+
+
+def persist_strategy_recap_items(db_path: Path, batch_id: str, items: pd.DataFrame) -> int:
+    init_db(db_path)
+    frame = items.copy() if items is not None else pd.DataFrame(columns=STRATEGY_RECAP_COLUMNS)
+    for column in STRATEGY_RECAP_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = ""
+    frame = frame[STRATEGY_RECAP_COLUMNS].drop(columns=["batch_id"], errors="ignore")
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("delete from strategy_recap_items where batch_id = ?", (batch_id,))
+        _append_frame(conn, "strategy_recap_items", batch_id, frame)
+        conn.commit()
+    return int(len(frame))
+
+
+def list_strategy_recap_items(db_path: Path, *, batch_id: str = "") -> pd.DataFrame:
+    return _read_batch_table(db_path, "strategy_recap_items", STRATEGY_RECAP_COLUMNS, batch_id=batch_id)
 
 
 def upsert_top_asset_cache_entry(db_path: Path, entry: dict[str, object]) -> None:
@@ -1825,6 +2113,8 @@ def _delete_batch_scoped_rows(conn: sqlite3.Connection, batch_id: str) -> None:
         "harvester_asset_manifests",
         "multimodal_recap_items",
         "type_recap_items",
+        "strategy_recap_items",
+        "manual_high_value_supplements",
         "upload_batches",
     ]:
         if not conn.execute(
@@ -2003,6 +2293,7 @@ def _init_lightweight_middle_platform_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_table_columns(conn, "content_assets", pd.DataFrame(columns=CONTENT_ASSET_COLUMNS))
     _ensure_table_columns(conn, "content_performance_items", pd.DataFrame(columns=CONTENT_PERFORMANCE_COLUMNS))
     _ensure_table_columns(conn, "period_channel_totals", pd.DataFrame(columns=["batch_id", *PERIOD_CHANNEL_TOTAL_COLUMNS]))
     conn.execute(
@@ -2117,6 +2408,27 @@ def _init_lightweight_middle_platform_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        create table if not exists manual_high_value_supplements (
+            supplement_id text primary key,
+            batch_id text not null default '',
+            platform text not null default '',
+            channel text not null default '',
+            content_id text not null default '',
+            content_url text not null default '',
+            title text not null default '',
+            account text not null default '',
+            category_l1 text not null default '',
+            category_l2 text not null default '',
+            bilibili_content_type text not null default '',
+            evidence_path text not null default '',
+            reason text not null default '',
+            created_at text not null default '',
+            updated_at text not null default ''
+        )
+        """
+    )
     _ensure_table_columns(
         conn,
         "multimodal_recap_items",
@@ -2129,6 +2441,11 @@ def _init_lightweight_middle_platform_tables(conn: sqlite3.Connection) -> None:
     )
     _ensure_table_columns(
         conn,
+        "strategy_recap_items",
+        pd.DataFrame(columns=STRATEGY_RECAP_COLUMNS),
+    )
+    _ensure_table_columns(
+        conn,
         "top_asset_cache_entries",
         pd.DataFrame(columns=TOP_ASSET_CACHE_ENTRY_COLUMNS),
     )
@@ -2136,6 +2453,11 @@ def _init_lightweight_middle_platform_tables(conn: sqlite3.Connection) -> None:
         conn,
         "top_asset_cache_refs",
         pd.DataFrame(columns=TOP_ASSET_CACHE_REF_COLUMNS),
+    )
+    _ensure_table_columns(
+        conn,
+        "manual_high_value_supplements",
+        pd.DataFrame(columns=MANUAL_HIGH_VALUE_SUPPLEMENT_COLUMNS),
     )
     _migrate_harvester_tables_to_batch_scoped_primary_key(conn)
     _ensure_table_columns(
@@ -2407,8 +2729,16 @@ def _normalize_platform_type_record(record: dict[str, object]) -> dict[str, obje
         if "content_type" in record:
             record["content_type"] = bilibili_type
     elif platform:
-        l1 = _clean_text(record.get("category_l1"))
-        l2 = _clean_text(record.get("category_l2")) or _clean_text(record.get("content_type"))
+        classification = normalize_platform_classification(
+            platform,
+            category_l1=record.get("category_l1"),
+            category_l2=record.get("category_l2"),
+            content_type=record.get("content_type") or record.get("raw_content_type"),
+        )
+        l1 = classification.primary_type or _clean_text(record.get("category_l1"))
+        l2 = classification.secondary_type
+        if not l2 and platform not in {"抖音", "小红书"}:
+            l2 = _clean_text(record.get("category_l2")) or _clean_text(record.get("content_type"))
         record["category_l1"] = l1
         record["category_l2"] = l2
         record["bilibili_content_type"] = ""
@@ -2718,6 +3048,14 @@ def _normalize_platform_type_tables(conn: sqlite3.Connection) -> None:
                 where platform <> 'B站'
                 """
             )
+            conn.execute(
+                f"""
+                update "{_sqlite_identifier(table_name)}"
+                set category_l2 = ''
+                where (platform = '抖音' or lower(platform) like '%douyin%')
+                  and category_l1 in ('说唱', '长视频')
+                """
+            )
         else:
             conn.execute(
                 f"""
@@ -2734,6 +3072,16 @@ def _content_asset_key(row: pd.Series) -> str:
     content_url = _clean_text(row.get("content_url"))
     title_key = _clean_text(row.get("title_key")) or normalized_title_key(_clean_text(row.get("title")))
     account = _clean_text(row.get("account"))
+    if platform == "抖音":
+        douyin_id = _trusted_douyin_work_id(row)
+        if douyin_id:
+            return f"{platform}::id::{douyin_id}"
+        douyin_url = _trusted_douyin_work_url(row)
+        if douyin_url:
+            return f"{platform}::url::{douyin_url}"
+        if title_key:
+            return f"{platform}::title_account::{account}::{title_key}"
+        return ""
     if content_id:
         return f"{platform}::id::{content_id}"
     if content_url:
@@ -2743,17 +3091,47 @@ def _content_asset_key(row: pd.Series) -> str:
     return ""
 
 
+def _content_asset_upsert_sql() -> str:
+    column_list = ", ".join(f'"{column}"' for column in CONTENT_ASSET_COLUMNS)
+    placeholders = ", ".join("?" for _ in CONTENT_ASSET_COLUMNS)
+    update_columns = [column for column in CONTENT_ASSET_COLUMNS if column != "asset_key"]
+    assignments = ",\n                    ".join(
+        f'"{column}" = excluded."{column}"' for column in update_columns
+    )
+    return f"""
+                insert into content_assets ({column_list})
+                values ({placeholders})
+                on conflict(asset_key) do update set
+                    {assignments}
+                """
+
+
 def _content_asset_record(asset_key: str, batch_id: str, row: pd.Series, now: str) -> dict[str, object]:
     published_date = _standard_date_text(row.get("published_date"))
+    platform = _clean_text(row.get("platform"))
+    work_id = _clean_text(row.get("work_id") or row.get("content_id"))
+    work_url = _clean_text(row.get("work_url") or row.get("content_url"))
+    content_id = _clean_text(row.get("content_id"))
+    content_url = _clean_text(row.get("content_url"))
+    if platform == "抖音":
+        work_id = _trusted_douyin_work_id(row)
+        work_url = _trusted_douyin_work_url(row) or (f"https://www.douyin.com/video/{work_id}" if work_id else "")
+        content_id = work_id
+        content_url = work_url
     record = {
         "asset_key": asset_key,
-        "platform": _clean_text(row.get("platform")),
-        "content_id": _clean_text(row.get("content_id")),
-        "content_url": _clean_text(row.get("content_url")),
+        "platform": platform,
+        "content_id": content_id,
+        "content_url": content_url,
+        "work_id": work_id,
+        "work_url": work_url,
+        "ad_material_id": _clean_text(row.get("ad_material_id") or row.get("material_id")),
+        "ad_material_url": _clean_text(row.get("ad_material_url")),
+        "ad_cover_url": _clean_text(row.get("ad_cover_url")),
         "title": _clean_text(row.get("title")),
         "account": _clean_text(row.get("account")),
         "tags": _clean_text(row.get("tags")),
-        "raw_content_type": _clean_text(row.get("raw_content_type")),
+        "raw_content_type": _clean_text(row.get("raw_content_type") or row.get("content_type") or row.get("category_l2")),
         "category_l1": _clean_text(row.get("category_l1")),
         "category_l2": _clean_text(row.get("category_l2")),
         "bilibili_content_type": _clean_text(row.get("bilibili_content_type")),
@@ -2772,6 +3150,20 @@ def _content_asset_record(asset_key: str, batch_id: str, row: pd.Series, now: st
         "updated_at": now,
     }
     _normalize_platform_type_record(record)
+    return record
+
+
+def _content_asset_record_for_diff(asset_key: str, batch_id: str, row: pd.Series, now: str) -> dict[str, object]:
+    record = _content_asset_record(asset_key, batch_id, row, now)
+    for field in [
+        "category_l1",
+        "category_l2",
+        "bilibili_content_type",
+        "content_type",
+        "raw_content_type",
+    ]:
+        if field in row:
+            record[field] = _clean_text(row.get(field))
     return record
 
 
@@ -2795,6 +3187,57 @@ def _merge_non_blank(existing: dict[str, object], incoming: dict[str, object]) -
     return result
 
 
+def _content_asset_changes(existing: dict[str, object], incoming: dict[str, object]) -> list[dict[str, object]]:
+    platform = _clean_text(incoming.get("platform") or existing.get("platform"))
+    content_id = _clean_text(incoming.get("content_id") or existing.get("content_id"))
+    content_url = _clean_text(incoming.get("content_url") or existing.get("content_url"))
+    title = _clean_text(incoming.get("title") or existing.get("title"))
+    asset_key = _clean_text(incoming.get("asset_key") or existing.get("asset_key"))
+    changes: list[dict[str, object]] = []
+    for field in [
+        "category_l2",
+        "category_l1",
+        "bilibili_content_type",
+        "content_type",
+        "raw_content_type",
+        "content_id",
+        "content_url",
+        "title",
+        "account",
+        "tags",
+        "content_type_review",
+        "filter_status",
+        "published_date",
+    ]:
+        new_value = _clean_text(incoming.get(field))
+        if not new_value:
+            continue
+        old_value = _content_asset_existing_value(existing, field)
+        if old_value == new_value:
+            continue
+        changes.append(
+            {
+                "platform": platform,
+                "content_id": content_id,
+                "content_url": content_url,
+                "title": title,
+                "asset_key": asset_key,
+                "field": field,
+                "old_value": old_value,
+                "new_value": new_value,
+            }
+        )
+    return changes
+
+
+def _content_asset_existing_value(existing: dict[str, object], field: str) -> str:
+    if field in {"category_l2", "content_type"}:
+        raw_type = _clean_text(existing.get("raw_content_type"))
+        if raw_type:
+            return raw_type
+    return _clean_text(existing.get(field))
+
+
 def _content_performance_frame(batch_id: str, canonical: pd.DataFrame) -> pd.DataFrame:
     if canonical is None or canonical.empty:
         return pd.DataFrame(columns=CONTENT_PERFORMANCE_COLUMNS)
@@ -2807,8 +3250,12 @@ def _content_performance_frame(batch_id: str, canonical: pd.DataFrame) -> pd.Dat
         "content_identity_key",
         "content_id",
         "material_id",
-        "content_url",
+        "work_id",
         "work_url",
+        "ad_material_id",
+        "ad_material_url",
+        "ad_cover_url",
+        "content_url",
         "title",
         "account",
         "matched_account",
@@ -2823,6 +3270,7 @@ def _content_performance_frame(batch_id: str, canonical: pd.DataFrame) -> pd.Dat
         "matched_category_l2",
         "matched_bilibili_content_type",
         "matched_content_type",
+        "analysis_status",
         "match_status",
         "match_source",
         "match_key",
@@ -2849,6 +3297,8 @@ def _content_performance_frame(batch_id: str, canonical: pd.DataFrame) -> pd.Dat
         first_pay = float(group["first_pay_count"].sum())
         display_title, extracted_tags = _split_title_and_tags(_performance_display_title(lead))
         display_tags = _clean_text(lead.get("metadata_tags")) or _clean_text(lead.get("tags")) or extracted_tags
+        trusted_douyin_id = _trusted_douyin_work_id(lead) if _clean_text(lead.get("platform")) == "抖音" else ""
+        trusted_douyin_url = _trusted_douyin_work_url(lead) if _clean_text(lead.get("platform")) == "抖音" else ""
         row = {
             "performance_key": _performance_key(batch_id, lead),
             "batch_id": batch_id,
@@ -2858,9 +3308,14 @@ def _content_performance_frame(batch_id: str, canonical: pd.DataFrame) -> pd.Dat
             "channel": _clean_text(lead.get("channel")),
             "content_identity_key": _clean_text(lead.get("content_identity_key")),
             "asset_key": _performance_asset_key(lead),
-            "content_id": _clean_text(lead.get("content_id")),
+            "content_id": trusted_douyin_id if _clean_text(lead.get("platform")) == "抖音" else _clean_text(lead.get("content_id")),
             "material_id": _clean_text(lead.get("material_id")),
-            "content_url": _clean_text(lead.get("content_url")) or _clean_text(lead.get("work_url")),
+            "work_id": trusted_douyin_id if _clean_text(lead.get("platform")) == "抖音" else _clean_text(lead.get("work_id")),
+            "work_url": trusted_douyin_url if _clean_text(lead.get("platform")) == "抖音" else _clean_text(lead.get("work_url")),
+            "ad_material_id": _clean_text(lead.get("ad_material_id") or lead.get("material_id")),
+            "ad_material_url": _clean_text(lead.get("ad_material_url")),
+            "ad_cover_url": _clean_text(lead.get("ad_cover_url")),
+            "content_url": _performance_content_url(lead),
             "title": display_title,
             "account": _clean_text(lead.get("account")),
             "tags": display_tags,
@@ -2868,6 +3323,7 @@ def _content_performance_frame(batch_id: str, canonical: pd.DataFrame) -> pd.Dat
             "category_l2": _clean_text(lead.get("matched_category_l2")) or _clean_text(lead.get("category_l2")) or _clean_text(lead.get("content_category")),
             "bilibili_content_type": _clean_text(lead.get("matched_bilibili_content_type")) or _clean_text(lead.get("bilibili_content_type")),
             "content_type": _clean_text(lead.get("matched_content_type")) or _clean_text(lead.get("content_type")) or _clean_text(lead.get("content_category")),
+            "analysis_status": _clean_text(lead.get("analysis_status")),
             "match_status": _clean_text(lead.get("match_status")),
             "match_source": _clean_text(lead.get("match_source")),
             "match_key": _clean_text(lead.get("match_key")),
@@ -2996,17 +3452,45 @@ def _asset_match_result_frame(canonical: pd.DataFrame) -> pd.DataFrame:
 def _performance_identity_key(row: pd.Series) -> str:
     current = _clean_text(row.get("content_identity_key"))
     if current:
+        if _clean_text(row.get("platform")) == "抖音" and not _trusted_douyin_identity_key(row, current):
+            current = ""
+    if current:
         return current
-    raw = "|".join(_clean_text(row.get(column)) for column in ["channel", "content_id", "material_id", "title", "content_url"])
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha1(_performance_row_identity(row).encode("utf-8")).hexdigest()
+
+
+def _trusted_douyin_identity_key(row: pd.Series, identity: str) -> bool:
+    material_id = _douyin_material_id(row)
+    match = re.search(r"::抖音::id::(\d{10,24})$", _clean_text(identity))
+    if not match:
+        return "material" not in _clean_text(identity).lower()
+    item_id = match.group(1)
+    return bool(item_id and (not _same_douyin_material_id(item_id, material_id) or _has_trusted_douyin_link_source(row)))
+
+
+def _performance_row_identity(row: pd.Series) -> str:
+    platform = _clean_text(row.get("platform"))
+    if platform == "抖音":
+        return "|".join(_clean_text(row.get(column)) for column in ["channel", "title", "account", "source_file", "source_sheet", "source_row"])
+    return "|".join(_clean_text(row.get(column)) for column in ["channel", "content_id", "material_id", "title", "content_url"])
 
 
 def _performance_asset_key(row: pd.Series) -> str:
     platform = _clean_text(row.get("platform"))
     content_id = _clean_text(row.get("content_id"))
-    content_url = _clean_text(row.get("content_url")) or _clean_text(row.get("work_url"))
+    work_id = _clean_text(row.get("work_id"))
+    work_url = _clean_text(row.get("work_url"))
+    content_url = _clean_text(row.get("content_url")) or work_url
+    material_id = _clean_text(row.get("ad_material_id")) or _clean_text(row.get("material_id"))
     title_key = normalized_title_key(_clean_text(row.get("title")))
     account = _clean_text(row.get("account"))
+    if platform == "抖音":
+        douyin_id = _trusted_douyin_work_id(row)
+        if douyin_id:
+            return f"{platform}::id::{douyin_id}"
+        if title_key:
+            return f"{platform}::title_account::{account}::{title_key}"
+        return f"{platform}::row::{hashlib.sha1(_performance_row_identity(row).encode('utf-8')).hexdigest()}"
     if content_id:
         return f"{platform}::id::{content_id}"
     if content_url:
@@ -3014,6 +3498,95 @@ def _performance_asset_key(row: pd.Series) -> str:
     if title_key:
         return f"{platform}::title_account::{account}::{title_key}"
     return _clean_text(row.get("content_identity_key"))
+
+
+def _performance_content_url(row: pd.Series) -> str:
+    platform = _clean_text(row.get("platform"))
+    content_id = _clean_text(row.get("content_id"))
+    work_url = _clean_text(row.get("work_url"))
+    content_url = _clean_text(row.get("content_url"))
+    if platform == "抖音":
+        douyin_id = _trusted_douyin_work_id(row)
+        if douyin_id:
+            return f"https://www.douyin.com/video/{douyin_id}"
+        return ""
+    return content_url or work_url
+
+
+def _trusted_douyin_work_id(row: pd.Series) -> str:
+    material_id = _douyin_material_id(row)
+    trusted_source = _has_trusted_douyin_link_source(row)
+    candidates = [
+        extract_douyin_item_id(row.get("work_id")),
+        extract_douyin_item_id(row.get("work_url")),
+        extract_douyin_item_id(row.get("content_url")),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if _same_douyin_material_id(candidate, material_id) and not trusted_source:
+            continue
+        return candidate
+    return ""
+
+
+def _trusted_douyin_work_url(row: pd.Series) -> str:
+    material_id = _douyin_material_id(row)
+    trusted_source = _has_trusted_douyin_link_source(row)
+    for value in [row.get("work_url"), row.get("content_url")]:
+        text = _clean_text(value)
+        item_id = extract_douyin_item_id(text)
+        if not item_id:
+            continue
+        if _same_douyin_material_id(item_id, material_id) and not trusted_source:
+            continue
+        return f"https://www.douyin.com/video/{item_id}"
+    return ""
+
+
+def _douyin_material_id(row: pd.Series) -> str:
+    return _normalized_douyin_numeric_id(row.get("ad_material_id")) or _normalized_douyin_numeric_id(row.get("material_id"))
+
+
+def _same_douyin_material_id(item_id: str, material_id: str) -> bool:
+    item = _normalized_douyin_numeric_id(item_id)
+    material = _normalized_douyin_numeric_id(material_id)
+    if not item or not material:
+        return False
+    if item == material:
+        return True
+    return len(item) == len(material) and item[:15] == material[:15]
+
+
+def _normalized_douyin_numeric_id(value: object) -> str:
+    text = _clean_text(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{10,24}", text):
+        return text
+    if re.fullmatch(r"\d+(?:\.\d+)?e\+\d+", text, flags=re.IGNORECASE):
+        try:
+            return str(int(float(text)))
+        except (OverflowError, ValueError):
+            return ""
+    match = re.search(r"(?<!\d)(\d{10,24})(?!\d)", text)
+    return match.group(1) if match else ""
+
+
+def _has_trusted_douyin_link_source(row: pd.Series) -> bool:
+    source = " ".join(
+        _clean_text(row.get(column))
+        for column in ["link_source", "metadata_source", "match_source"]
+    ).lower()
+    trusted_tokens = [
+        "harvester_douyin_detail",
+        "harvester_cache",
+        "metadata_cache",
+        "original_excel",
+        "作品id",
+        "作品ID".lower(),
+    ]
+    return any(token.lower() in source for token in trusted_tokens)
 
 
 def _performance_display_title(row: pd.Series) -> str:

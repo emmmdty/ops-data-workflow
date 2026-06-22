@@ -22,6 +22,11 @@ DEFAULT_STANDARD_COLUMNS = [
     "period_end",
     "content_id",
     "material_id",
+    "work_id",
+    "work_url",
+    "ad_material_id",
+    "ad_material_url",
+    "ad_cover_url",
     "title",
     "account",
     "cover_url",
@@ -191,13 +196,14 @@ def high_spend_content_identity_key(row: pd.Series) -> str:
         work_id = _clean_identifier(row.get("work_id", ""))
         work_url = _normalize_identity_url(row.get("work_url", "")) or content_url
         standard_title_key = normalized_title_key(row.get("standard_title", "")) or title_key
-        douyin_id = _extract_douyin_identity_id(work_id or work_url)
+        douyin_id = _trusted_douyin_work_identity_id(row, work_id, work_url)
         if douyin_id:
             return f"{channel}::抖音::id::{douyin_id}"
-        if work_url:
+        if work_url and _trusted_douyin_work_url(row, work_url):
             return f"{channel}::抖音::url::{work_url}"
         if standard_title_key:
             return f"{channel}::抖音::title_account::{account}::{standard_title_key}"
+        return f"{channel}::抖音::row::{row.name}"
     if content_id:
         return f"{channel}::{platform}::id::{content_id}"
     if content_url:
@@ -353,3 +359,66 @@ def _extract_douyin_identity_id(value: object) -> str:
     text = _clean_identifier(value)
     match = re.search(r"(?<!\d)(\d{16,20})(?!\d)", text)
     return match.group(1) if match else ""
+
+
+def _extract_douyin_work_identity_id(value: object) -> str:
+    text = _clean_identifier(value)
+    return text if re.fullmatch(r"\d{10,24}", text) else _extract_douyin_identity_id(text)
+
+
+def _trusted_douyin_work_identity_id(row: pd.Series, work_id: str, work_url: str) -> str:
+    material_id = _douyin_material_id(row)
+    trusted_source = _has_trusted_douyin_link_source(row)
+    for candidate in [_extract_douyin_work_identity_id(work_id), _extract_douyin_identity_id(work_url)]:
+        if not candidate:
+            continue
+        if _same_douyin_material_id(candidate, material_id) and not trusted_source:
+            continue
+        return candidate
+    return ""
+
+
+def _trusted_douyin_work_url(row: pd.Series, work_url: str) -> bool:
+    item_id = _extract_douyin_identity_id(work_url)
+    material_id = _douyin_material_id(row)
+    return bool(work_url and item_id and (not _same_douyin_material_id(item_id, material_id) or _has_trusted_douyin_link_source(row)))
+
+
+def _douyin_material_id(row: pd.Series) -> str:
+    return _normalized_douyin_numeric_id(row.get("ad_material_id")) or _normalized_douyin_numeric_id(row.get("material_id"))
+
+
+def _same_douyin_material_id(item_id: str, material_id: str) -> bool:
+    item = _normalized_douyin_numeric_id(item_id)
+    material = _normalized_douyin_numeric_id(material_id)
+    if not item or not material:
+        return False
+    if item == material:
+        return True
+    return len(item) == len(material) and item[:15] == material[:15]
+
+
+def _normalized_douyin_numeric_id(value: object) -> str:
+    text = _clean_identifier(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{10,24}", text):
+        return text
+    if re.fullmatch(r"\d+(?:\.\d+)?e\+\d+", text, flags=re.IGNORECASE):
+        try:
+            return str(int(float(text)))
+        except (OverflowError, ValueError):
+            return ""
+    match = re.search(r"(?<!\d)(\d{10,24})(?!\d)", text)
+    return match.group(1) if match else ""
+
+
+def _has_trusted_douyin_link_source(row: pd.Series) -> bool:
+    source = " ".join(
+        _clean_identifier(row.get(column))
+        for column in ["link_source", "metadata_source", "match_source"]
+    ).lower()
+    return any(
+        token in source
+        for token in ["harvester_douyin_detail", "harvester_cache", "metadata_cache", "original_excel", "作品id"]
+    )

@@ -130,6 +130,13 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("run_harvester_asset_capture", self.app_source)
         self.assertIn("run_top_multimodal_analysis_from_manifests", self.app_source)
         self.assertIn("persist_multimodal_recap", self.app_source)
+        self.assertIn("persist_type_recap_from_top_content", self.app_source)
+        self.assertIn("ANALYSIS_PURPOSE_FILL_MISSING_TYPE", self.app_source)
+        self.assertIn("ANALYSIS_PURPOSE_STRATEGY_RECAP", self.app_source)
+        self.assertIn("生成/更新类型复盘", recap_source)
+        self.assertIn("多模态补缺失类型", recap_source)
+        self.assertIn("生成/更新策略复盘", recap_source)
+        self.assertIn("list_strategy_recap_items", self.app_source)
         self.assertIn("缓存占用", recap_source)
         self.assertIn("清理缓存", recap_source)
         self.assertIn("_asset_cache_status_summary", self.app_source)
@@ -167,6 +174,17 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("asset_key", card_source)
         self.assertNotIn("st.columns(2)", card_source)
         self.assertNotIn("metric(\"价值\"", card_source)
+
+    def test_channel_top5_lives_in_report_tab_with_explicit_manifests(self):
+        report_source = self._function_source("_render_high_value_report_tab", "def _render_high_value_evidence_tab")
+        evidence_source = self._function_source("_render_high_value_evidence_tab", "def _render_high_value_quality_tab")
+
+        self.assertIn("manifests: pd.DataFrame", report_source)
+        self.assertIn('st.subheader("渠道消耗前 5")', report_source)
+        self.assertIn("_render_channel_top_link_cards(top_pool, manifests=manifests)", report_source)
+        self.assertNotIn("list_harvester_asset_manifests", report_source)
+        self.assertNotIn("渠道消耗前 5", evidence_source)
+        self.assertNotIn("_render_channel_top_link_cards", evidence_source)
 
     def test_overview_and_local_tables_use_new_cleaning_recap_tables(self):
         for token in [

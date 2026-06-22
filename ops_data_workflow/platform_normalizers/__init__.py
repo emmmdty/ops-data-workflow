@@ -33,6 +33,8 @@ def normalize_platform_identities(frame: pd.DataFrame) -> pd.DataFrame:
                 "work_url": _text(row.get("content_url", "")),
                 "work_id": "",
                 "ad_material_id": _first_text(row, ["material_id", "content_id"]),
+                "ad_material_url": _text(row.get("ad_material_url", "")),
+                "ad_cover_url": _text(row.get("ad_cover_url", "")),
                 "normalization_status": "unsupported_platform",
                 "normalization_reason": "平台不在复盘范围",
             }
@@ -41,6 +43,7 @@ def normalize_platform_identities(frame: pd.DataFrame) -> pd.DataFrame:
         work_id = _text(identity.get("work_id", ""))
         if platform == "抖音":
             normalized.at[index, "content_id"] = work_id
+            normalized.at[index, "content_url"] = _text(identity.get("work_url", ""))
             if "material_id" in normalized.columns and _text(identity.get("ad_material_id", "")):
                 normalized.at[index, "material_id"] = _text(identity.get("ad_material_id", ""))
         elif platform in {"小红书", "B站"} and work_id:

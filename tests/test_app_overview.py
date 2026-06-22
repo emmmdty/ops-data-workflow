@@ -13,9 +13,13 @@ from app import (
     _batch_options_for_level,
     _batch_period_value_label,
     _channel_top_link_card_rows,
+    _channel_top_link_card_html,
     _channel_totals_table_html,
     _channel_totals_for_display,
+    _classification_quality_issues,
     _content_performance_display,
+    _evidence_status_summary,
+    _evidence_status_table,
     _local_content_assets_display,
     _local_recap_metric_html,
     _local_recap_metric_items,
@@ -28,12 +32,16 @@ from app import (
     _overview_period_level_options,
     _comparison_caption,
     _render_channel_totals_table,
+    _report_pool_with_manual_supplements,
+    _report_section_view_model,
+    _report_status_copy,
     _rollup_components_display,
     _render_metric_row,
     _split_type_recap_tables,
     _show_frame,
     _top_asset_cache_entries_display,
     _top_pool_with_value,
+    _quality_items_with_manual_supplements,
     _trend_display_frame,
 )
 from ops_data_workflow.periods import PERIOD_LEVEL_MONTH, PERIOD_LEVEL_QUARTER, PERIOD_LEVEL_WEEK, PERIOD_LEVEL_YEAR
@@ -578,6 +586,99 @@ class AppOverviewTests(unittest.TestCase):
         self.assertEqual(cards.iloc[0]["content_id"], "BV1")
         self.assertEqual(cards[cards["channel"].eq("抖音商业化")].iloc[0]["content_id"], "dy-1")
 
+    def test_channel_top_link_card_prefers_douyin_work_id_for_link_and_cover(self):
+        row = pd.Series(
+            {
+                "platform": "抖音",
+                "channel": "抖音商业化",
+                "content_id": "wrong-material-id",
+                "work_id": "real-video-id",
+                "work_url": "https://www.douyin.com/video/real-video-id",
+                "material_id": "wrong-material-id",
+                "asset_key": "抖音::id::wrong-material-id",
+                "title": "投放素材",
+                "account": "投资号",
+                "content_url": "https://www.douyin.com/video/wrong-material-id",
+                "spend": 100.0,
+                "impressions": 1000.0,
+                "activations": 10.0,
+                "first_pay_count": 2.0,
+            }
+        )
+        cover_lookup = {
+            "抖音::id::real-video-id": "/tmp/real-cover.jpg",
+        }
+
+        def fake_image_data_uri(path: str) -> str:
+            return "data:image/jpeg;base64,cover" if path == "/tmp/real-cover.jpg" else ""
+
+        with patch("app._image_data_uri", side_effect=fake_image_data_uri):
+            html = _channel_top_link_card_html(row, cover_lookup, rank=1)
+
+        self.assertIn("<img", html)
+        self.assertNotIn("暂无封面", html)
+        self.assertIn('href="https://www.douyin.com/video/real-video-id"', html)
+        self.assertNotIn('href="https://www.douyin.com/video/wrong-material-id"', html)
+
+    def test_channel_top_link_card_does_not_open_douyin_material_id_as_video(self):
+        row = pd.Series(
+            {
+                "platform": "抖音",
+                "channel": "抖音商业化",
+                "content_id": "7623721481431780662",
+                "material_id": "7623721481431780662",
+                "asset_key": "抖音::material::7623721481431780662",
+                "title": "巨量素材",
+                "account": "投资号",
+                "content_url": "",
+                "work_id": "",
+                "work_url": "",
+                "spend": 100.0,
+                "impressions": 1000.0,
+                "activations": 10.0,
+                "first_pay_count": 2.0,
+            }
+        )
+        cover_lookup = {
+            "抖音::id::7623721481431780662": "/tmp/wrong-cover.jpg",
+        }
+
+        with patch("app._image_data_uri", return_value="data:image/jpeg;base64,cover"):
+            html = _channel_top_link_card_html(row, cover_lookup, rank=1)
+
+        self.assertNotIn("<img", html)
+        self.assertIn("暂无封面", html)
+        self.assertIn("暂无可打开链接", html)
+        self.assertNotIn("https://www.douyin.com/video/7623721481431780662", html)
+
+    def test_channel_top_link_card_uses_douyin_giant_asset_url_as_evidence_link(self):
+        row = pd.Series(
+            {
+                "platform": "抖音",
+                "channel": "抖音商业化",
+                "content_id": "",
+                "material_id": "7623721481431780662",
+                "asset_key": "抖音::material::7623721481431780662",
+                "title": "巨量素材",
+                "account": "投资号",
+                "content_url": "",
+                "work_id": "",
+                "work_url": "",
+                "ad_material_url": "https://巨量.example/video.mp4",
+                "ad_cover_url": "https://巨量.example/cover.jpg",
+                "spend": 100.0,
+                "impressions": 1000.0,
+                "activations": 10.0,
+                "first_pay_count": 2.0,
+            }
+        )
+
+        html = _channel_top_link_card_html(row, {}, rank=1)
+
+        self.assertIn('href="https://巨量.example/video.mp4"', html)
+        self.assertIn("打开巨量证据", html)
+        self.assertNotIn("https://www.douyin.com/video/7623721481431780662", html)
+
     def test_type_recap_tables_are_split_by_required_platform_type_levels(self):
         type_recap = pd.DataFrame(
             [
@@ -764,6 +865,383 @@ class AppOverviewTests(unittest.TestCase):
         self.assertEqual(summary["待补采"], 1)
         self.assertEqual(summary["已完成多模态"], 1)
         self.assertIn("登录状态失效", summary["失败原因"])
+
+    def test_report_status_copy_only_states_whether_conclusion_uses_current_data(self):
+        self.assertEqual(_report_status_copy({"has_report": True}), "结论已基于当前选择周期的数据。")
+        self.assertEqual(_report_status_copy({"has_report": False}), "结论待更新：当前选择周期还没有生成口头汇报结论。")
+
+    def test_report_section_view_model_uses_weekly_meeting_order_and_text_fallbacks(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-1",
+                    "title": "达人观点素材",
+                    "spend": 300.0,
+                    "impressions": 3000.0,
+                    "activations": 30.0,
+                    "first_pay_count": 3.0,
+                    "content_url": "https://example.com/dy-1",
+                },
+                {
+                    "platform": "B站",
+                    "channel": "B站市场部",
+                    "content_id": "BV1",
+                    "title": "旧内容同步",
+                    "spend": 200.0,
+                    "impressions": 2000.0,
+                    "activations": 8.0,
+                    "first_pay_count": 1.0,
+                    "content_url": "",
+                },
+            ]
+        )
+
+        model = _report_section_view_model(top_pool, {"has_report": False}, {})
+
+        self.assertEqual(
+            list(model),
+            [
+                "一、整体数据",
+                "二、抖音商业化内容分析",
+                "三、抖音市场部内容分析",
+                "四、小红书商业化内容分析",
+                "五、小红书市场部内容分析",
+                "六、B站数据",
+                "下周重点策略",
+            ],
+        )
+        self.assertNotIn("下周待办", model)
+        self.assertIn("数据结论", model["一、整体数据"]["title"])
+        self.assertIn("结论待更新", "\n".join(model["一、整体数据"]["items"]))
+        self.assertIn("抖音商业化", "\n".join(model["二、抖音商业化内容分析"]["items"]))
+        self.assertIn("当前数据未提供足够证据", "\n".join(model["三、抖音市场部内容分析"]["items"]))
+        self.assertIn("B站", "\n".join(model["六、B站数据"]["items"]))
+
+    def test_report_section_view_model_names_top_l1_l2_types_and_common_patterns(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-1",
+                    "title": "普通人如何建立交易体系",
+                    "category_l1": "图文",
+                    "category_l2": "投资认知理财方法",
+                    "spend": 500.0,
+                    "impressions": 5000.0,
+                    "activations": 50.0,
+                    "first_pay_count": 5.0,
+                },
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-2",
+                    "title": "普通人存钱复利方法",
+                    "category_l1": "图文",
+                    "category_l2": "投资认知理财方法",
+                    "spend": 300.0,
+                    "impressions": 3000.0,
+                    "activations": 30.0,
+                    "first_pay_count": 3.0,
+                },
+                {
+                    "platform": "小红书",
+                    "channel": "小红书市场部",
+                    "content_id": "xhs-1",
+                    "title": "K线形态入门清单",
+                    "category_l1": "图文",
+                    "category_l2": "理财方法",
+                    "spend": 200.0,
+                    "impressions": 2000.0,
+                    "activations": 20.0,
+                    "first_pay_count": 2.0,
+                },
+            ]
+        )
+
+        model = _report_section_view_model(top_pool, {"has_report": True}, {})
+        overview = "\n".join(model["一、整体数据"]["items"])
+        douyin = "\n".join(model["二、抖音商业化内容分析"]["items"])
+
+        self.assertIn("一级类型表现", overview)
+        self.assertIn("二级类型表现", overview)
+        self.assertIn("图文", overview)
+        self.assertIn("投资认知理财方法", overview)
+        self.assertIn("高价值内容共性", overview)
+        self.assertIn("普通人", overview)
+        self.assertIn("一级类型表现", douyin)
+        self.assertIn("二级类型表现", douyin)
+        self.assertIn("投资认知理财方法", douyin)
+
+    def test_report_section_view_model_does_not_duplicate_generated_overview_summary(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-1",
+                    "title": "普通人交易方法",
+                    "category_l1": "图文",
+                    "category_l2": "投资认知理财方法",
+                    "spend": 500.0,
+                    "impressions": 5000.0,
+                    "activations": 50.0,
+                    "first_pay_count": 5.0,
+                }
+            ]
+        )
+        generated_report = {
+            "overview": {
+                "summary": "结论已基于当前选择周期的数据。；本周期高价值池共 1 条素材。",
+                "sections": [
+                    {
+                        "title": "一、整体数据",
+                        "items": ["本周期高价值池共 1 条素材。"],
+                    }
+                ],
+            }
+        }
+
+        model = _report_section_view_model(top_pool, {"has_report": True}, generated_report)
+        overview = "\n".join(model["一、整体数据"]["items"])
+
+        self.assertNotIn("；本周期高价值池", overview)
+
+    def test_evidence_status_groups_hidden_links_missing_assets_and_reportable_items(self):
+        top_pool = pd.DataFrame(
+            [
+                {"asset_key": "asset-1", "content_id": "dy-1", "title": "有缓存", "content_url": "https://example.com/1"},
+                {"asset_key": "asset-2", "content_id": "dy-2", "title": "链接可能删除", "content_url": "https://example.com/2"},
+                {"asset_key": "asset-3", "content_id": "dy-3", "title": "无素材", "content_url": ""},
+            ]
+        )
+        manifests = pd.DataFrame(
+            [
+                {"asset_key": "asset-1", "status": "succeeded", "error_message": ""},
+                {"asset_key": "asset-2", "status": "failed", "error_message": "作品已删除或隐藏"},
+            ]
+        )
+
+        summary = _evidence_status_summary(top_pool, manifests)
+        table = _evidence_status_table(top_pool, manifests)
+
+        self.assertEqual(summary["可汇报"], 1)
+        self.assertEqual(summary["链接不可访问"], 1)
+        self.assertEqual(summary["有数据无素材"], 1)
+        self.assertEqual(set(table["证据状态"]), {"可汇报", "链接不可访问", "有数据无素材"})
+        self.assertIn("作品已删除或隐藏", table.set_index("平台编号").loc["dy-2", "原因"])
+
+    def test_evidence_status_marks_douyin_giant_asset_without_work_link_as_analyzable(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "asset_key": "抖音::title_account::账号::高价值标题",
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "material_id": "7626286546770968627",
+                    "title": "高价值标题",
+                    "content_url": "",
+                    "category_l1": "股友说",
+                    "category_l2": "股民教学",
+                    "ad_material_url": "https://巨量.example/video.mp4",
+                    "ad_cover_url": "https://巨量.example/cover.jpg",
+                    "match_status": "已匹配",
+                    "match_source": "标准标题",
+                }
+            ]
+        )
+
+        summary = _evidence_status_summary(top_pool, pd.DataFrame())
+        table = _evidence_status_table(top_pool, pd.DataFrame())
+
+        self.assertEqual(summary["可分析但作品链接缺失"], 1)
+        row = table.iloc[0]
+        self.assertEqual(row["证据状态"], "可分析但作品链接缺失")
+        self.assertIn("巨量视频/封面", row["原因"])
+
+    def test_evidence_status_marks_douyin_work_identity_with_giant_cover_as_reportable(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "asset_key": "抖音::id::7594830477777751338",
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "7594830477777751338",
+                    "work_id": "7594830477777751338",
+                    "work_url": "https://www.douyin.com/video/7594830477777751338",
+                    "title": "已有作品身份",
+                    "category_l1": "社区话题",
+                    "category_l2": "股市段子互动",
+                    "ad_cover_url": "https://巨量.example/cover.jpg",
+                    "match_status": "已匹配",
+                }
+            ]
+        )
+
+        summary = _evidence_status_summary(top_pool, pd.DataFrame())
+        table = _evidence_status_table(top_pool, pd.DataFrame())
+
+        self.assertEqual(summary["可汇报"], 1)
+        row = table.iloc[0]
+        self.assertEqual(row["证据状态"], "可汇报")
+        self.assertIn("巨量视频/封面", row["原因"])
+
+    def test_evidence_status_marks_unmatched_douyin_giant_cover_as_unmatched_local_library(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "asset_key": "抖音::title_account::账号::未匹配标题",
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "",
+                    "material_id": "7626286546770968627",
+                    "title": "未匹配标题",
+                    "content_url": "",
+                    "ad_cover_url": "https://巨量.example/cover.jpg",
+                    "match_status": "未匹配",
+                    "analysis_status": "不可分析",
+                }
+            ]
+        )
+
+        summary = _evidence_status_summary(top_pool, pd.DataFrame())
+        table = _evidence_status_table(top_pool, pd.DataFrame())
+
+        self.assertEqual(summary["未匹配本地库"], 1)
+        self.assertEqual(table.iloc[0]["证据状态"], "未匹配本地库")
+
+    def test_manual_supplements_join_report_pool_and_evidence_status(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-1",
+                    "title": "原高价值素材",
+                    "spend": 100.0,
+                }
+            ]
+        )
+        supplements = pd.DataFrame(
+            [
+                {
+                    "supplement_id": "manual-1",
+                    "platform": "小红书",
+                    "channel": "小红书市场部",
+                    "content_id": "note-1",
+                    "content_url": "https://example.com/note-1",
+                    "title": "人工补充素材",
+                    "category_l1": "图文",
+                    "category_l2": "理财方法",
+                    "evidence_path": "/tmp/note-1.png",
+                    "reason": "这条影响小红书结论。",
+                }
+            ]
+        )
+
+        report_pool = _report_pool_with_manual_supplements(top_pool, supplements)
+        model = _report_section_view_model(report_pool, {"has_report": False}, {})
+        evidence = _evidence_status_table(report_pool, pd.DataFrame())
+
+        self.assertEqual(len(report_pool), 2)
+        self.assertIn("已纳入 1 条人工补充", "\n".join(model["一、整体数据"]["items"]))
+        self.assertIn("人工补充素材", "\n".join(model["五、小红书市场部内容分析"]["items"]))
+        self.assertEqual(evidence.set_index("平台编号").loc["note-1", "证据状态"], "人工新增")
+        self.assertIn("/tmp/note-1.png", evidence.set_index("平台编号").loc["note-1", "原因"])
+
+    def test_classification_quality_issues_follow_harvester_taxonomy_boundaries(self):
+        items = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-ok",
+                    "category_l1": "股友说",
+                    "category_l2": "股民教学",
+                    "bilibili_content_type": "",
+                },
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-bad",
+                    "category_l1": "资讯",
+                    "category_l2": "泛财经",
+                    "bilibili_content_type": "",
+                },
+                {
+                    "platform": "小红书",
+                    "channel": "小红书市场部",
+                    "content_id": "xhs-bad",
+                    "category_l1": "图文",
+                    "category_l2": "股友说",
+                    "bilibili_content_type": "",
+                },
+                {
+                    "platform": "B站",
+                    "channel": "B站市场部",
+                    "content_id": "bv-bad",
+                    "category_l1": "采访内容",
+                    "category_l2": "二级不应存在",
+                    "bilibili_content_type": "",
+                },
+            ]
+        )
+
+        issues = _classification_quality_issues(items)
+
+        self.assertEqual(set(issues["平台编号"]), {"dy-bad", "xhs-bad", "bv-bad"})
+        self.assertIn("抖音一级类型", issues.set_index("平台编号").loc["dy-bad", "问题"])
+        self.assertIn("小红书图文二级类型", issues.set_index("平台编号").loc["xhs-bad", "问题"])
+        self.assertIn("B站只使用单级内容类型", issues.set_index("平台编号").loc["bv-bad", "问题"])
+
+    def test_quality_items_are_scoped_to_report_pool_plus_manual_supplements(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-top",
+                    "category_l1": "股友说",
+                    "category_l2": "股民教学",
+                }
+            ]
+        )
+        non_top_items = pd.DataFrame(
+            [
+                *top_pool.to_dict("records"),
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-non-top",
+                    "category_l1": "资讯",
+                    "category_l2": "泛财经",
+                },
+            ]
+        )
+        supplements = pd.DataFrame(
+            [
+                {
+                    "supplement_id": "manual-bad",
+                    "platform": "B站",
+                    "channel": "B站市场部",
+                    "content_id": "bv-manual",
+                    "category_l1": "采访内容",
+                    "category_l2": "不应存在",
+                    "bilibili_content_type": "",
+                }
+            ]
+        )
+
+        scoped = _quality_items_with_manual_supplements(top_pool, supplements)
+        unscoped_issues = _classification_quality_issues(non_top_items)
+        scoped_issues = _classification_quality_issues(scoped)
+
+        self.assertIn("dy-non-top", set(unscoped_issues["平台编号"]))
+        self.assertNotIn("dy-non-top", set(scoped_issues["平台编号"]))
+        self.assertEqual(set(scoped_issues["平台编号"]), {"bv-manual"})
 
     def test_local_recap_metric_items_add_total_share_and_scope_notes(self):
         row = pd.Series(

@@ -21,6 +21,8 @@ JOB_STATUS_RETRY = "retry"
 JOB_STATUS_FAILED = "failed"
 JOB_STATUS_SUCCEEDED = "succeeded"
 TOP_MULTIMODAL_JOB_TYPE = "top_multimodal_content"
+ANALYSIS_PURPOSE_FILL_MISSING_TYPE = "fill_missing_type"
+ANALYSIS_PURPOSE_STRATEGY_RECAP = "strategy_recap"
 MULTIMODAL_RESULT_FIELDS = [
     "内容形态",
     "一级内容类型",
@@ -41,6 +43,7 @@ JOB_COLUMNS = [
     "job_id",
     "batch_id",
     "job_type",
+    "analysis_purpose",
     "status",
     "trigger",
     "platform",
@@ -70,6 +73,7 @@ def init_analysis_jobs(db_path: Path) -> None:
                 job_id text primary key,
                 batch_id text not null,
                 job_type text not null,
+                analysis_purpose text not null default 'strategy_recap',
                 status text not null,
                 trigger text not null default '',
                 platform text not null default '',
@@ -89,6 +93,7 @@ def init_analysis_jobs(db_path: Path) -> None:
             )
             """
         )
+        _ensure_analysis_job_columns(conn)
         conn.commit()
 
 
@@ -100,6 +105,7 @@ def enqueue_top_multimodal_jobs(
     trigger: str,
     prompt_hint: str = "",
     max_attempts: int = 2,
+    analysis_purpose: str = ANALYSIS_PURPOSE_STRATEGY_RECAP,
 ) -> list[str]:
     init_analysis_jobs(db_path)
     if top_content.empty:
@@ -109,23 +115,26 @@ def enqueue_top_multimodal_jobs(
     with closing(sqlite3.connect(db_path)) as conn:
         for _, row in top_content.iterrows():
             payload = _job_payload(row)
-            job_id = _job_id(batch_id, TOP_MULTIMODAL_JOB_TYPE, payload.get("content_identity_key", ""))
+            purpose = _analysis_purpose(analysis_purpose)
+            payload["analysis_purpose"] = purpose
+            job_id = _job_id(batch_id, TOP_MULTIMODAL_JOB_TYPE, purpose, payload.get("content_identity_key", ""))
             exists = conn.execute("select 1 from analysis_jobs where job_id = ?", (job_id,)).fetchone()
             if exists:
                 continue
             conn.execute(
                 """
                 insert into analysis_jobs (
-                    job_id, batch_id, job_type, status, trigger, platform, channel,
+                    job_id, batch_id, job_type, analysis_purpose, status, trigger, platform, channel,
                     content_identity_key, title, content_url, prompt_hint, payload_json,
                     attempts, max_attempts, visible_alert, created_at, updated_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)
                 """,
                 (
                     job_id,
                     batch_id,
                     TOP_MULTIMODAL_JOB_TYPE,
+                    purpose,
                     JOB_STATUS_QUEUED,
                     trigger,
                     payload.get("platform", ""),
@@ -153,6 +162,7 @@ def reset_top_multimodal_jobs(
     trigger: str,
     prompt_hint: str = "",
     max_attempts: int = 2,
+    analysis_purpose: str = ANALYSIS_PURPOSE_STRATEGY_RECAP,
 ) -> list[str]:
     """Queue or requeue Top multimodal jobs for a manual analysis pass."""
     init_analysis_jobs(db_path)
@@ -160,11 +170,13 @@ def reset_top_multimodal_jobs(
         return []
     job_ids: list[str] = []
     now = _now()
+    purpose = _analysis_purpose(analysis_purpose)
     with closing(sqlite3.connect(db_path)) as conn:
         current_job_ids: set[str] = set()
         for _, row in top_content.iterrows():
             payload = _job_payload(row)
-            job_id = _job_id(batch_id, TOP_MULTIMODAL_JOB_TYPE, payload.get("content_identity_key", ""))
+            payload["analysis_purpose"] = purpose
+            job_id = _job_id(batch_id, TOP_MULTIMODAL_JOB_TYPE, purpose, payload.get("content_identity_key", ""))
             current_job_ids.add(job_id)
             payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             exists = conn.execute("select 1 from analysis_jobs where job_id = ?", (job_id,)).fetchone()
@@ -172,7 +184,7 @@ def reset_top_multimodal_jobs(
                 conn.execute(
                     """
                     update analysis_jobs
-                    set status = ?, trigger = ?, platform = ?, channel = ?,
+                    set analysis_purpose = ?, status = ?, trigger = ?, platform = ?, channel = ?,
                         content_identity_key = ?, title = ?, content_url = ?,
                         prompt_hint = ?, payload_json = ?, result_json = '',
                         error_message = '', attempts = 0, max_attempts = ?,
@@ -180,6 +192,7 @@ def reset_top_multimodal_jobs(
                     where job_id = ?
                     """,
                     (
+                        purpose,
                         JOB_STATUS_QUEUED,
                         trigger,
                         payload.get("platform", ""),
@@ -198,16 +211,17 @@ def reset_top_multimodal_jobs(
                 conn.execute(
                     """
                     insert into analysis_jobs (
-                        job_id, batch_id, job_type, status, trigger, platform, channel,
+                        job_id, batch_id, job_type, analysis_purpose, status, trigger, platform, channel,
                         content_identity_key, title, content_url, prompt_hint, payload_json,
                         attempts, max_attempts, visible_alert, created_at, updated_at
                     )
-                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)
                     """,
                     (
                         job_id,
                         batch_id,
                         TOP_MULTIMODAL_JOB_TYPE,
+                        purpose,
                         JOB_STATUS_QUEUED,
                         trigger,
                         payload.get("platform", ""),
@@ -230,9 +244,10 @@ def reset_top_multimodal_jobs(
                 delete from analysis_jobs
                 where batch_id = ?
                   and job_type = ?
+                  and analysis_purpose = ?
                   and job_id not in ({placeholders})
                 """,
-                [batch_id, TOP_MULTIMODAL_JOB_TYPE, *sorted(current_job_ids)],
+                [batch_id, TOP_MULTIMODAL_JOB_TYPE, purpose, *sorted(current_job_ids)],
             )
         conn.commit()
     return job_ids
@@ -349,6 +364,9 @@ def list_analysis_jobs(db_path: Path, *, batch_id: str = "") -> pd.DataFrame:
     frame = pd.DataFrame(rows, columns=columns)
     if "visible_alert" in frame.columns:
         frame["visible_alert"] = frame["visible_alert"].astype(bool)
+    if "analysis_purpose" not in frame.columns:
+        frame["analysis_purpose"] = ANALYSIS_PURPOSE_STRATEGY_RECAP
+    frame["analysis_purpose"] = frame["analysis_purpose"].fillna("").astype(str).replace("", ANALYSIS_PURPOSE_STRATEGY_RECAP)
     return frame[[column for column in JOB_COLUMNS if column in frame.columns]]
 
 
@@ -361,6 +379,10 @@ def _job_payload(row: pd.Series) -> dict[str, str]:
         "title": _text(row.get("title")),
         "account": _text(row.get("account")),
         "content_url": _text(row.get("content_url") or row.get("work_url")),
+        "work_url": _text(row.get("work_url")),
+        "ad_material_id": _text(row.get("ad_material_id") or row.get("material_id")),
+        "ad_material_url": _text(row.get("ad_material_url")),
+        "ad_cover_url": _text(row.get("ad_cover_url")),
         "spend": _text(row.get("spend")),
         "impressions": _text(row.get("impressions")),
         "activations": _text(row.get("activations")),
@@ -441,9 +463,24 @@ def _fallback_identity(row: pd.Series) -> str:
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()
 
 
-def _job_id(batch_id: str, job_type: str, identity: str) -> str:
-    raw = f"{batch_id}|{job_type}|{identity}"
+def _job_id(batch_id: str, job_type: str, analysis_purpose: str, identity: str) -> str:
+    raw = f"{batch_id}|{job_type}|{_analysis_purpose(analysis_purpose)}|{identity}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _analysis_purpose(value: object) -> str:
+    text = _text(value)
+    if text == ANALYSIS_PURPOSE_FILL_MISSING_TYPE:
+        return ANALYSIS_PURPOSE_FILL_MISSING_TYPE
+    return ANALYSIS_PURPOSE_STRATEGY_RECAP
+
+
+def _ensure_analysis_job_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute('pragma table_info("analysis_jobs")').fetchall()}
+    if "analysis_purpose" not in existing:
+        conn.execute(
+            'alter table "analysis_jobs" add column "analysis_purpose" text not null default "strategy_recap"'
+        )
 
 
 def _now() -> str:

@@ -5,6 +5,8 @@ import unittest
 import pandas as pd
 
 from ops_data_workflow.analysis_jobs import (
+    ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
+    ANALYSIS_PURPOSE_STRATEGY_RECAP,
     enqueue_top_multimodal_jobs,
     list_analysis_jobs,
     record_job_failure,
@@ -56,6 +58,53 @@ class AnalysisJobTests(unittest.TestCase):
             self.assertIn("429", jobs.iloc[0]["error_message"])
             self.assertEqual(jobs.iloc[0]["trigger"], "upload")
             self.assertEqual(jobs.iloc[0]["prompt_hint"], "重点分析爆量共性")
+            self.assertEqual(jobs.iloc[0]["analysis_purpose"], ANALYSIS_PURPOSE_STRATEGY_RECAP)
+
+    def test_top_multimodal_jobs_are_distinct_per_analysis_purpose(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite3"
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "channel": "抖音商业化",
+                        "platform": "抖音",
+                        "content_identity_key": "douyin-1",
+                        "title": "抖音Top",
+                        "content_url": "https://www.douyin.com/video/1",
+                    }
+                ]
+            )
+
+            fill_jobs = enqueue_top_multimodal_jobs(
+                db_path,
+                "batch-1",
+                top_content,
+                trigger="manual_fill_type",
+                analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
+            )
+            strategy_jobs = enqueue_top_multimodal_jobs(
+                db_path,
+                "batch-1",
+                top_content,
+                trigger="manual_strategy",
+                analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
+            )
+            duplicate_fill = enqueue_top_multimodal_jobs(
+                db_path,
+                "batch-1",
+                top_content,
+                trigger="manual_fill_type",
+                analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
+            )
+
+            jobs = list_analysis_jobs(db_path, batch_id="batch-1").sort_values("analysis_purpose")
+
+            self.assertEqual(len(fill_jobs), 1)
+            self.assertEqual(len(strategy_jobs), 1)
+            self.assertNotEqual(fill_jobs[0], strategy_jobs[0])
+            self.assertEqual(duplicate_fill, [])
+            self.assertEqual(set(jobs["analysis_purpose"]), {ANALYSIS_PURPOSE_FILL_MISSING_TYPE, ANALYSIS_PURPOSE_STRATEGY_RECAP})
+            self.assertIn(ANALYSIS_PURPOSE_FILL_MISSING_TYPE, jobs.iloc[0]["payload_json"])
 
     def test_manual_top_analysis_reset_requeues_existing_jobs_with_new_prompt(self):
         with TemporaryDirectory() as tmp:
@@ -81,6 +130,7 @@ class AnalysisJobTests(unittest.TestCase):
                 top_content,
                 trigger="manual_top_analysis",
                 prompt_hint="重点看选题共性",
+                analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
             )
 
             jobs = list_analysis_jobs(db_path, batch_id="batch-1")
@@ -90,6 +140,7 @@ class AnalysisJobTests(unittest.TestCase):
             self.assertEqual(jobs.iloc[0]["attempts"], 0)
             self.assertEqual(jobs.iloc[0]["trigger"], "manual_top_analysis")
             self.assertEqual(jobs.iloc[0]["prompt_hint"], "重点看选题共性")
+            self.assertEqual(jobs.iloc[0]["analysis_purpose"], ANALYSIS_PURPOSE_STRATEGY_RECAP)
 
     def test_manual_top_analysis_reset_removes_stale_jobs_outside_current_pool(self):
         with TemporaryDirectory() as tmp:
@@ -124,6 +175,33 @@ class AnalysisJobTests(unittest.TestCase):
             jobs = list_analysis_jobs(db_path, batch_id="batch-1")
             self.assertEqual(len(jobs), 1)
             self.assertEqual(jobs.iloc[0]["content_identity_key"], "keep-1")
+
+    def test_multimodal_payload_keeps_douyin_giant_asset_links_out_of_work_url(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite3"
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "channel": "抖音商业化",
+                        "platform": "抖音",
+                        "content_identity_key": "douyin-title-1",
+                        "content_id": "",
+                        "title": "巨量素材可分析",
+                        "content_url": "",
+                        "ad_material_url": "https://巨量.example/video.mp4",
+                        "ad_cover_url": "https://巨量.example/cover.jpg",
+                        "spend": 3000.0,
+                    }
+                ]
+            )
+
+            enqueue_top_multimodal_jobs(db_path, "batch-1", top_content, trigger="upload")
+            jobs = list_analysis_jobs(db_path, batch_id="batch-1")
+            payload = jobs.iloc[0]["payload_json"]
+
+            self.assertIn('"content_url": ""', payload)
+            self.assertIn('"ad_material_url": "https://巨量.example/video.mp4"', payload)
+            self.assertIn('"ad_cover_url": "https://巨量.example/cover.jpg"', payload)
 
     def test_runs_top_multimodal_analysis_from_successful_harvester_manifests(self):
         with TemporaryDirectory() as tmp:

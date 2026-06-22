@@ -32,10 +32,10 @@ class CacheCleanupResult:
 def asset_key_for_job(job: Mapping[str, object]) -> str:
     platform = _platform_label(job.get("platform") or job.get("channel"))
     content_id = _text(job.get("content_id"))
-    content_url = _text(job.get("content_url"))
-    identity = _text(job.get("content_identity_key"))
     if content_id:
         return f"{platform}::id::{content_id}"
+    content_url = _text(job.get("content_url"))
+    identity = _text(job.get("content_identity_key"))
     if content_url:
         return f"{platform}::url::{_normalize_url(content_url)}"
     if identity:
@@ -47,7 +47,28 @@ def asset_key_for_job(job: Mapping[str, object]) -> str:
 
 def asset_cache_path(cache_root: Path, job: Mapping[str, object]) -> Path:
     platform = _platform_cache_name(job.get("platform") or job.get("channel"))
+    if has_reusable_asset_identity(job):
+        return reusable_asset_cache_path(cache_root, job)
     return Path(cache_root).expanduser().resolve() / platform / safe_path_segment(asset_key_for_job(job))
+
+
+def reusable_asset_key_for_job(job: Mapping[str, object]) -> str:
+    """Return the stable cross-period cache key, limited to real platform IDs."""
+    platform = _platform_label(job.get("platform") or job.get("channel"))
+    content_id = _text(job.get("content_id"))
+    if not platform or not content_id:
+        return ""
+    return f"{platform}::id::{content_id}"
+
+
+def has_reusable_asset_identity(job: Mapping[str, object]) -> bool:
+    return bool(reusable_asset_key_for_job(job))
+
+
+def reusable_asset_cache_path(cache_root: Path, job: Mapping[str, object]) -> Path:
+    platform = _platform_cache_name(job.get("platform") or job.get("channel"))
+    content_id = _text(job.get("content_id"))
+    return Path(cache_root).expanduser().resolve() / platform / safe_path_segment(content_id)
 
 
 def directory_size(path: Path) -> int:

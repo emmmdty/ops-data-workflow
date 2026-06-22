@@ -544,8 +544,8 @@ def _douyin_candidate(
     detail_source = _clean_text(row.get("content_url")) or _clean_text(row.get("title"))
     original_link = _first_url_from_text(detail_source) or _clean_text(row.get("content_url")) or _first_url_from_text(row.get("title"))
     raw_content_id = _clean_text(row.get("content_id"))
-    content_id = _extract_douyin_item_id(_first_non_blank(row, ["content_id", "material_id", "content_url", "dedupe_key"]))
-    url_item_id = content_id or _extract_douyin_numeric_id(_first_non_blank(row, ["material_id", "dedupe_key"]))
+    content_id = _extract_douyin_item_id_from_url(original_link)
+    url_item_id = content_id
     link = _normalize_douyin_url(original_link) if url_item_id else ""
     error = ""
     if not url_item_id and original_link and _is_douyin_shortlink(original_link):
@@ -1054,6 +1054,15 @@ def _extract_douyin_numeric_id(value: object) -> str:
         except (OverflowError, ValueError):
             return ""
     return ""
+
+
+def _extract_douyin_item_id_from_url(value: object) -> str:
+    text = _clean_text(value)
+    match = re.search(r"(?:douyin\.com|iesdouyin\.com)/(?:video|note)/(\d+)", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"/(?:video|note)/(\d+)", text)
+    return match.group(1) if match else ""
 
 
 def _extract_xhs_note_id(value: object) -> str:

@@ -191,6 +191,60 @@ class HighSpendContentPoolTests(unittest.TestCase):
         self.assertIn("note-rank-09", xhs_ids)
         self.assertNotIn("note-rank-10", xhs_ids)
 
+    def test_douyin_identity_prefers_work_url_over_exported_material_url(self):
+        pool = build_high_spend_content_pool(
+            pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "platform_group": "抖音",
+                        "channel": "抖音商业化",
+                        "content_id": "7594830477777751338",
+                        "material_id": "7595047544461393956",
+                        "work_id": "7594830477777751338",
+                        "work_url": "https://www.douyin.com/video/7594830477777751338",
+                        "title": "巨量导出素材",
+                        "account": "投资号",
+                        "content_url": "https://www.douyin.com/video/7595047544461393956",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                    }
+                ]
+            )
+        )
+
+        self.assertEqual(pool.iloc[0]["content_identity_key"], "抖音商业化::抖音::id::7594830477777751338")
+
+    def test_douyin_giant_asset_links_are_preserved_but_not_identity(self):
+        pool = build_high_spend_content_pool(
+            pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "platform_group": "抖音",
+                        "channel": "抖音商业化",
+                        "content_id": "",
+                        "material_id": "7626286546770968627",
+                        "title": "只有巨量素材",
+                        "account": "投放号",
+                        "content_url": "",
+                        "work_id": "",
+                        "work_url": "",
+                        "ad_material_url": "https://巨量.example/video.mp4",
+                        "ad_cover_url": "https://巨量.example/cover.jpg",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                    }
+                ]
+            )
+        )
+
+        row = pool.iloc[0]
+        self.assertIn("title_account", row["content_identity_key"])
+        self.assertNotIn("7626286546770968627", row["content_identity_key"])
+        self.assertEqual(row["ad_material_url"], "https://巨量.example/video.mp4")
+        self.assertEqual(row["ad_cover_url"], "https://巨量.example/cover.jpg")
+
     def test_executable_top_content_pool_filters_unmatched_or_unanalyzable_rows(self):
         rows = [
             {

@@ -31,6 +31,14 @@ fields:
     internal: cover_url
     role: identity
     source_columns: [视频封面图, 封面, 封面图, 图片链接, 素材url]
+  - display: 巨量链接
+    internal: ad_material_url
+    role: evidence
+    source_columns: [巨量素材链接, 巨量链接, 素材链接, 素材url, 素材URL, 视频素材链接]
+  - display: 巨量封面链接
+    internal: ad_cover_url
+    role: evidence
+    source_columns: [巨量封面链接, 巨量封面, 封面链接, 视频封面图, 封面图]
   - display: 时间
     internal: source_time
     role: context

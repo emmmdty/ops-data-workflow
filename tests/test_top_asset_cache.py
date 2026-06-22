@@ -16,6 +16,7 @@ from ops_data_workflow.top_asset_cache import (
     asset_key_for_job,
     cleanup_top_asset_cache,
     directory_size,
+    reusable_asset_cache_path,
 )
 
 
@@ -33,13 +34,14 @@ class TopAssetCacheTests(unittest.TestCase):
 
         self.assertEqual(asset_key, "B站::id::BV1same")
         self.assertEqual(path.parent.name, "bilibili")
-        self.assertIn("B站_id_BV1same", path.name)
+        self.assertEqual(path.name, "BV1same")
+        self.assertEqual(reusable_asset_cache_path(Path("/tmp/cache"), job).name, "BV1same")
         self.assertNotIn("batch-specific-job", str(path))
 
     def test_cache_entry_and_refs_track_cross_period_usage(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "workflow.sqlite3"
-            asset_dir = Path(tmp) / ".runtime" / "top-assets" / "bilibili" / "B站_id_BV1same"
+            asset_dir = Path(tmp) / ".runtime" / "top-assets" / "bilibili" / "BV1same"
             asset_dir.mkdir(parents=True)
             (asset_dir / "cover.jpg").write_text("cover", encoding="utf-8")
 

@@ -17,6 +17,8 @@ NORMALIZED_IDENTITY_COLUMNS = [
     "work_url",
     "work_id",
     "ad_material_id",
+    "ad_material_url",
+    "ad_cover_url",
     "normalization_status",
     "normalization_reason",
 ]
@@ -30,6 +32,8 @@ class PlatformIdentity:
     work_url: str = ""
     work_id: str = ""
     ad_material_id: str = ""
+    ad_material_url: str = ""
+    ad_cover_url: str = ""
     normalization_status: str = ""
     normalization_reason: str = ""
 
@@ -41,6 +45,8 @@ class PlatformIdentity:
             "work_url": self.work_url,
             "work_id": self.work_id,
             "ad_material_id": self.ad_material_id,
+            "ad_material_url": self.ad_material_url,
+            "ad_cover_url": self.ad_cover_url,
             "normalization_status": self.normalization_status,
             "normalization_reason": self.normalization_reason,
         }

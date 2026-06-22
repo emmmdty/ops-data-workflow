@@ -15,6 +15,8 @@ import pandas as pd
 import streamlit as st
 
 from ops_data_workflow.analysis_jobs import (
+    ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
+    ANALYSIS_PURPOSE_STRATEGY_RECAP,
     list_analysis_jobs,
     reset_top_multimodal_jobs,
     run_top_multimodal_analysis_from_manifests,
@@ -34,7 +36,11 @@ from ops_data_workflow.harvester_bridge import (
     run_harvester_asset_capture,
 )
 from ops_data_workflow.minimax_recap import analyze_top_content_with_minimax
-from ops_data_workflow.multimodal_recap import build_type_recap_items, persist_multimodal_recap
+from ops_data_workflow.multimodal_recap import (
+    build_type_recap_items,
+    persist_multimodal_recap,
+    persist_type_recap_from_top_content,
+)
 from ops_data_workflow.periods import (
     PERIOD_LEVEL_LABELS,
     PERIOD_LEVEL_MONTH,
@@ -44,23 +50,37 @@ from ops_data_workflow.periods import (
     PERIOD_LEVELS,
     review_period_from_dates,
 )
+from ops_data_workflow.platform_taxonomy import (
+    BILIBILI_CONTENT_TYPES,
+    DOUYIN_TAXONOMY,
+    XHS_TAXONOMY,
+    normalize_platform_classification,
+)
 from ops_data_workflow.recap_settings import get_recap_settings, update_recap_settings
 from ops_data_workflow.reporting import DISPLAY_NUMERIC_COLUMNS, format_display_number, localize_columns
 from ops_data_workflow.rollups import rollup_period_for, select_rollup_component_batches
 from ops_data_workflow.source_storage import source_dir_for_period, source_storage_key
 from ops_data_workflow.storage import (
+    build_feishu_content_asset_diff,
     get_top_asset_cache_summary,
     list_content_performance_items,
     list_harvester_asset_jobs,
     list_harvester_asset_manifests,
     list_local_content_assets,
+    clear_manual_recap_report,
+    list_manual_high_value_supplements,
+    load_manual_recap_report,
+    load_manual_recap_status,
     list_multimodal_recap_items,
     list_period_channel_totals,
+    list_strategy_recap_items,
     list_top_asset_cache_entries,
     list_type_recap_items,
     persist_feishu_ledger_snapshot,
+    persist_oral_recap_report,
     previous_successful_batch_id_for_period,
     read_batch_record,
+    upsert_manual_high_value_supplement,
     upsert_content_assets_from_feishu,
 )
 from ops_data_workflow.top_asset_service import build_executable_top_content_pool, build_high_spend_content_pool
@@ -114,6 +134,13 @@ LOCALIZED_TABLE_NUMERIC_COLUMNS = {
     localize_columns(pd.DataFrame(columns=[column])).columns[0]: column
     for column in TABLE_NUMERIC_COLUMNS
 }
+REPORT_CHANNEL_SECTIONS = [
+    ("二、抖音商业化内容分析", "抖音商业化"),
+    ("三、抖音市场部内容分析", "抖音市场部"),
+    ("四、小红书商业化内容分析", "小红书商业化"),
+    ("五、小红书市场部内容分析", "小红书市场部"),
+    ("六、B站数据", "B站"),
+]
 
 
 st.set_page_config(page_title="原生内容投放分析工作台", layout="wide", initial_sidebar_state="collapsed")
@@ -534,7 +561,10 @@ def _page_overview() -> None:
     totals = list_period_channel_totals(APP_DB, batch_id=batch_id)
     items = _overview_items_for_batch(batch_id)
     recap_items = list_type_recap_items(APP_DB, batch_id=batch_id)
-    manifests = list_harvester_asset_manifests(APP_DB, batch_id=batch_id)
+    manifests = _manifests_with_job_context(
+        list_harvester_asset_manifests(APP_DB, batch_id=batch_id),
+        list_harvester_asset_jobs(APP_DB, batch_id=batch_id),
+    )
     settings = get_recap_settings(APP_DB)
     previous_batch_id = _previous_batch_id_for_record(record)
     previous_totals = list_period_channel_totals(APP_DB, batch_id=previous_batch_id) if previous_batch_id else pd.DataFrame()
@@ -699,10 +729,7 @@ def _page_high_value_recap() -> None:
         activation_weight=settings.activation_weight,
         first_pay_weight=settings.first_pay_weight,
     )
-    st.subheader("高价值素材池")
-    st.subheader("渠道消耗前 5")
     manifests = list_harvester_asset_manifests(APP_DB, batch_id=batch_id)
-    _render_channel_top_link_cards(top_pool, manifests=manifests)
     recap_tables = _build_local_recap_tables(APP_DB, batch_id, top_pool)
     totals = list_period_channel_totals(APP_DB, batch_id=batch_id)
     total_metrics = _overview_metrics(
@@ -711,24 +738,95 @@ def _page_high_value_recap() -> None:
         activation_weight=settings.activation_weight,
         first_pay_weight=settings.first_pay_weight,
     )
-    _render_local_recap_tables(recap_tables, total_metrics=total_metrics)
-    _show_frame(_top_pool_display(top_pool), height=420)
-    if top_pool.empty:
-        st.info("当前周期没有达到数量排名或阈值条件的素材。")
-        return
+    analysis_jobs = list_analysis_jobs(APP_DB, batch_id=batch_id)
+    report_status = load_manual_recap_status(APP_DB, batch_id)
+    loaded_report = load_manual_recap_report(APP_DB, batch_id)
+    supplements = list_manual_high_value_supplements(APP_DB, batch_id=batch_id)
+    report_pool = _report_pool_with_manual_supplements(top_pool, supplements)
+    quality_items = _quality_items_with_manual_supplements(top_pool, supplements)
+    report_tab, evidence_tab, quality_tab = st.tabs(["高价值汇报报告", "素材证据与人工补齐", "分类与数据质量"])
+    with report_tab:
+        _render_high_value_report_tab(
+            report_pool,
+            report_status=report_status,
+            manual_report=loaded_report.get("report", {}),
+            recap_tables=recap_tables,
+            total_metrics=total_metrics,
+            manifests=manifests,
+        )
+    with evidence_tab:
+        _render_high_value_evidence_tab(report_pool, executable_top_pool, manifests, analysis_jobs, batch_id=batch_id)
+    with quality_tab:
+        _render_high_value_quality_tab(quality_items, report_pool, batch_id=batch_id)
 
-    capture_pool = executable_top_pool
+
+def _render_high_value_report_tab(
+    top_pool: pd.DataFrame,
+    *,
+    report_status: dict[str, object],
+    manual_report: object,
+    recap_tables: dict[str, pd.DataFrame],
+    total_metrics: dict[str, float],
+    manifests: pd.DataFrame,
+) -> None:
+    status_copy = _report_status_copy(report_status)
+    if bool(report_status.get("has_report")):
+        st.success(status_copy)
+    else:
+        st.warning(status_copy)
+    st.subheader("渠道消耗前 5")
+    _render_channel_top_link_cards(top_pool, manifests=manifests)
+    sections = _report_section_view_model(top_pool, report_status, manual_report)
+    for title, section in sections.items():
+        st.subheader(title)
+        section_title = _text(section.get("title"))
+        if section_title:
+            st.markdown(f"**{section_title}**")
+        for item in section.get("items", []):
+            st.markdown(f"- {_text(item)}")
+    if st.button("生成/更新口头汇报结论", type="primary", width="stretch", disabled=top_pool.empty):
+        report = _local_oral_report_payload(top_pool)
+        persist_oral_recap_report(
+            APP_DB,
+            _text(report_status.get("batch_id")),
+            provider="local",
+            model="oral-report-v1",
+            report=report,
+        )
+        st.success("已根据当前选择周期的数据更新口头汇报结论。")
+        st.rerun()
+    with st.expander("数据支撑附录", expanded=False):
+        _render_local_recap_tables(recap_tables, total_metrics=total_metrics)
+        st.markdown("#### 高价值素材明细")
+        _show_frame(_top_pool_display(top_pool), height=420)
+
+
+def _render_high_value_evidence_tab(
+    top_pool: pd.DataFrame,
+    capture_pool: pd.DataFrame,
+    manifests: pd.DataFrame,
+    analysis_jobs: pd.DataFrame,
+    *,
+    batch_id: str,
+) -> None:
+    st.subheader("素材证据状态")
+    summary = _evidence_status_summary(top_pool, manifests)
+    columns = st.columns(len(summary))
+    for column, (label, value) in zip(columns, summary.items()):
+        column.metric(label, format_display_number(value, 0))
+    _show_frame(_evidence_status_table(top_pool, manifests), height=320)
+
+    capture_pool = capture_pool if capture_pool is not None else pd.DataFrame()
     if capture_pool.empty:
         st.warning("当前高价值素材还没有可执行的匹配状态，请先完成清洗匹配。")
 
-    analysis_jobs = list_analysis_jobs(APP_DB, batch_id=batch_id)
     _render_asset_cache_status(
         _asset_cache_status_summary(top_pool, capture_pool, manifests, analysis_jobs),
         get_top_asset_cache_summary(APP_DB),
     )
 
     with st.container(border=True):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4, c5 = st.columns(5)
         if c1.button("复用每日采集素材", disabled=capture_pool.empty, width="stretch"):
             reused = cache_existing_harvester_assets_for_batch(
                 APP_DB,
@@ -766,8 +864,42 @@ def _page_high_value_recap() -> None:
                 st.success(result.message)
             else:
                 st.error(result.message)
-        if c3.button("生成/更新复盘结果", disabled=capture_pool.empty, width="stretch"):
-            reset_top_multimodal_jobs(APP_DB, batch_id, capture_pool, trigger="manual_recap")
+        if c3.button("生成/更新类型复盘", disabled=top_pool.empty, width="stretch"):
+            written = persist_type_recap_from_top_content(APP_DB, batch_id, top_pool)
+            st.success(f"已基于高价值池写入 {written} 条类型复盘；不依赖素材补采或多模态。")
+            st.rerun()
+        missing_type_pool = _missing_type_pool(capture_pool)
+        if c4.button("多模态补缺失类型", disabled=missing_type_pool.empty, width="stretch"):
+            reset_top_multimodal_jobs(
+                APP_DB,
+                batch_id,
+                missing_type_pool,
+                trigger="manual_fill_missing_type",
+                analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
+            )
+            copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
+            updated_jobs = run_top_multimodal_analysis_from_manifests(
+                APP_DB,
+                batch_id,
+                analyzer=lambda job, manifest: analyze_top_content_with_minimax(job, manifest, env_path=ENV_PATH),
+            )
+            persisted = persist_multimodal_recap(
+                APP_DB,
+                batch_id,
+                missing_type_pool,
+                analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
+                analyzer=_analysis_job_result_analyzer(batch_id, ANALYSIS_PURPOSE_FILL_MISSING_TYPE),
+            )
+            st.success(f"已更新 {updated_jobs} 个补类型任务，写入 {persisted.item_count} 条审计记录；仅填充空类型。")
+            st.rerun()
+        if c5.button("生成/更新策略复盘", disabled=capture_pool.empty, width="stretch"):
+            reset_top_multimodal_jobs(
+                APP_DB,
+                batch_id,
+                capture_pool,
+                trigger="manual_strategy_recap",
+                analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
+            )
             copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
             updated_jobs = run_top_multimodal_analysis_from_manifests(
                 APP_DB,
@@ -778,9 +910,16 @@ def _page_high_value_recap() -> None:
                 APP_DB,
                 batch_id,
                 capture_pool,
-                analyzer=_analysis_job_result_analyzer(batch_id),
+                analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
+                analyzer=_analysis_job_result_analyzer(batch_id, ANALYSIS_PURPOSE_STRATEGY_RECAP),
             )
-            st.success(f"已更新 {updated_jobs} 个分析任务，写入 {persisted.item_count} 条素材复盘和 {persisted.type_count} 条类型复盘。")
+            st.success(f"已更新 {updated_jobs} 个策略任务，写入 {persisted.item_count} 条素材复盘和 {persisted.strategy_count} 条渠道类型策略。")
+            st.rerun()
+
+    _render_manual_supplement_form(batch_id)
+    supplements = list_manual_high_value_supplements(APP_DB, batch_id=batch_id)
+    with st.expander("人工补充记录", expanded=not supplements.empty):
+        _show_frame(_manual_supplements_display(supplements), height=220)
 
     with st.expander("缓存占用与清理", expanded=False):
         cache_summary = get_top_asset_cache_summary(APP_DB)
@@ -797,13 +936,645 @@ def _page_high_value_recap() -> None:
             st.rerun()
         _show_frame(_top_asset_cache_entries_display(list_top_asset_cache_entries(APP_DB)), height=220)
 
+    with st.expander("素材缓存记录与复盘任务", expanded=False):
+        _show_frame(_asset_cache_records_display(manifests), height=260)
+        _show_frame(_analysis_jobs_display(analysis_jobs), height=260)
+
+
+def _render_high_value_quality_tab(items: pd.DataFrame, top_pool: pd.DataFrame, *, batch_id: str) -> None:
+    st.subheader("分类与数据质量")
+    issues = _classification_quality_issues(items)
+    if issues.empty:
+        st.success("抖音、小红书、B站分类口径已通过当前校验。")
+    else:
+        st.warning("存在分类口径不一致或缺失项，以下素材不应直接进入口头结论。")
+        _show_frame(issues, height=320)
     st.subheader("类型复盘")
     _render_type_recap_result_tables(list_type_recap_items(APP_DB, batch_id=batch_id))
     st.subheader("素材复盘")
     _show_frame(_multimodal_recap_display(list_multimodal_recap_items(APP_DB, batch_id=batch_id)), height=360)
-    with st.expander("素材缓存记录与复盘任务", expanded=False):
-        _show_frame(_asset_cache_records_display(manifests), height=260)
-        _show_frame(_analysis_jobs_display(analysis_jobs), height=260)
+    st.subheader("渠道类型策略")
+    _show_frame(_strategy_recap_display(list_strategy_recap_items(APP_DB, batch_id=batch_id)), height=360)
+    with st.expander("高价值素材明细", expanded=False):
+        _show_frame(_top_pool_display(top_pool), height=420)
+
+
+def _report_pool_with_manual_supplements(top_pool: pd.DataFrame, supplements: pd.DataFrame) -> pd.DataFrame:
+    frame = top_pool.copy() if top_pool is not None else pd.DataFrame()
+    manual_rows = _manual_supplements_as_report_rows(supplements)
+    if manual_rows.empty:
+        return frame
+    if frame.empty:
+        return manual_rows
+    return pd.concat([frame, manual_rows], ignore_index=True, sort=False)
+
+
+def _quality_items_with_manual_supplements(items: pd.DataFrame, supplements: pd.DataFrame) -> pd.DataFrame:
+    frame = items.copy() if items is not None else pd.DataFrame()
+    manual_rows = _manual_supplements_as_report_rows(supplements)
+    if manual_rows.empty:
+        return frame
+    if frame.empty:
+        return manual_rows
+    return pd.concat([frame, manual_rows], ignore_index=True, sort=False)
+
+
+def _manual_supplements_as_report_rows(supplements: pd.DataFrame) -> pd.DataFrame:
+    if supplements is None or supplements.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, object]] = []
+    for _, row in supplements.iterrows():
+        platform = _text(row.get("platform"))
+        channel = _text(row.get("channel")) or platform
+        content_id = _text(row.get("content_id"))
+        content_url = _text(row.get("content_url"))
+        title = _text(row.get("title"))
+        identity = _text(row.get("supplement_id")) or content_id or content_url or title
+        rows.append(
+            {
+                "asset_key": f"manual:{identity}",
+                "platform": platform,
+                "channel": channel,
+                "content_id": content_id,
+                "content_url": content_url,
+                "title": title,
+                "account": _text(row.get("account")),
+                "category_l1": _text(row.get("category_l1")),
+                "category_l2": _text(row.get("category_l2")),
+                "bilibili_content_type": _text(row.get("bilibili_content_type")),
+                "content_type": _text(row.get("bilibili_content_type"))
+                or _text(row.get("category_l2"))
+                or _text(row.get("category_l1")),
+                "evidence_path": _text(row.get("evidence_path")),
+                "manual_reason": _text(row.get("reason")),
+                "source_kind": "manual",
+                "spend": 0.0,
+                "impressions": 0.0,
+                "activations": 0.0,
+                "first_pay_count": 0.0,
+                "value": 0.0,
+                "high_spend_reason": "人工新增",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_manual_supplement_form(batch_id: str) -> None:
+    with st.form(f"manual_supplement_{batch_id}", border=True):
+        st.subheader("人工补充高价值素材")
+        c1, c2, c3 = st.columns(3)
+        platform = c1.selectbox("平台", ["抖音", "小红书", "B站"], key=f"supplement_platform_{batch_id}")
+        channel = c2.text_input("渠道", key=f"supplement_channel_{batch_id}")
+        content_id = c3.text_input("平台编号", key=f"supplement_content_id_{batch_id}")
+        title = st.text_input("标题", key=f"supplement_title_{batch_id}")
+        content_url = st.text_input("作品链接", key=f"supplement_url_{batch_id}")
+        d1, d2, d3 = st.columns(3)
+        category_l1 = d1.text_input("一级类型", key=f"supplement_l1_{batch_id}")
+        category_l2 = d2.text_input("二级类型", key=f"supplement_l2_{batch_id}")
+        bilibili_content_type = d3.text_input("B站内容类型", key=f"supplement_bili_type_{batch_id}")
+        evidence_path = st.text_input("截图/封面/缓存路径", key=f"supplement_evidence_path_{batch_id}")
+        reason = st.text_area("为什么影响结论", key=f"supplement_reason_{batch_id}", height=90)
+        submitted = st.form_submit_button("保存补充并标记结论待更新", type="primary", width="stretch")
+        if submitted:
+            if not (_text(content_id) or _text(content_url) or _text(title)):
+                st.error("至少填写平台编号、作品链接或标题中的一项。")
+                return
+            upsert_manual_high_value_supplement(
+                APP_DB,
+                batch_id,
+                {
+                    "platform": platform,
+                    "channel": channel,
+                    "content_id": content_id,
+                    "content_url": content_url,
+                    "title": title,
+                    "category_l1": category_l1,
+                    "category_l2": category_l2,
+                    "bilibili_content_type": bilibili_content_type,
+                    "evidence_path": evidence_path,
+                    "reason": reason,
+                },
+            )
+            clear_manual_recap_report(APP_DB, batch_id)
+            st.success("已保存补充素材。当前口头汇报结论已标记为待更新。")
+            st.rerun()
+
+
+def _report_status_copy(status: dict[str, object]) -> str:
+    if bool(status.get("has_report")):
+        return "结论已基于当前选择周期的数据。"
+    return "结论待更新：当前选择周期还没有生成口头汇报结论。"
+
+
+def _report_section_view_model(
+    top_pool: pd.DataFrame,
+    report_status: dict[str, object],
+    manual_report: object,
+) -> dict[str, dict[str, list[str] | str]]:
+    frame = _prepare_report_pool(top_pool)
+    sections: dict[str, dict[str, list[str] | str]] = {
+        "一、整体数据": {
+            "title": "数据结论",
+            "items": _overall_report_items(frame, report_status, manual_report),
+        }
+    }
+    for title, channel_key in REPORT_CHANNEL_SECTIONS:
+        channel_frame = _channel_report_frame(frame, channel_key)
+        sections[title] = {
+            "title": f"{channel_key}内容分析",
+            "items": _channel_report_items(channel_frame, channel_key),
+        }
+    sections["下周重点策略"] = {"title": "下周重点策略", "items": _next_strategy_items(frame)}
+    return sections
+
+
+def _local_oral_report_payload(top_pool: pd.DataFrame) -> dict[str, object]:
+    sections = _report_section_view_model(top_pool, {"has_report": True}, {})
+    return {
+        "overview": {
+            "summary": "；".join(sections["一、整体数据"]["items"]),
+            "sections": [
+                {"title": title, "items": section["items"]}
+                for title, section in sections.items()
+            ],
+        },
+        "channels": [
+            {"channel": channel_key, "analysis": "；".join(sections[title]["items"])}
+            for title, channel_key in REPORT_CHANNEL_SECTIONS
+        ],
+    }
+
+
+def _prepare_report_pool(top_pool: pd.DataFrame) -> pd.DataFrame:
+    frame = top_pool.copy() if top_pool is not None else pd.DataFrame()
+    for column in [
+        "platform",
+        "channel",
+        "content_id",
+        "title",
+        "content_url",
+        "category_l1",
+        "category_l2",
+        "bilibili_content_type",
+        "content_type",
+        "evidence_path",
+        "manual_reason",
+        "source_kind",
+    ]:
+        if column not in frame.columns:
+            frame[column] = ""
+        frame[column] = frame[column].fillna("").astype(str)
+    for column in ["spend", "impressions", "activations", "first_pay_count", "value"]:
+        if column not in frame.columns:
+            frame[column] = 0.0
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+    return frame
+
+
+def _overall_report_items(
+    frame: pd.DataFrame,
+    report_status: dict[str, object],
+    manual_report: object,
+) -> list[str]:
+    status_line = _report_status_copy(report_status)
+    if frame.empty:
+        return [status_line, "当前周期没有进入高价值池的素材，暂不做过多结论。"]
+    channel_count = int(frame["channel"].replace("", pd.NA).dropna().nunique())
+    spend = _sum(frame, "spend")
+    activations = _sum(frame, "activations")
+    top_channel = _top_dimension_name(frame, "channel")
+    items = [
+        status_line,
+        f"本周期高价值池共 {len(frame)} 条素材，覆盖 {channel_count} 个渠道，高价值消耗 {format_display_number(spend, 0)}，激活 {format_display_number(activations, 0)}。",
+    ]
+    manual_count = int(frame.get("source_kind", pd.Series(dtype=object)).fillna("").astype(str).eq("manual").sum())
+    if manual_count:
+        items.append(f"已纳入 {manual_count} 条人工补充的高价值素材，结论更新时会一起参与口头汇报判断。")
+    if top_channel:
+        items.append(f"当前高价值消耗主要集中在{top_channel}，口头汇报应优先说明该渠道的有效素材和可复用方向。")
+    type_summary = _type_performance_summary(frame)
+    if type_summary.get("primary"):
+        items.append(f"一级类型表现：{type_summary['primary']}。")
+    if type_summary.get("secondary"):
+        items.append(f"二级类型表现：{type_summary['secondary']}。")
+    commonality = _high_value_commonality(frame)
+    if commonality:
+        items.append(f"高价值内容共性：{commonality}。")
+    report_items = _manual_report_overview_items(manual_report)
+    return items + report_items[:2]
+
+
+def _manual_report_overview_items(manual_report: object) -> list[str]:
+    if not isinstance(manual_report, dict):
+        return []
+    overview = manual_report.get("overview", {})
+    if not isinstance(overview, dict):
+        return []
+    sections = overview.get("sections")
+    if isinstance(sections, list) and any(
+        isinstance(section, dict) and _text(section.get("title")) == "一、整体数据"
+        for section in sections
+    ):
+        return []
+    for section in sections if isinstance(sections, list) else []:
+        if not isinstance(section, dict):
+            continue
+        if _text(section.get("title")) in {"核心结论", "下周期动作"}:
+            return [_text(item) for item in section.get("items", []) if _text(item)]
+    return [
+        _text(overview.get(key))
+        for key in ["summary", "report", "next_cycle_direction"]
+        if _text(overview.get(key))
+    ]
+
+
+def _channel_report_frame(frame: pd.DataFrame, channel_key: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    channel = frame["channel"].fillna("").astype(str)
+    platform = frame["platform"].fillna("").astype(str)
+    if channel_key == "B站":
+        return frame[channel.str.contains("B站", na=False) | platform.eq("B站")].copy()
+    return frame[channel.str.contains(channel_key, na=False)].copy()
+
+
+def _channel_report_items(frame: pd.DataFrame, channel_key: str) -> list[str]:
+    if frame.empty:
+        return [f"{channel_key}当前数据未提供足够证据，暂不做过多结论。"]
+    spend = _sum(frame, "spend")
+    activations = _sum(frame, "activations")
+    first_pay = _sum(frame, "first_pay_count")
+    top_title = _top_title(frame)
+    type_summary = _type_performance_summary(frame)
+    type_name = _channel_type_signal(frame)
+    commonality = _high_value_commonality(frame)
+    items = [
+        f"ps：{channel_key}数据取自当前高价值池内的可报告素材，共 {len(frame)} 条，高价值消耗 {format_display_number(spend, 0)}，激活 {format_display_number(activations, 0)}，付费 {format_display_number(first_pay, 0)}。",
+    ]
+    if top_title:
+        items.append(f"表现最突出的素材是「{top_title}」，建议口头汇报时结合封面或截图说明它为什么值得复用。")
+    if type_summary.get("primary"):
+        items.append(f"一级类型表现：{type_summary['primary']}。")
+    if type_summary.get("secondary"):
+        items.append(f"二级类型表现：{type_summary['secondary']}。")
+    if type_name:
+        items.append(f"内容类型上，{type_name}是当前最值得优先复盘的方向，后续应围绕同类素材继续补充样本。")
+    if commonality:
+        items.append(f"高价值内容共性：{commonality}。")
+    return items
+
+
+def _next_strategy_items(frame: pd.DataFrame) -> list[str]:
+    if frame.empty:
+        return ["先补齐高价值素材证据，再判断下周策略。"]
+    top_channel = _top_dimension_name(frame, "channel")
+    type_name = _channel_type_signal(frame)
+    items = []
+    if top_channel:
+        items.append(f"优先复用{top_channel}中已验证的高价值素材方向，先扩大同类内容样本。")
+    if type_name:
+        items.append(f"继续测试{type_name}，并对低证据素材补截图、封面或缓存。")
+    items.append("链接隐藏或删除的作品不直接丢弃，先用缓存或人工截图确认后再纳入结论。")
+    return items
+
+
+def _top_dimension_name(frame: pd.DataFrame, column: str) -> str:
+    if frame.empty or column not in frame.columns:
+        return ""
+    grouped = frame.groupby(column, dropna=False)["spend"].sum().sort_values(ascending=False)
+    for name in grouped.index.tolist():
+        text = _text(name)
+        if text:
+            return text
+    return ""
+
+
+def _top_title(frame: pd.DataFrame) -> str:
+    if frame.empty:
+        return ""
+    sorted_frame = frame.sort_values("spend", ascending=False)
+    for _, row in sorted_frame.iterrows():
+        title = _text(row.get("title")) or _text(row.get("content_id"))
+        if title:
+            return title
+    return ""
+
+
+def _channel_type_signal(frame: pd.DataFrame) -> str:
+    if frame.empty:
+        return ""
+    candidates: list[str] = []
+    for _, row in frame.iterrows():
+        classification = _row_classification(row)
+        if classification.platform == "B站":
+            candidates.append(classification.bilibili_type)
+        else:
+            candidates.append(classification.secondary_type or classification.primary_type)
+    series = pd.Series([item for item in candidates if item])
+    if series.empty:
+        return ""
+    return _text(series.value_counts().index[0])
+
+
+def _type_performance_summary(frame: pd.DataFrame) -> dict[str, str]:
+    if frame.empty:
+        return {"primary": "", "secondary": ""}
+    primary_rows: list[dict[str, object]] = []
+    secondary_rows: list[dict[str, object]] = []
+    for _, row in frame.iterrows():
+        classification = _row_classification(row)
+        if classification.platform == "B站":
+            if classification.bilibili_type:
+                primary_rows.append({"类型": classification.bilibili_type, "spend": _number(row.get("spend")), "value": _number(row.get("value"))})
+            continue
+        if classification.primary_type:
+            primary_rows.append({"类型": classification.primary_type, "spend": _number(row.get("spend")), "value": _number(row.get("value"))})
+        if classification.secondary_type:
+            secondary_rows.append({"类型": classification.secondary_type, "spend": _number(row.get("spend")), "value": _number(row.get("value"))})
+    return {
+        "primary": _top_type_sentence(pd.DataFrame(primary_rows)),
+        "secondary": _top_type_sentence(pd.DataFrame(secondary_rows)),
+    }
+
+
+def _top_type_sentence(rows: pd.DataFrame) -> str:
+    if rows.empty:
+        return ""
+    grouped = rows.groupby("类型", dropna=False).agg(spend=("spend", "sum"), value=("value", "sum"), item_count=("类型", "size"))
+    grouped = grouped.sort_values(["value", "spend"], ascending=[False, False])
+    parts = []
+    for type_name, row in grouped.head(3).iterrows():
+        label = _text(type_name)
+        if not label:
+            continue
+        parts.append(
+            f"{label}（{int(row['item_count'])}条，消耗{format_display_number(row['spend'], 0)}，价值{format_display_number(row['value'], 0)}）"
+        )
+    return "、".join(parts)
+
+
+def _high_value_commonality(frame: pd.DataFrame) -> str:
+    if frame.empty:
+        return ""
+    titles = " ".join(_text(value) for value in frame.get("title", pd.Series(dtype=object)).tolist())
+    signals = [
+        ("普通人", "围绕普通人处境、财富焦虑或可执行方法展开"),
+        ("股民", "直接击中股民身份、情绪和交易心态"),
+        ("K线", "用K线、指标或图表结构降低理解门槛"),
+        ("复利", "用复利、存钱、财务自由等长期收益叙事承接转化"),
+        ("涨停", "用涨停、资金、板块等明确市场结果制造即时关注"),
+        ("财富", "用财富层级、财富曲线或人物故事强化传播钩子"),
+    ]
+    matched = [description for token, description in signals if token in titles]
+    if not matched:
+        type_name = _channel_type_signal(frame)
+        return f"集中在{type_name}等已验证类型，标题通常先给出明确问题或强情绪场景" if type_name else ""
+    return "；".join(matched[:3])
+
+
+def _row_classification(row: pd.Series):
+    platform_text = " ".join(_text(row.get(column)) for column in ["platform", "platform_group", "channel"])
+    return normalize_platform_classification(
+        platform_text,
+        category_l1=row.get("category_l1"),
+        category_l2=row.get("category_l2"),
+        bilibili_content_type=row.get("bilibili_content_type"),
+        content_type=row.get("content_type"),
+    )
+
+
+def _evidence_status_summary(top_pool: pd.DataFrame, manifests: pd.DataFrame) -> dict[str, int]:
+    table = _evidence_status_table(top_pool, manifests)
+    counts = table["证据状态"].value_counts().to_dict() if not table.empty else {}
+    return {
+        "可汇报": int(counts.get("可汇报", 0)),
+        "待补齐": int(counts.get("待补齐", 0)),
+        "待补素材": int(counts.get("待补素材", counts.get("待补齐", 0))),
+        "链接不可访问": int(counts.get("链接不可访问", 0)),
+        "可分析但作品链接缺失": int(counts.get("可分析但作品链接缺失", 0)),
+        "未匹配本地库": int(counts.get("未匹配本地库", 0)),
+        "有数据无素材": int(counts.get("有数据无素材", 0)),
+        "人工新增": int(counts.get("人工新增", 0)),
+    }
+
+
+def _evidence_status_table(top_pool: pd.DataFrame, manifests: pd.DataFrame) -> pd.DataFrame:
+    frame = top_pool.copy() if top_pool is not None else pd.DataFrame()
+    for column in [
+        "asset_key",
+        "platform",
+        "channel",
+        "content_id",
+        "title",
+        "content_url",
+        "work_id",
+        "work_url",
+        "material_id",
+        "ad_material_id",
+        "ad_material_url",
+        "ad_cover_url",
+        "match_status",
+        "analysis_status",
+        "source_kind",
+        "evidence_path",
+        "manual_reason",
+    ]:
+        if column not in frame.columns:
+            frame[column] = ""
+    manifest_lookup = _manifest_status_lookup(manifests)
+    rows: list[dict[str, object]] = []
+    for _, row in frame.iterrows():
+        manifest = _manifest_for_row(row, manifest_lookup)
+        status = _text(manifest.get("status"))
+        error = _text(manifest.get("error_message"))
+        url = _text(row.get("content_url"))
+        work_url = _text(row.get("work_url"))
+        source_kind = _text(row.get("source_kind"))
+        if source_kind == "manual":
+            evidence_status = "人工新增"
+            reason_parts = ["人工补充素材"]
+            manual_reason = _text(row.get("manual_reason"))
+            evidence_path = _text(row.get("evidence_path"))
+            if manual_reason:
+                reason_parts.append(manual_reason)
+            if evidence_path:
+                reason_parts.append(f"证据：{evidence_path}")
+            reason = "；".join(reason_parts)
+        elif status == "succeeded":
+            evidence_status = "可汇报"
+            reason = "已有素材缓存或封面证据"
+        elif _has_douyin_ad_material_evidence(row) and _has_work_identity(row):
+            evidence_status = "可汇报"
+            reason = "已有作品身份，并有巨量视频/封面素材证据"
+        elif _is_inaccessible_reason(error):
+            evidence_status = "链接不可访问"
+            reason = error
+        elif _has_douyin_ad_material_evidence(row) and not _has_work_identity(row):
+            evidence_status = "可分析但作品链接缺失"
+            reason = "已有巨量视频/封面证据，可做素材分析；缺少作品链接，不能生成作品打开链接或作品ID。"
+        elif _is_unmatched_local_content(row):
+            evidence_status = "未匹配本地库"
+            reason = "作品ID/作品链接/标题都未匹配到本地内容库"
+        elif not url:
+            evidence_status = "有数据无素材"
+            reason = "缺少作品链接，需要人工补充截图、封面或缓存路径"
+        else:
+            evidence_status = "待补齐"
+            reason = error or "尚未取得可报告素材证据"
+        rows.append(
+            {
+                "证据状态": evidence_status,
+                "平台": _text(row.get("platform")),
+                "渠道": _text(row.get("channel")),
+                "平台编号": _text(row.get("content_id")),
+                "标题": _text(row.get("title")),
+                "作品链接": url or work_url,
+                "巨量链接": _text(row.get("ad_material_url")),
+                "巨量封面链接": _text(row.get("ad_cover_url")),
+                "原因": reason,
+            }
+        )
+    return pd.DataFrame(rows, columns=["证据状态", "平台", "渠道", "平台编号", "标题", "作品链接", "巨量链接", "巨量封面链接", "原因"])
+
+
+def _manifest_for_row(row: pd.Series, manifest_lookup: dict[str, dict[str, str]]) -> dict[str, str]:
+    for asset_key in _asset_key_candidates_for_row(row):
+        manifest = manifest_lookup.get(asset_key)
+        if manifest:
+            return manifest
+    return {}
+
+
+def _has_douyin_ad_material_evidence(row: pd.Series) -> bool:
+    platform = _text(row.get("platform"))
+    if platform != "抖音":
+        return False
+    has_ad_asset = bool(_text(row.get("ad_material_url")) or _text(row.get("ad_cover_url")))
+    if not has_ad_asset:
+        return False
+    matched = _text(row.get("match_status")) == "已匹配" or _text(row.get("analysis_status")) == "可分析"
+    return matched or _has_work_identity(row) or _has_content_type(row)
+
+
+def _has_work_identity(row: pd.Series) -> bool:
+    return bool(
+        _text(row.get("content_url"))
+        or _text(row.get("work_url"))
+        or _text(row.get("content_id"))
+        or _text(row.get("work_id"))
+    )
+
+
+def _is_unmatched_local_content(row: pd.Series) -> bool:
+    status = _text(row.get("match_status"))
+    analysis_status = _text(row.get("analysis_status"))
+    has_type = _has_content_type(row)
+    return status == "未匹配" or (analysis_status == "不可分析" and not has_type and not _has_work_identity(row))
+
+
+def _has_content_type(row: pd.Series) -> bool:
+    return bool(
+        _text(row.get("category_l1"))
+        or _text(row.get("category_l2"))
+        or _text(row.get("content_type"))
+        or _text(row.get("bilibili_content_type"))
+    )
+
+
+def _manifest_status_lookup(manifests: pd.DataFrame | None) -> dict[str, dict[str, str]]:
+    if manifests is None or manifests.empty:
+        return {}
+    lookup: dict[str, dict[str, str]] = {}
+    frame = manifests.copy()
+    for column in ["asset_key", "status", "error_message"]:
+        if column not in frame.columns:
+            frame[column] = ""
+    for _, row in frame.iterrows():
+        asset_key = _text(row.get("asset_key"))
+        if asset_key and asset_key not in lookup:
+            lookup[asset_key] = {
+                "status": _text(row.get("status")),
+                "error_message": _text(row.get("error_message")),
+            }
+    return lookup
+
+
+def _is_inaccessible_reason(reason: object) -> bool:
+    text = _text(reason)
+    return any(token in text for token in ["删除", "隐藏", "不可访问", "404", "下架", "不存在"])
+
+
+def _classification_quality_issues(items: pd.DataFrame) -> pd.DataFrame:
+    frame = items.copy() if items is not None else pd.DataFrame()
+    for column in ["platform", "channel", "content_id", "title", "category_l1", "category_l2", "bilibili_content_type"]:
+        if column not in frame.columns:
+            frame[column] = ""
+        frame[column] = frame[column].fillna("").astype(str).str.strip()
+    rows: list[dict[str, str]] = []
+    for _, row in frame.iterrows():
+        problem = _classification_problem(row)
+        if not problem:
+            continue
+        rows.append(
+            {
+                "平台": _text(row.get("platform")),
+                "渠道": _text(row.get("channel")),
+                "平台编号": _text(row.get("content_id")),
+                "标题": _text(row.get("title")),
+                "一级类型": _text(row.get("category_l1")),
+                "二级类型": _text(row.get("category_l2")),
+                "B站内容类型": _text(row.get("bilibili_content_type")),
+                "问题": problem,
+            }
+        )
+    return pd.DataFrame(rows, columns=["平台", "渠道", "平台编号", "标题", "一级类型", "二级类型", "B站内容类型", "问题"])
+
+
+def _classification_problem(row: pd.Series) -> str:
+    platform = _text(row.get("platform"))
+    l1 = _text(row.get("category_l1"))
+    l2 = _text(row.get("category_l2"))
+    bilibili_type = _text(row.get("bilibili_content_type"))
+    if platform == "抖音":
+        if l1 not in DOUYIN_TAXONOMY:
+            return f"抖音一级类型只能是{'、'.join(DOUYIN_TAXONOMY)}。"
+        allowed = DOUYIN_TAXONOMY[l1]
+        if allowed and l2 not in allowed:
+            return f"抖音{l1}二级类型只能是{'、'.join(sorted(allowed))}。"
+        if not allowed and l2:
+            return f"抖音{l1}二级类型必须为空。"
+    if platform == "小红书":
+        if l1 not in XHS_TAXONOMY:
+            return "小红书一级类型只能是图文或视频。"
+        allowed = XHS_TAXONOMY[l1]
+        if l2 not in allowed:
+            return f"小红书{l1}二级类型只能是{'、'.join(sorted(allowed))}。"
+    if platform == "B站":
+        effective_type = bilibili_type or l1
+        if l2:
+            return "B站只使用单级内容类型，二级类型必须为空。"
+        if effective_type not in BILIBILI_CONTENT_TYPES:
+            return f"B站内容类型只能是{'、'.join(sorted(BILIBILI_CONTENT_TYPES))}。"
+    return ""
+
+
+def _manual_supplements_display(supplements: pd.DataFrame) -> pd.DataFrame:
+    if supplements is None or supplements.empty:
+        return pd.DataFrame(columns=["平台", "渠道", "平台编号", "标题", "作品链接", "一级类型", "二级类型", "B站内容类型", "证据路径", "影响结论原因"])
+    columns = [
+        "platform",
+        "channel",
+        "content_id",
+        "title",
+        "content_url",
+        "category_l1",
+        "category_l2",
+        "bilibili_content_type",
+        "evidence_path",
+        "reason",
+    ]
+    display = supplements[[column for column in columns if column in supplements.columns]].copy()
+    return localize_columns(display.rename(columns={"evidence_path": "证据路径", "reason": "影响结论原因"}))
 
 
 def _page_local_assets() -> None:
@@ -814,6 +1585,7 @@ def _page_local_assets() -> None:
         st.subheader("本地总素材表")
         if st.button("从线上飞书读取并更新本地总表", width="stretch"):
             _sync_feishu_ledger_to_local("manual:feishu")
+        _render_feishu_sync_diff()
         _show_frame(_local_content_assets_display(list_local_content_assets(APP_DB)), height=420)
 
 
@@ -980,17 +1752,76 @@ def _sync_feishu_ledger_to_local(batch_id: str) -> None:
     copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
     with st.status("正在读取线上飞书台账", expanded=True) as status:
         ledger = load_feishu_content_ledger(env_path=ENV_PATH)
+        diff = build_feishu_content_asset_diff(APP_DB, batch_id, ledger)
         written = upsert_content_assets_from_feishu(APP_DB, batch_id, ledger)
         snapshot = ledger.attrs.get("feishu_snapshot")
         if isinstance(snapshot, dict):
             persist_feishu_ledger_snapshot(APP_DB, batch_id, snapshot)
         status.update(label="本地总表已更新", state="complete")
-    st.success(f"已写入或更新 {written} 条本地素材记录。")
+    st.session_state["feishu_sync_diff"] = diff
+    if diff.summary.get("新增", 0) or diff.summary.get("修改", 0):
+        st.success(
+            f"已读取 {written} 条飞书记录：新增 {diff.summary.get('新增', 0)} 条，"
+            f"修改 {diff.summary.get('修改', 0)} 条，无变化 {diff.summary.get('无变化', 0)} 条。"
+        )
+    else:
+        st.warning("本次飞书没有更新内容，请先在飞书补充或修正后再同步。")
+
+
+def _render_feishu_sync_diff() -> None:
+    diff = st.session_state.get("feishu_sync_diff")
+    if diff is None:
+        return
+    summary = getattr(diff, "summary", {}) or {}
+    st.caption(
+        f"最近一次飞书同步：新增 {int(summary.get('新增', 0))} 条 / "
+        f"修改 {int(summary.get('修改', 0))} 条 / 无变化 {int(summary.get('无变化', 0))} 条"
+    )
+    added = getattr(diff, "added", pd.DataFrame())
+    changed = getattr(diff, "changed", pd.DataFrame())
+    if int(summary.get("新增", 0)) == 0 and int(summary.get("修改", 0)) == 0:
+        st.warning("本次飞书没有更新内容，请先在飞书补充或修正后再同步。")
+        return
+    if added is not None and not added.empty:
+        with st.expander("查看飞书新增内容", expanded=True):
+            _show_frame(_feishu_added_display(added), height=260)
+    if changed is not None and not changed.empty:
+        with st.expander("查看飞书修改内容", expanded=True):
+            _show_frame(_feishu_changed_display(changed), height=260)
 
 
 def _display_batch_id(batch_id: object) -> str:
     text = _text(batch_id)
     return text or "当前周期"
+
+
+def _feishu_added_display(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "platform",
+        "title",
+        "content_id",
+        "content_url",
+        "category_l1",
+        "category_l2",
+        "source_sheet",
+        "source_row",
+    ]
+    display = _select_display_columns(frame, columns)
+    return localize_columns(display)
+
+
+def _feishu_changed_display(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = ["platform", "content_id", "content_url", "title", "field", "old_value", "new_value"]
+    display = _select_display_columns(frame, columns)
+    return localize_columns(
+        display.rename(
+            columns={
+                "field": "修改字段",
+                "old_value": "旧值",
+                "new_value": "新值",
+            }
+        )
+    )
 
 
 def _select_batch(key_prefix: str, *, allow_empty: bool = False) -> str:
@@ -1451,7 +2282,10 @@ def _top_pool_display(top_pool: pd.DataFrame) -> pd.DataFrame:
         "category_l1",
         "category_l2",
         "bilibili_content_type",
+        "work_url",
         "content_url",
+        "ad_material_url",
+        "ad_cover_url",
         "spend",
         "impressions",
         "activations",
@@ -1477,7 +2311,10 @@ def _content_performance_display(items: pd.DataFrame) -> pd.DataFrame:
         "category_l1",
         "category_l2",
         "bilibili_content_type",
+        "work_url",
         "content_url",
+        "ad_material_url",
+        "ad_cover_url",
         "spend",
         "impressions",
         "activations",
@@ -1495,6 +2332,7 @@ def _local_content_assets_display(assets: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "platform",
         "content_id",
+        "work_url",
         "account",
         "title",
         "tags",
@@ -1502,6 +2340,8 @@ def _local_content_assets_display(assets: pd.DataFrame) -> pd.DataFrame:
         "category_l2",
         "bilibili_content_type",
         "content_url",
+        "ad_material_url",
+        "ad_cover_url",
         "published_date",
         "updated_at",
     ]
@@ -1539,6 +2379,10 @@ def _local_asset_dedupe_key(row: pd.Series) -> str:
 
 def _multimodal_recap_display(items: pd.DataFrame) -> pd.DataFrame:
     columns = [
+        "analysis_purpose",
+        "evidence_source",
+        "classification_write_status",
+        "classification_write_reason",
         "platform",
         "channel",
         "content_id",
@@ -1559,6 +2403,24 @@ def _multimodal_recap_display(items: pd.DataFrame) -> pd.DataFrame:
         "updated_at",
     ]
     return _clean_display_title_tags(_format_display_time_columns(_platform_type_display_columns(_select_display_columns(items, columns))))
+
+
+def _strategy_recap_display(items: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "channel",
+        "platform",
+        "type_level",
+        "content_type",
+        "item_count",
+        "metrics",
+        "common_patterns",
+        "reuse_points",
+        "avoid_points",
+        "next_period_actions",
+        "supporting_content_identity_keys",
+        "updated_at",
+    ]
+    return _format_display_time_columns(_select_display_columns(items, columns))
 
 
 def _asset_cache_jobs_display(jobs: pd.DataFrame) -> pd.DataFrame:
@@ -1601,10 +2463,23 @@ def _harvester_asset_manifests_display(manifests: pd.DataFrame) -> pd.DataFrame:
     return _asset_cache_records_display(manifests)
 
 
+def _manifests_with_job_context(manifests: pd.DataFrame, jobs: pd.DataFrame) -> pd.DataFrame:
+    if manifests is None or manifests.empty or jobs is None or jobs.empty:
+        return manifests
+    if "job_id" not in manifests.columns or "job_id" not in jobs.columns:
+        return manifests
+    job_columns = [column for column in ["job_id", "channel", "content_identity_key", "content_id", "content_url"] if column in jobs.columns]
+    if len(job_columns) <= 1:
+        return manifests
+    context = jobs[job_columns].drop_duplicates("job_id")
+    return manifests.merge(context, on="job_id", how="left", suffixes=("", "_job"))
+
+
 def _analysis_jobs_display(jobs: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "status",
         "trigger",
+        "analysis_purpose",
         "platform",
         "channel",
         "title",
@@ -1615,6 +2490,40 @@ def _analysis_jobs_display(jobs: pd.DataFrame) -> pd.DataFrame:
         "updated_at",
     ]
     return _localize_display_values(_select_display_columns(jobs, columns))
+
+
+def _missing_type_pool(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    prepared = frame.copy()
+    for column in ["platform", "platform_group", "category_l1", "category_l2", "bilibili_content_type", "content_type"]:
+        if column not in prepared.columns:
+            prepared[column] = ""
+        prepared[column] = prepared[column].fillna("").astype(str).str.strip()
+    mask = prepared.apply(_row_missing_platform_type, axis=1)
+    return prepared[mask].copy().reset_index(drop=True)
+
+
+def _row_missing_platform_type(row: pd.Series) -> bool:
+    platform = _platform_from_row(row)
+    if platform in {"抖音", "小红书"}:
+        classification = normalize_platform_classification(
+            platform,
+            category_l1=row.get("category_l1"),
+            category_l2=row.get("category_l2"),
+        )
+        if not classification.primary_valid:
+            return True
+        allowed = DOUYIN_TAXONOMY.get(classification.primary_type) if platform == "抖音" else XHS_TAXONOMY.get(classification.primary_type)
+        return bool(allowed) and not classification.secondary_valid
+    if platform == "B站":
+        classification = normalize_platform_classification(
+            platform,
+            bilibili_content_type=row.get("bilibili_content_type"),
+            content_type=row.get("content_type"),
+        )
+        return not classification.bilibili_valid
+    return False
 
 
 def _asset_cache_status_summary(
@@ -1818,15 +2727,15 @@ def _channel_top_link_card_html(row: pd.Series, cover_lookup: dict[str, str], *,
     account = _text(row.get("account"))
     content_id = _text(row.get("content_id"))
     asset_key = _text(row.get("asset_key"))
-    cover_path = cover_lookup.get(asset_key, "")
-    cover_uri = _image_data_uri(cover_path)
-    url = _text(row.get("content_url"))
+    cover_path = _cover_path_for_row(row, cover_lookup)
+    cover_uri = _image_data_uri(cover_path) if cover_path else ""
+    url, open_label = _open_link_for_row(row)
     activation_cost = _safe_ratio(row.get("spend"), row.get("activations"))
     first_pay_cost = _safe_ratio(row.get("spend"), row.get("first_pay_count"))
     details = "｜".join(part for part in [account, content_id] if part)
     cover_id = f"top-cover-{abs(hash(asset_key or content_id or title))}"
     open_link = (
-        f'<a class="top-link-open" href="{_safe_html(url)}" target="_blank" rel="noopener noreferrer">打开内容</a>'
+        f'<a class="top-link-open" href="{_safe_html(url)}" target="_blank" rel="noopener noreferrer">{_safe_html(open_label)}</a>'
         if url
         else '<span class="top-link-open muted">暂无可打开链接</span>'
     )
@@ -1870,12 +2779,154 @@ def _channel_top_link_card_html(row: pd.Series, cover_lookup: dict[str, str], *,
     """).strip()
 
 
+def _cover_path_for_row(row: pd.Series, cover_lookup: dict[str, str]) -> str:
+    for key in _asset_key_candidates_for_row(row):
+        channel_key = _cover_lookup_key(_text(row.get("channel")), key)
+        cover_path = cover_lookup.get(channel_key, "")
+        if cover_path:
+            return cover_path
+        cover_path = cover_lookup.get(key, "")
+        if cover_path:
+            return cover_path
+    return ""
+
+
+def _asset_key_candidates_for_row(row: pd.Series) -> list[str]:
+    platform = _platform_from_row(row)
+    candidates: list[str] = []
+    explicit = _text(row.get("asset_key"))
+    if explicit and not (platform == "抖音" and "::material::" in explicit):
+        candidates.append(explicit)
+    if platform == "抖音":
+        for content_id in _douyin_work_id_candidates_for_row(row):
+            candidates.append(f"抖音::id::{content_id}")
+        return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+    for content_id in _content_id_candidates_for_row(row):
+        candidates.append(f"{platform}::id::{content_id}" if platform else f"id::{content_id}")
+    url = _text(row.get("content_url"))
+    if url:
+        candidates.append(f"{platform}::url::{url}" if platform else f"url::{url}")
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def _open_url_for_row(row: pd.Series) -> str:
+    return _open_link_for_row(row)[0]
+
+
+def _open_link_for_row(row: pd.Series) -> tuple[str, str]:
+    platform = _platform_from_row(row)
+    if platform == "抖音":
+        douyin_id = _preferred_douyin_work_id(row)
+        if douyin_id:
+            return f"https://www.douyin.com/video/{douyin_id}", "打开作品"
+        douyin_url = _douyin_url_from_row(row)
+        if douyin_url:
+            return douyin_url, "打开作品"
+        evidence_url = _text(row.get("ad_material_url")) or _text(row.get("ad_cover_url"))
+        if evidence_url:
+            return evidence_url, "打开巨量证据"
+        return "", ""
+    url = _text(row.get("content_url")) or _text(row.get("work_url"))
+    return (url, "打开作品") if url else ("", "")
+
+
+def _platform_from_row(row: pd.Series) -> str:
+    text = " ".join(_text(row.get(column)) for column in ["platform", "platform_group", "channel"])
+    lowered = text.lower()
+    if "抖音" in text or "douyin" in lowered:
+        return "抖音"
+    if "小红书" in text or "xhs" in lowered:
+        return "小红书"
+    if "B站" in text or "b站" in text or "bilibili" in lowered:
+        return "B站"
+    return _text(row.get("platform"))
+
+
+def _content_id_candidates_for_row(row: pd.Series) -> list[str]:
+    return [
+        value
+        for value in [
+            _text(row.get("content_id")),
+            _text(row.get("material_id")),
+            _text(row.get("work_id")),
+            _douyin_id_from_text(row.get("content_url")),
+            _douyin_id_from_text(row.get("asset_key")),
+            _douyin_id_from_text(row.get("content_identity_key")),
+        ]
+        if value
+    ]
+
+
+def _douyin_id_candidates_for_row(row: pd.Series) -> list[str]:
+    values = [
+        _text(row.get("content_id")),
+        _text(row.get("work_id")),
+        _douyin_id_from_text(row.get("content_url")),
+        _text(row.get("material_id")),
+        _douyin_id_from_text(row.get("asset_key")),
+        _douyin_id_from_text(row.get("content_identity_key")),
+    ]
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _douyin_work_id_candidates_for_row(row: pd.Series) -> list[str]:
+    material_id = _text(row.get("ad_material_id")) or _text(row.get("material_id"))
+    trusted = _has_trusted_douyin_link_source(row)
+    values = []
+    for value in [
+        _text(row.get("work_id")),
+        _douyin_id_from_text(row.get("work_url")),
+        _douyin_id_from_text(row.get("content_url")),
+        _douyin_id_from_text(row.get("content_identity_key")),
+    ]:
+        if not value:
+            continue
+        if value == material_id and not trusted:
+            continue
+        values.append(value)
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _preferred_douyin_work_id(row: pd.Series) -> str:
+    for value in _douyin_work_id_candidates_for_row(row):
+        if value:
+            return value
+    return ""
+
+
+def _douyin_url_from_row(row: pd.Series) -> str:
+    for value in [_text(row.get("work_url")), _text(row.get("content_url"))]:
+        item_id = _douyin_id_from_text(value)
+        material_id = _text(row.get("ad_material_id")) or _text(row.get("material_id"))
+        if "douyin.com/" in value and item_id and (item_id != material_id or _has_trusted_douyin_link_source(row)):
+            return value
+    return ""
+
+
+def _has_trusted_douyin_link_source(row: pd.Series) -> bool:
+    source = " ".join(_text(row.get(column)) for column in ["link_source", "metadata_source", "match_source"]).lower()
+    return any(
+        token in source
+        for token in ["harvester_douyin_detail", "harvester_cache", "metadata_cache", "original_excel", "作品id"]
+    )
+
+
+def _douyin_id_from_text(value: object) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    match = re.search(r"(?:douyin\.com/video/|抖音::id::|::抖音::id::)([A-Za-z0-9_-]+)", text)
+    if match:
+        return match.group(1)
+    return ""
+
+
 def _top_cover_lookup(manifests: pd.DataFrame | None) -> dict[str, str]:
     if manifests is None or manifests.empty:
         return {}
     lookup: dict[str, str] = {}
     frame = manifests.copy()
-    for column in ["asset_key", "cover_path", "status"]:
+    for column in ["asset_key", "cover_path", "status", "channel"]:
         if column not in frame.columns:
             frame[column] = ""
     for _, row in frame.iterrows():
@@ -1883,9 +2934,16 @@ def _top_cover_lookup(manifests: pd.DataFrame | None) -> dict[str, str]:
             continue
         asset_key = _text(row.get("asset_key"))
         cover_path = _text(row.get("cover_path"))
+        channel = _text(row.get("channel"))
+        if channel and asset_key and cover_path:
+            lookup.setdefault(_cover_lookup_key(channel, asset_key), cover_path)
         if asset_key and cover_path and asset_key not in lookup:
             lookup[asset_key] = cover_path
     return lookup
+
+
+def _cover_lookup_key(channel: str, asset_key: str) -> str:
+    return f"{_text(channel)}::{_text(asset_key)}"
 
 
 def _build_local_recap_tables(db_path: Path, batch_id: str, top_pool: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -2091,11 +3149,13 @@ def _display_value_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def _analysis_job_result_analyzer(batch_id: str):
+def _analysis_job_result_analyzer(batch_id: str, analysis_purpose: str = ANALYSIS_PURPOSE_STRATEGY_RECAP):
     jobs = list_analysis_jobs(APP_DB, batch_id=batch_id)
     results: dict[str, dict[str, object]] = {}
     if not jobs.empty:
         for _, row in jobs.iterrows():
+            if _text(row.get("analysis_purpose")) != analysis_purpose:
+                continue
             identity = _text(row.get("content_identity_key"))
             result_json = _text(row.get("result_json"))
             if not identity or not result_json:

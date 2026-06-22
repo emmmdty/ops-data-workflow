@@ -172,9 +172,24 @@ def _douyin_row_work_ids(row: pd.Series) -> list[str]:
     from .platform_normalizers.douyin import extract_douyin_item_id
 
     values = []
-    for column in ["work_id", "content_id", "content_url", "work_url"]:
-        values.append(extract_douyin_item_id(row.get(column, "")))
+    work_id = extract_douyin_item_id(row.get("work_id", ""))
+    material_id = _douyin_material_id(row)
+    trusted_source = _has_trusted_douyin_link_source(row)
+    if work_id and (not _same_douyin_material_id(work_id, material_id) or trusted_source):
+        values.append(work_id)
+    for column in ["content_url", "work_url"]:
+        candidate = extract_douyin_item_id(row.get(column, ""))
+        if candidate and (not _same_douyin_material_id(candidate, material_id) or trusted_source):
+            values.append(candidate)
     return _unique_nonblank(values)
+
+
+def _has_trusted_douyin_link_source(row: pd.Series) -> bool:
+    source = " ".join(text_value(row.get(column, "")) for column in ["link_source", "metadata_source", "match_source"]).lower()
+    return any(
+        token in source
+        for token in ["harvester_douyin_detail", "harvester_cache", "metadata_cache", "original_excel", "作品id"]
+    )
 
 
 def _ledger_work_id(platform: str, row: pd.Series) -> str:
@@ -187,13 +202,34 @@ def _ledger_work_id(platform: str, row: pd.Series) -> str:
     if platform == "抖音":
         from .platform_normalizers.douyin import extract_douyin_item_id
 
-        return extract_douyin_item_id(text) or extract_douyin_item_id(url)
+        material_id = _douyin_material_id(row)
+        trusted_source = _has_trusted_douyin_link_source(row)
+        for value in [row.get("work_id", ""), row.get("work_url", ""), text, url]:
+            candidate = extract_douyin_item_id(value)
+            if candidate and (not _same_douyin_material_id(candidate, material_id) or trusted_source):
+                return candidate
+        return ""
     return text
 
 
 def _ledger_work_url(platform: str, row: pd.Series, work_id: str) -> str:
-    return _normalized_work_url(platform, row.get("content_url", "")) or (
-        normalize_xhs_url(work_id) if platform == "小红书" else normalize_bilibili_url(work_id) if platform == "B站" else ""
+    source_url = row.get("work_url", "") if platform == "抖音" else row.get("content_url", "")
+    normalized = _normalized_work_url(platform, source_url)
+    if platform == "抖音" and normalized:
+        from .platform_normalizers.douyin import extract_douyin_item_id
+
+        material_id = _douyin_material_id(row)
+        item_id = extract_douyin_item_id(normalized)
+        if _same_douyin_material_id(item_id, material_id) and not _has_trusted_douyin_link_source(row):
+            normalized = ""
+    return normalized or (
+        normalize_xhs_url(work_id)
+        if platform == "小红书"
+        else normalize_bilibili_url(work_id)
+        if platform == "B站"
+        else f"https://www.douyin.com/video/{work_id}"
+        if platform == "抖音" and work_id
+        else ""
     )
 
 
@@ -297,6 +333,35 @@ def _unique_nonblank(values: list[str]) -> list[str]:
             seen.add(text)
             result.append(text)
     return result
+
+
+def _douyin_material_id(row: pd.Series) -> str:
+    return _normalized_douyin_numeric_id(row.get("ad_material_id")) or _normalized_douyin_numeric_id(row.get("material_id"))
+
+
+def _same_douyin_material_id(item_id: str, material_id: str) -> bool:
+    item = _normalized_douyin_numeric_id(item_id)
+    material = _normalized_douyin_numeric_id(material_id)
+    if not item or not material:
+        return False
+    if item == material:
+        return True
+    return len(item) == len(material) and item[:15] == material[:15]
+
+
+def _normalized_douyin_numeric_id(value: object) -> str:
+    text = text_value(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{10,24}", text):
+        return text
+    if re.fullmatch(r"\d+(?:\.\d+)?e\+\d+", text, flags=re.IGNORECASE):
+        try:
+            return str(int(float(text)))
+        except (OverflowError, ValueError):
+            return ""
+    match = re.search(r"(?<!\d)(\d{10,24})(?!\d)", text)
+    return match.group(1) if match else ""
 
 
 def _normalized_work_url(platform: str, value: object) -> str:

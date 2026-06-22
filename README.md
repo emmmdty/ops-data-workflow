@@ -82,7 +82,7 @@ uv run streamlit run app.py
 - `data/years/`：直接上传的年度原始源文件。
 - `processed/`：清洗产物和核验 workbook。
 - `.runtime/workflow.sqlite3`：权威运行库。
-- `.runtime/top-assets/{platform}/{stable_asset_key}/`：本项目复用或补采的素材缓存，同一素材跨周期只存一份。
+- `.runtime/top-assets/{platform}/{真实作品ID}/`：本项目复用或补采的素材库，同一真实平台作品跨周期只存一份；巨量素材 ID 不作为复用目录名。
 - `config/channel_profiles.yml`：渠道识别配置；字段别名优先于通用字段映射。
 - `config/field_mapping.yml`：通用字段别名。
 

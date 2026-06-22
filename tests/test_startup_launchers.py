@@ -20,33 +20,42 @@ def load_startup_module():
     return module
 
 
-def test_port_selection_uses_8501_when_available():
+def reserve_ephemeral_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def test_port_selection_uses_start_port_when_available():
     start_lan = load_startup_module()
+    port = reserve_ephemeral_port()
 
-    assert start_lan.find_available_port("127.0.0.1", 8501, 8501) == 8501
+    assert start_lan.find_available_port("127.0.0.1", port, port) == port
 
 
-def test_port_selection_moves_to_next_port_when_8501_is_occupied():
+def test_port_selection_moves_to_next_port_when_start_port_is_occupied():
     start_lan = load_startup_module()
+    port = reserve_ephemeral_port()
     occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    occupied.bind(("127.0.0.1", 8501))
+    occupied.bind(("127.0.0.1", port))
     occupied.listen(1)
     try:
-        assert start_lan.find_available_port("127.0.0.1", 8501, 8503) == 8502
+        assert start_lan.find_available_port("127.0.0.1", port, port + 2) == port + 1
     finally:
         occupied.close()
 
 
 def test_port_selection_errors_when_range_is_exhausted():
     start_lan = load_startup_module()
+    port = reserve_ephemeral_port()
     occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    occupied.bind(("127.0.0.1", 8501))
+    occupied.bind(("127.0.0.1", port))
     occupied.listen(1)
     try:
-        with pytest.raises(RuntimeError, match="8501-8501"):
-            start_lan.find_available_port("127.0.0.1", 8501, 8501)
+        with pytest.raises(RuntimeError, match=f"{port}-{port}"):
+            start_lan.find_available_port("127.0.0.1", port, port)
     finally:
         occupied.close()
 

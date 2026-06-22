@@ -13,6 +13,8 @@ CLEANED_ASSET_COLUMNS = [
     "标准标题",
     "作品链接",
     "作品ID/BV号",
+    "巨量链接",
+    "巨量封面链接",
     "巨量素材ID",
     "消耗",
     "曝光",
@@ -60,6 +62,8 @@ def build_cleaned_asset_table(canonical: pd.DataFrame) -> pd.DataFrame:
     result["标准标题"] = _first_text(frame, ["standard_title", "title"])
     result["作品链接"] = _first_text(frame, ["work_url", "content_url"])
     result["作品ID/BV号"] = _work_identity(frame)
+    result["巨量链接"] = _text(frame, "ad_material_url")
+    result["巨量封面链接"] = _text(frame, "ad_cover_url")
     result["巨量素材ID"] = _first_text(frame, ["ad_material_id", "material_id"])
     result["消耗"] = _numeric(frame, "spend")
     result["曝光"] = _numeric(frame, "impressions")

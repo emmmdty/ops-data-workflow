@@ -25,6 +25,7 @@ from ops_data_workflow.harvester_bridge import (
     _run_command_with_progress,
 )
 from ops_data_workflow.storage import (
+    build_feishu_content_asset_diff,
     init_db,
     list_harvester_asset_jobs,
     list_harvester_asset_manifests,
@@ -36,6 +37,7 @@ from ops_data_workflow.storage import (
     persist_feishu_ledger_snapshot,
     persist_harvester_asset_jobs,
     persist_harvester_asset_manifests,
+    upsert_top_asset_cache_entry,
     upsert_content_assets_from_feishu,
 )
 
@@ -199,15 +201,18 @@ class HarvesterBridgeTests(unittest.TestCase):
         self.assertEqual(jobs[0]["content_url"], "https://www.douyin.com/video/7594830477777751338")
         self.assertEqual(jobs[0]["content_identity_key"], "抖音商业化::抖音::id::7594830477777751338")
 
-    def test_build_asset_jobs_uses_douyin_work_id_from_url_before_juliang_material_id(self):
+    def test_build_asset_jobs_does_not_treat_douyin_material_id_as_work_url(self):
         top_content = pd.DataFrame(
             [
                 {
                     "platform": "抖音",
                     "channel": "抖音商业化",
-                    "content_identity_key": "抖音商业化::抖音::id::7623723655051214889",
+                    "content_identity_key": "抖音商业化::抖音::title_account::投放号::巨量素材",
                     "content_id": "7623721481431780662",
-                    "content_url": "https://www.douyin.com/video/7623723655051214889?previous_page=web_code_link",
+                    "material_id": "7623721481431780662",
+                    "content_url": "",
+                    "work_id": "",
+                    "work_url": "",
                     "title": "巨量素材链接",
                     "spend": 3000,
                 }
@@ -216,9 +221,86 @@ class HarvesterBridgeTests(unittest.TestCase):
 
         jobs = build_asset_jobs("batch-1", top_content)
 
-        self.assertEqual(jobs[0]["content_id"], "7623723655051214889")
-        self.assertEqual(jobs[0]["content_url"], "https://www.douyin.com/video/7623723655051214889")
-        self.assertEqual(jobs[0]["content_identity_key"], "抖音商业化::抖音::id::7623723655051214889")
+        self.assertEqual(jobs[0]["content_id"], "")
+        self.assertEqual(jobs[0]["content_url"], "")
+        self.assertEqual(jobs[0]["ad_material_id"], "7623721481431780662")
+        self.assertEqual(jobs[0]["content_identity_key"], "抖音商业化::抖音::title_account::投放号::巨量素材")
+
+    def test_build_asset_jobs_ignores_douyin_material_id_when_work_url_has_real_id(self):
+        top_content = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_identity_key": "抖音商业化::抖音::url::https://www.douyin.com/video/7594830477777751338",
+                    "content_id": "",
+                    "material_id": "7595047544461393956",
+                    "content_url": "https://www.douyin.com/video/7594830477777751338",
+                    "title": "只有链接匹配到真实作品",
+                    "spend": 3000,
+                }
+            ]
+        )
+
+        jobs = build_asset_jobs("batch-1", top_content)
+
+        self.assertEqual(jobs[0]["content_id"], "7594830477777751338")
+        self.assertEqual(jobs[0]["content_url"], "https://www.douyin.com/video/7594830477777751338")
+        self.assertEqual(jobs[0]["content_identity_key"], "抖音商业化::抖音::id::7594830477777751338")
+
+    def test_build_asset_jobs_rejects_douyin_content_url_when_it_matches_material_id(self):
+        top_content = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_identity_key": "抖音商业化::抖音::title_account::投放号::巨量链接",
+                    "content_id": "",
+                    "material_id": "7623721481431780662",
+                    "content_url": "https://www.douyin.com/video/7623721481431780662",
+                    "work_id": "",
+                    "work_url": "",
+                    "title": "巨量链接被误当作品",
+                    "spend": 3000,
+                }
+            ]
+        )
+
+        jobs = build_asset_jobs("batch-1", top_content)
+
+        self.assertEqual(jobs[0]["content_id"], "")
+        self.assertEqual(jobs[0]["content_url"], "")
+        self.assertEqual(jobs[0]["ad_material_id"], "7623721481431780662")
+        self.assertEqual(jobs[0]["content_identity_key"], "抖音商业化::抖音::title_account::投放号::巨量链接")
+
+    def test_build_asset_jobs_passes_douyin_giant_asset_links_as_evidence_only(self):
+        top_content = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "channel": "抖音商业化",
+                    "content_identity_key": "抖音商业化::抖音::title_account::投放号::巨量素材",
+                    "content_id": "",
+                    "material_id": "7623721481431780662",
+                    "content_url": "",
+                    "work_id": "",
+                    "work_url": "",
+                    "title": "巨量素材",
+                    "account": "投放号",
+                    "ad_material_url": "https://巨量.example/video.mp4",
+                    "ad_cover_url": "https://巨量.example/cover.jpg",
+                    "spend": 3000,
+                }
+            ]
+        )
+
+        jobs = build_asset_jobs("batch-1", top_content)
+
+        self.assertEqual(jobs[0]["content_id"], "")
+        self.assertEqual(jobs[0]["content_url"], "")
+        self.assertEqual(jobs[0]["ad_material_id"], "7623721481431780662")
+        self.assertEqual(jobs[0]["ad_material_url"], "https://巨量.example/video.mp4")
+        self.assertEqual(jobs[0]["ad_cover_url"], "https://巨量.example/cover.jpg")
 
     def test_run_harvester_asset_capture_records_missing_cli_as_failed_jobs(self):
         with TemporaryDirectory() as tmp:
@@ -366,7 +448,7 @@ class HarvesterBridgeTests(unittest.TestCase):
             self.assertEqual(seen["command"][seen["command"].index("--target-date") + 1], "2026-05-31")
             jobs = list_harvester_asset_jobs(db_path, batch_id="batch-1")
             manifests = list_harvester_asset_manifests(db_path, batch_id="batch-1")
-            cached_dir = tmp_path / ".runtime" / "top-assets" / "xhs" / "小红书_id_note-1"
+            cached_dir = tmp_path / ".runtime" / "top-assets" / "xhs" / "note-1"
             self.assertEqual(jobs.iloc[0]["status"], "succeeded")
             self.assertEqual(manifests.iloc[0]["asset_key"], "小红书::id::note-1")
             self.assertEqual(Path(manifests.iloc[0]["asset_dir"]).resolve(), cached_dir.resolve())
@@ -378,6 +460,179 @@ class HarvesterBridgeTests(unittest.TestCase):
             refs = list_top_asset_cache_refs(db_path, batch_id="batch-1")
             self.assertEqual(entries.iloc[0]["asset_key"], "小红书::id::note-1")
             self.assertEqual(len(refs), 1)
+
+    def test_run_harvester_asset_capture_preserves_capture_run_source_assets(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            harvester_root = tmp_path / "harvester-THS"
+            harvester_root.mkdir()
+            (harvester_root / "package.json").write_text(
+                json.dumps({"scripts": {"materials:cache-topn": "node src/cache-topn-materials.mjs"}}),
+                encoding="utf-8",
+            )
+            db_path = tmp_path / "workflow.sqlite3"
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "抖音商业化::抖音::id::7594830477777751338",
+                        "content_id": "7594830477777751338",
+                        "content_url": "https://www.douyin.com/video/7594830477777751338",
+                        "title": "标题",
+                        "period_end": "2026-06-11",
+                        "spend": 3000,
+                    }
+                ]
+            )
+            source_assets: dict[str, Path] = {}
+
+            def fake_runner(command, **kwargs):
+                input_path = Path(command[command.index("--input") + 1])
+                out_path = Path(command[command.index("--out") + 1])
+                run_root = Path(command[command.index("--root") + 1])
+                asset_dir = run_root / "output" / "2026-06-11" / "douyin" / "7594830477777751338"
+                asset_dir.mkdir(parents=True)
+                (asset_dir / "cover.jpg").write_text("cover", encoding="utf-8")
+                source_assets["dir"] = asset_dir
+                out_path.write_text(
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "job_id": json.loads(input_path.read_text(encoding="utf-8").splitlines()[0])["job_id"],
+                                    "status": "succeeded",
+                                    "platform": "抖音",
+                                    "asset_dir": str(asset_dir),
+                                    "cover_path": str(asset_dir / "cover.jpg"),
+                                    "metadata": {},
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(tmp_path)
+                result = run_harvester_asset_capture(
+                    db_path,
+                    "batch-1",
+                    top_content,
+                    harvester_root=harvester_root,
+                    runtime_root=Path("runtime"),
+                    runner=fake_runner,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            cached_dir = tmp_path / ".runtime" / "top-assets" / "douyin" / "7594830477777751338"
+            self.assertTrue(result.ok)
+            self.assertTrue((cached_dir / "cover.jpg").exists())
+            self.assertTrue((source_assets["dir"] / "cover.jpg").exists())
+
+    def test_run_harvester_asset_capture_keeps_existing_batch_manifests_in_manifest_file(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            harvester_root = tmp_path / "harvester-THS"
+            harvester_root.mkdir()
+            (harvester_root / "package.json").write_text(
+                json.dumps({"scripts": {"materials:cache-topn": "node src/cache-topn-materials.mjs"}}),
+                encoding="utf-8",
+            )
+            db_path = tmp_path / "workflow.sqlite3"
+            existing_dir = tmp_path / ".runtime" / "top-assets" / "douyin" / "7594830477777751338"
+            existing_dir.mkdir(parents=True)
+            (existing_dir / "cover.jpg").write_text("old cover", encoding="utf-8")
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "抖音商业化::抖音::id::7594830477777751338",
+                        "content_id": "7594830477777751338",
+                        "content_url": "https://www.douyin.com/video/7594830477777751338",
+                        "title": "旧标题",
+                        "period_end": "2026-06-11",
+                        "spend": 5000,
+                    },
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "抖音商业化::抖音::id::7625926538924478825",
+                        "content_id": "7625926538924478825",
+                        "content_url": "https://www.douyin.com/video/7625926538924478825",
+                        "title": "标题",
+                        "period_end": "2026-06-11",
+                        "spend": 3000,
+                    }
+                ]
+            )
+            existing_job = build_asset_jobs("batch-1", top_content.iloc[[0]])[0]
+            persist_harvester_asset_manifests(
+                db_path,
+                "batch-1",
+                [
+                    {
+                        "job_id": existing_job["job_id"],
+                        "status": "succeeded",
+                        "platform": "抖音",
+                        "asset_key": "抖音::id::7594830477777751338",
+                        "asset_dir": str(existing_dir),
+                        "cover_path": str(existing_dir / "cover.jpg"),
+                        "video_path": "",
+                        "screenshots": [str(existing_dir / "cover.jpg")],
+                        "frames": [],
+                        "metadata": {},
+                        "error_message": "",
+                    }
+                ],
+            )
+
+            def fake_runner(command, **kwargs):
+                input_path = Path(command[command.index("--input") + 1])
+                out_path = Path(command[command.index("--out") + 1])
+                run_root = Path(command[command.index("--root") + 1])
+                asset_dir = run_root / "output" / "2026-06-11" / "douyin" / "7625926538924478825"
+                asset_dir.mkdir(parents=True)
+                (asset_dir / "cover.jpg").write_text("new cover", encoding="utf-8")
+                out_path.write_text(
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "job_id": json.loads(input_path.read_text(encoding="utf-8").splitlines()[0])["job_id"],
+                                    "status": "succeeded",
+                                    "platform": "抖音",
+                                    "asset_dir": str(asset_dir),
+                                    "cover_path": str(asset_dir / "cover.jpg"),
+                                    "metadata": {},
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+            result = run_harvester_asset_capture(
+                db_path,
+                "batch-1",
+                top_content,
+                harvester_root=harvester_root,
+                runtime_root=tmp_path / "runtime",
+                runner=fake_runner,
+            )
+
+            self.assertTrue(result.ok)
+            manifest_items = load_asset_manifests(result.manifest_path)
+            asset_keys = {item["asset_key"] for item in manifest_items}
+            self.assertIn("抖音::id::7594830477777751338", asset_keys)
+            self.assertIn("抖音::id::7625926538924478825", asset_keys)
 
     def test_run_harvester_asset_capture_reports_progress_counts(self):
         with TemporaryDirectory() as tmp:
@@ -806,9 +1061,9 @@ class HarvesterBridgeTests(unittest.TestCase):
                         "account": "",
                         "tags": "股票,投教",
                         "raw_content_type": "图文",
-                        "category_l1": "投教",
-                        "category_l2": "方法论",
-                        "content_type": "方法论",
+                        "category_l1": "图文",
+                        "category_l2": "理财方法",
+                        "content_type": "理财方法",
                         "published_date": "2026/06/01",
                         "source_file": "feishu",
                         "source_sheet": "小红书",
@@ -826,9 +1081,9 @@ class HarvesterBridgeTests(unittest.TestCase):
                         "account": "",
                         "tags": "",
                         "raw_content_type": "",
-                        "category_l1": "投教",
-                        "category_l2": "选题拆解",
-                        "content_type": "选题拆解",
+                        "category_l1": "图文",
+                        "category_l2": "行业盘点",
+                        "content_type": "行业盘点",
                         "published_date": "2026-06-02",
                         "source_file": "feishu",
                         "source_sheet": "小红书",
@@ -846,9 +1101,81 @@ class HarvesterBridgeTests(unittest.TestCase):
             self.assertEqual(row["title"], "新标题")
             self.assertEqual(row["account"], "")
             self.assertEqual(row["tags"], "股票,投教")
-            self.assertEqual(row["category_l2"], "选题拆解")
+            self.assertEqual(row["category_l2"], "行业盘点")
             self.assertEqual(row["published_date"], "2026-06-02")
             self.assertEqual(row["last_seen_batch_id"], "batch-2")
+
+    def test_feishu_asset_diff_reports_added_changed_and_unchanged_rows(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            existing = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "content_id": "7594830477777751338",
+                        "content_url": "https://www.douyin.com/video/7594830477777751338",
+                        "title": "旧标题",
+                        "account": "旧账号",
+                        "category_l1": "股友说",
+                        "category_l2": "旧二级",
+                        "content_type": "旧二级",
+                        "source_file": "feishu",
+                        "source_sheet": "抖音",
+                        "source_row": 2,
+                    }
+                ]
+            )
+            incoming = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "content_id": "7594830477777751338",
+                        "content_url": "https://www.douyin.com/video/7594830477777751338",
+                        "title": "新标题",
+                        "account": "",
+                        "category_l1": "股友说",
+                        "category_l2": "新二级",
+                        "content_type": "新二级",
+                        "source_file": "feishu",
+                        "source_sheet": "抖音",
+                        "source_row": 2,
+                    },
+                    {
+                        "platform": "抖音",
+                        "content_id": "7646251309365346347",
+                        "content_url": "https://www.douyin.com/video/7646251309365346347",
+                        "title": "新增标题",
+                        "category_l1": "行情资讯",
+                        "category_l2": "市场解读",
+                        "content_type": "市场解读",
+                        "source_file": "feishu",
+                        "source_sheet": "抖音",
+                        "source_row": 3,
+                    },
+                ]
+            )
+
+            upsert_content_assets_from_feishu(db_path, "batch-1", existing)
+            diff = build_feishu_content_asset_diff(db_path, "batch-2", incoming)
+
+            self.assertEqual(diff.summary["新增"], 1)
+            self.assertEqual(diff.summary["修改"], 1)
+            self.assertEqual(diff.summary["无变化"], 0)
+            self.assertIn("新增标题", set(diff.added["title"]))
+            changed = diff.changed.iloc[0]
+            self.assertEqual(changed["platform"], "抖音")
+            self.assertEqual(changed["content_id"], "7594830477777751338")
+            self.assertEqual(changed["field"], "category_l2")
+            self.assertEqual(changed["old_value"], "旧二级")
+            self.assertEqual(changed["new_value"], "新二级")
+
+            upsert_content_assets_from_feishu(db_path, "batch-2", incoming)
+            assets = list_local_content_assets(db_path)
+            updated = assets[assets["content_id"].eq("7594830477777751338")].iloc[0]
+            self.assertEqual(updated["title"], "新标题")
+            self.assertEqual(updated["account"], "旧账号")
+            self.assertEqual(updated["category_l2"], "")
+            self.assertEqual(updated["raw_content_type"], "新二级")
 
     def test_build_asset_jobs_to_capture_skips_successful_existing_manifest(self):
         with TemporaryDirectory() as tmp:
@@ -962,7 +1289,7 @@ class HarvesterBridgeTests(unittest.TestCase):
 
             jobs = list_harvester_asset_jobs(db_path, batch_id="new-batch")
             manifests = list_harvester_asset_manifests(db_path, batch_id="new-batch")
-            cached_dir = tmp_path / ".runtime" / "top-assets" / "bilibili" / "B站_id_BV1same"
+            cached_dir = tmp_path / ".runtime" / "top-assets" / "bilibili" / "BV1same"
             self.assertEqual(reused, 1)
             self.assertTrue(cached_dir.exists())
             self.assertEqual(len(jobs), 1)
@@ -1032,7 +1359,7 @@ class HarvesterBridgeTests(unittest.TestCase):
             )
             pending = build_asset_jobs_to_capture(db_path, "batch-1", top_content)
             manifests = list_harvester_asset_manifests(db_path, batch_id="batch-1")
-            cached_dir = tmp_path / ".runtime" / "top-assets" / "douyin" / "抖音_id_7594830477777751338"
+            cached_dir = tmp_path / ".runtime" / "top-assets" / "douyin" / "7594830477777751338"
 
             self.assertEqual(reused, 1)
             self.assertEqual(pending, [])
@@ -1040,6 +1367,138 @@ class HarvesterBridgeTests(unittest.TestCase):
             self.assertEqual(Path(manifests.iloc[0]["asset_dir"]).resolve(), cached_dir.resolve())
             self.assertTrue(cached_dir.exists())
             self.assertIn("harvester每日缓存", manifests.iloc[0]["metadata_json"])
+
+    def test_cache_existing_harvester_assets_recovers_previous_ops_capture_run(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            harvester_root = tmp_path / "harvester-THS"
+            cache_root = tmp_path / ".runtime" / "top-assets"
+            capture_dir = (
+                cache_root
+                / "_capture-runs"
+                / "upload_week_20260605-20260611"
+                / "output"
+                / "2026-06-11"
+                / "douyin"
+                / "7625944581779066138"
+            )
+            capture_dir.mkdir(parents=True)
+            (capture_dir / "7625944581779066138.jpeg").write_text("cover", encoding="utf-8")
+            (capture_dir / "7625944581779066138.mp4").write_text("video", encoding="utf-8")
+            (capture_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "platformId": "douyin",
+                        "id": "7625944581779066138",
+                        "link": "https://www.douyin.com/video/7625944581779066138",
+                        "title": "据说赚钱的股民都听这首歌？",
+                        "dir": str(capture_dir),
+                        "ok": True,
+                        "assets": [
+                            {"kind": "image", "path": str(capture_dir / "7625944581779066138.jpeg")},
+                            {"kind": "video", "path": str(capture_dir / "7625944581779066138.mp4")},
+                        ],
+                        "imagePaths": [str(capture_dir / "7625944581779066138.jpeg")],
+                        "videoPath": str(capture_dir / "7625944581779066138.mp4"),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "抖音商业化::抖音::id::7625944581779066138",
+                        "content_id": "7625944581779066138",
+                        "work_id": "7625944581779066138",
+                        "work_url": "https://www.douyin.com/video/7625944581779066138",
+                        "content_url": "https://www.douyin.com/video/7625944581779066138",
+                        "title": "据说赚钱的股民都听这首歌？",
+                        "period_end": "2026-06-11",
+                        "spend": 3000,
+                    }
+                ]
+            )
+
+            reused = cache_existing_harvester_assets_for_batch(
+                db_path,
+                "upload:week:20260605-20260611",
+                top_content,
+                cache_root=cache_root,
+                harvester_root=harvester_root,
+                jobs_path=tmp_path / "jobs.jsonl",
+                manifest_path=tmp_path / "manifest.json",
+            )
+
+            manifests = list_harvester_asset_manifests(db_path, batch_id="upload:week:20260605-20260611")
+            cached_dir = cache_root / "douyin" / "7625944581779066138"
+            self.assertEqual(reused, 1)
+            self.assertEqual(manifests.iloc[0]["asset_key"], "抖音::id::7625944581779066138")
+            self.assertEqual(Path(manifests.iloc[0]["asset_dir"]).resolve(), cached_dir.resolve())
+            self.assertEqual(Path(manifests.iloc[0]["cover_path"]).resolve(), (cached_dir / "7625944581779066138.jpeg").resolve())
+            self.assertEqual(Path(manifests.iloc[0]["video_path"]).resolve(), (cached_dir / "7625944581779066138.mp4").resolve())
+            self.assertTrue((cached_dir / "7625944581779066138.jpeg").exists())
+            self.assertTrue((cached_dir / "7625944581779066138.mp4").exists())
+
+    def test_cache_existing_harvester_assets_rejects_conflicting_douyin_manifest_ids(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            harvester_root = tmp_path / "harvester-THS"
+            source_dir = harvester_root / "output" / "2026-06-11" / "douyin" / "7625944581779066138"
+            screenshot_dir = source_dir / "screenshots"
+            screenshot_dir.mkdir(parents=True)
+            (screenshot_dir / "001.jpg").write_text("wrong page", encoding="utf-8")
+            (source_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "platformId": "douyin",
+                        "id": "7625944581779066138",
+                        "link": "https://www.douyin.com/video/7626286546770968627",
+                        "dir": str(source_dir),
+                        "ok": True,
+                        "error": "yt-dlp 下载失败，退出码 1；已使用抖音图文视觉兜底素材。",
+                        "assets": [{"kind": "image", "path": str(screenshot_dir / "001.jpg")}],
+                        "fallback": {"kind": "douyin-note-visual", "extractedMedia": False, "screenshots": 1},
+                        "imagePaths": [str(screenshot_dir / "001.jpg")],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "抖音商业化::抖音::id::7626286546770968627",
+                        "content_id": "7626286546770968627",
+                        "work_id": "7626286546770968627",
+                        "work_url": "https://www.douyin.com/video/7626286546770968627",
+                        "content_url": "https://www.douyin.com/video/7626286546770968627",
+                        "title": "真实作品",
+                        "period_end": "2026-06-11",
+                        "spend": 3000,
+                    }
+                ]
+            )
+
+            reused = cache_existing_harvester_assets_for_batch(
+                db_path,
+                "batch-1",
+                top_content,
+                cache_root=tmp_path / ".runtime" / "top-assets",
+                harvester_root=harvester_root,
+                jobs_path=tmp_path / "jobs.jsonl",
+                manifest_path=tmp_path / "manifest.json",
+            )
+            manifests = list_harvester_asset_manifests(db_path, batch_id="batch-1")
+
+            self.assertEqual(reused, 0)
+            self.assertTrue(manifests.empty)
 
     def test_cache_existing_harvester_assets_is_idempotent_when_manifest_already_points_to_ops_cache(self):
         with TemporaryDirectory() as tmp:
@@ -1061,7 +1520,7 @@ class HarvesterBridgeTests(unittest.TestCase):
                 ]
             )
             job = build_asset_jobs("batch-1", top_content)[0]
-            cached_dir = cache_root / "douyin" / "抖音_id_7594830477777751338"
+            cached_dir = cache_root / "douyin" / "7594830477777751338"
             cached_dir.mkdir(parents=True)
             (cached_dir / "7594830477777751338.mp4").write_text("video", encoding="utf-8")
             (cached_dir / "7594830477777751338.jpeg").write_text("cover", encoding="utf-8")
@@ -1106,6 +1565,63 @@ class HarvesterBridgeTests(unittest.TestCase):
             self.assertTrue((cached_dir / "7594830477777751338.jpeg").exists())
             self.assertEqual(Path(manifests.iloc[0]["asset_dir"]).resolve(), cached_dir.resolve())
             self.assertEqual(Path(manifests.iloc[0]["cover_path"]).resolve(), (cached_dir / "7594830477777751338.jpeg").resolve())
+
+    def test_cache_existing_harvester_assets_does_not_reuse_douyin_giant_only_cache(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            cache_root = tmp_path / ".runtime" / "top-assets"
+            cached_dir = cache_root / "douyin" / "抖音_title_account_投放号_巨量素材"
+            cached_dir.mkdir(parents=True)
+            (cached_dir / "asset.mp4").write_text("cached giant asset", encoding="utf-8")
+            upsert_top_asset_cache_entry(
+                db_path,
+                {
+                    "asset_key": "抖音::title_account::投放号::巨量素材",
+                    "content_id": "",
+                    "platform": "抖音",
+                    "source": "previous_giant_capture",
+                    "asset_dir": str(cached_dir),
+                    "size_bytes": 1,
+                    "last_used_batch_id": "old-batch",
+                },
+            )
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "抖音商业化::抖音::title_account::投放号::巨量素材",
+                        "content_id": "",
+                        "work_id": "",
+                        "work_url": "",
+                        "material_id": "7623721481431780662",
+                        "ad_material_id": "7623721481431780662",
+                        "ad_material_url": "https://巨量.example/video.mp4",
+                        "ad_cover_url": "https://巨量.example/cover.jpg",
+                        "title": "巨量素材",
+                        "account": "投放号",
+                        "period_end": "2026-06-11",
+                        "spend": 3000,
+                    }
+                ]
+            )
+
+            reused = cache_existing_harvester_assets_for_batch(
+                db_path,
+                "batch-1",
+                top_content,
+                cache_root=cache_root,
+                harvester_root=tmp_path / "harvester-THS",
+                jobs_path=tmp_path / "jobs.jsonl",
+                manifest_path=tmp_path / "manifest.json",
+            )
+
+            manifests = list_harvester_asset_manifests(db_path, batch_id="batch-1")
+            refs = list_top_asset_cache_refs(db_path, batch_id="batch-1")
+            self.assertEqual(reused, 0)
+            self.assertTrue(manifests.empty)
+            self.assertTrue(refs.empty)
 
     def test_cache_existing_harvester_assets_copies_current_batch_harvester_output_to_ops_cache(self):
         with TemporaryDirectory() as tmp:
@@ -1165,11 +1681,168 @@ class HarvesterBridgeTests(unittest.TestCase):
             )
 
             manifests = list_harvester_asset_manifests(db_path, batch_id="batch-1")
-            cached_dir = tmp_path / ".runtime" / "top-assets" / "douyin" / "抖音_id_7594830477777751338"
+            cached_dir = tmp_path / ".runtime" / "top-assets" / "douyin" / "7594830477777751338"
             self.assertEqual(reused, 1)
             self.assertEqual(Path(manifests.iloc[0]["asset_dir"]).resolve(), cached_dir.resolve())
             self.assertTrue(cached_dir.exists())
             self.assertEqual(Path(manifests.iloc[0]["video_path"]).resolve(), (cached_dir / "7594830477777751338.mp4").resolve())
+
+    def test_run_harvester_asset_capture_keeps_douyin_giant_only_result_out_of_stable_cache(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            harvester_root = tmp_path / "harvester-THS"
+            harvester_root.mkdir()
+            (harvester_root / "package.json").write_text(
+                json.dumps({"scripts": {"materials:cache-topn": "node src/cache-topn-materials.mjs"}}),
+                encoding="utf-8",
+            )
+            db_path = tmp_path / "workflow.sqlite3"
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "抖音商业化::抖音::title_account::投放号::巨量素材",
+                        "content_id": "",
+                        "work_id": "",
+                        "work_url": "",
+                        "material_id": "7623721481431780662",
+                        "ad_material_id": "7623721481431780662",
+                        "ad_material_url": "https://巨量.example/video.mp4",
+                        "ad_cover_url": "https://巨量.example/cover.jpg",
+                        "title": "巨量素材",
+                        "account": "投放号",
+                        "period_end": "2026-06-11",
+                        "spend": 3000,
+                    }
+                ]
+            )
+
+            def fake_runner(command, **kwargs):
+                input_path = Path(command[command.index("--input") + 1])
+                out_path = Path(command[command.index("--out") + 1])
+                run_root = Path(command[command.index("--root") + 1])
+                asset_dir = run_root / "output" / "2026-06-11" / "douyin" / "giant-only"
+                asset_dir.mkdir(parents=True)
+                (asset_dir / "asset.mp4").write_text("giant asset", encoding="utf-8")
+                out_path.write_text(
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "job_id": json.loads(input_path.read_text(encoding="utf-8").splitlines()[0])["job_id"],
+                                    "status": "succeeded",
+                                    "platform": "抖音",
+                                    "asset_dir": str(asset_dir),
+                                    "video_path": str(asset_dir / "asset.mp4"),
+                                    "metadata": {"source": "giant_asset"},
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+            result = run_harvester_asset_capture(
+                db_path,
+                "batch-1",
+                top_content,
+                harvester_root=harvester_root,
+                runtime_root=tmp_path / "runtime",
+                cache_root=tmp_path / ".runtime" / "top-assets",
+                runner=fake_runner,
+            )
+
+            manifests = list_harvester_asset_manifests(db_path, batch_id="batch-1")
+            entries = list_top_asset_cache_entries(db_path)
+            refs = list_top_asset_cache_refs(db_path, batch_id="batch-1")
+            self.assertTrue(result.ok)
+            self.assertEqual(len(manifests), 1)
+            self.assertEqual(manifests.iloc[0]["asset_key"], "")
+            self.assertIn("_capture-runs", manifests.iloc[0]["asset_dir"])
+            self.assertTrue(entries.empty)
+            self.assertTrue(refs.empty)
+
+    def test_run_harvester_asset_capture_caches_real_douyin_work_even_with_giant_fields(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            harvester_root = tmp_path / "harvester-THS"
+            harvester_root.mkdir()
+            (harvester_root / "package.json").write_text(
+                json.dumps({"scripts": {"materials:cache-topn": "node src/cache-topn-materials.mjs"}}),
+                encoding="utf-8",
+            )
+            db_path = tmp_path / "workflow.sqlite3"
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "抖音商业化::抖音::id::7594830477777751338",
+                        "content_id": "7594830477777751338",
+                        "work_id": "7594830477777751338",
+                        "work_url": "https://www.douyin.com/video/7594830477777751338",
+                        "material_id": "7623721481431780662",
+                        "ad_material_id": "7623721481431780662",
+                        "ad_material_url": "https://巨量.example/video.mp4",
+                        "ad_cover_url": "https://巨量.example/cover.jpg",
+                        "title": "真实作品",
+                        "account": "投放号",
+                        "period_end": "2026-06-11",
+                        "spend": 3000,
+                    }
+                ]
+            )
+
+            def fake_runner(command, **kwargs):
+                input_path = Path(command[command.index("--input") + 1])
+                out_path = Path(command[command.index("--out") + 1])
+                run_root = Path(command[command.index("--root") + 1])
+                asset_dir = run_root / "output" / "2026-06-11" / "douyin" / "7594830477777751338"
+                asset_dir.mkdir(parents=True)
+                (asset_dir / "7594830477777751338.mp4").write_text("video", encoding="utf-8")
+                out_path.write_text(
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "job_id": json.loads(input_path.read_text(encoding="utf-8").splitlines()[0])["job_id"],
+                                    "status": "succeeded",
+                                    "platform": "抖音",
+                                    "asset_dir": str(asset_dir),
+                                    "video_path": str(asset_dir / "7594830477777751338.mp4"),
+                                    "metadata": {"source": "real_work"},
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+            result = run_harvester_asset_capture(
+                db_path,
+                "batch-1",
+                top_content,
+                harvester_root=harvester_root,
+                runtime_root=tmp_path / "runtime",
+                cache_root=tmp_path / ".runtime" / "top-assets",
+                runner=fake_runner,
+            )
+
+            cached_dir = tmp_path / ".runtime" / "top-assets" / "douyin" / "7594830477777751338"
+            manifests = list_harvester_asset_manifests(db_path, batch_id="batch-1")
+            entries = list_top_asset_cache_entries(db_path)
+            refs = list_top_asset_cache_refs(db_path, batch_id="batch-1")
+            self.assertTrue(result.ok)
+            self.assertEqual(manifests.iloc[0]["asset_key"], "抖音::id::7594830477777751338")
+            self.assertEqual(Path(manifests.iloc[0]["asset_dir"]).resolve(), cached_dir.resolve())
+            self.assertTrue((cached_dir / "7594830477777751338.mp4").exists())
+            self.assertEqual(entries.iloc[0]["asset_key"], "抖音::id::7594830477777751338")
+            self.assertEqual(refs.iloc[0]["asset_key"], "抖音::id::7594830477777751338")
 
     def test_content_performance_items_merge_feishu_fields_and_cleaned_metrics(self):
         with TemporaryDirectory() as tmp:
@@ -1189,9 +1862,9 @@ class HarvesterBridgeTests(unittest.TestCase):
                         "title": "标题",
                         "account": "",
                         "matched_account": "示例账号",
-                        "matched_category_l1": "投教",
-                        "matched_category_l2": "方法论",
-                        "matched_content_type": "方法论",
+                        "matched_category_l1": "股友说",
+                        "matched_category_l2": "股民教学",
+                        "matched_content_type": "股民教学",
                         "match_status": "已匹配",
                         "match_source": "标准标题",
                         "match_confidence": 0.95,
@@ -1219,9 +1892,9 @@ class HarvesterBridgeTests(unittest.TestCase):
                         "title": "标题",
                         "account": "",
                         "matched_account": "示例账号",
-                        "matched_category_l1": "投教",
-                        "matched_category_l2": "方法论",
-                        "matched_content_type": "方法论",
+                        "matched_category_l1": "股友说",
+                        "matched_category_l2": "股民教学",
+                        "matched_content_type": "股民教学",
                         "match_status": "已匹配",
                         "match_source": "标准标题",
                         "match_confidence": 0.95,
@@ -1247,14 +1920,259 @@ class HarvesterBridgeTests(unittest.TestCase):
             self.assertEqual(len(items), 1)
             row = items.iloc[0]
             self.assertEqual(row["account"], "")
-            self.assertEqual(row["category_l1"], "投教")
-            self.assertEqual(row["category_l2"], "方法论")
-            self.assertEqual(row["content_type"], "方法论")
+            self.assertEqual(row["category_l1"], "股友说")
+            self.assertEqual(row["category_l2"], "股民教学")
+            self.assertEqual(row["content_type"], "股民教学")
             self.assertEqual(float(row["spend"]), 1500.0)
             self.assertEqual(float(row["impressions"]), 15000.0)
             self.assertEqual(float(row["activations"]), 15.0)
             self.assertEqual(float(row["first_pay_count"]), 3.0)
             self.assertEqual(int(row["merged_row_count"]), 2)
+
+    def test_content_performance_items_prefer_douyin_matched_work_url_over_exported_material_url(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-06-05",
+                        "period_end": "2026-06-11",
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_id": "7594830477777751338",
+                        "material_id": "7595047544461393956",
+                        "content_url": "https://www.douyin.com/video/7595047544461393956",
+                        "work_url": "https://www.douyin.com/video/7594830477777751338",
+                        "title": "巨量导出素材",
+                        "account": "示例账号",
+                        "match_status": "已匹配",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                        "activations": 10.0,
+                        "first_pay_count": 1.0,
+                    }
+                ]
+            )
+
+            persist_content_performance_items(db_path, "batch-1", canonical)
+            items = list_content_performance_items(db_path, batch_id="batch-1")
+
+            self.assertEqual(items.iloc[0]["content_url"], "https://www.douyin.com/video/7594830477777751338")
+            self.assertEqual(items.iloc[0]["asset_key"], "抖音::id::7594830477777751338")
+
+    def test_content_performance_items_do_not_generate_douyin_url_from_material_id(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-06-05",
+                        "period_end": "2026-06-11",
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_id": "7623721481431780662",
+                        "material_id": "7623721481431780662",
+                        "content_url": "",
+                        "work_id": "",
+                        "work_url": "",
+                        "title": "巨量导出素材",
+                        "account": "示例账号",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                        "activations": 10.0,
+                        "first_pay_count": 1.0,
+                    }
+                ]
+            )
+
+            persist_content_performance_items(db_path, "batch-1", canonical)
+            items = list_content_performance_items(db_path, batch_id="batch-1")
+
+            self.assertEqual(items.iloc[0]["content_url"], "")
+            self.assertTrue(items.iloc[0]["asset_key"].startswith("抖音::title_account::"))
+            self.assertNotIn("7623721481431780662", items.iloc[0]["asset_key"])
+
+    def test_content_performance_items_reject_precision_drifted_douyin_material_id(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-06-05",
+                        "period_end": "2026-06-11",
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_id": "7631402274104541184",
+                        "material_id": "7.631402274104541e+18",
+                        "ad_material_id": "7.631402274104541e+18",
+                        "work_id": "7631402274104541184",
+                        "work_url": "https://www.douyin.com/video/7631402274104541184",
+                        "content_url": "https://www.douyin.com/video/7631402274104541184",
+                        "link_source": "",
+                        "metadata_source": "douyin_id_derived",
+                        "title": "巨量导出素材",
+                        "account": "示例账号",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                        "activations": 10.0,
+                        "first_pay_count": 1.0,
+                    }
+                ]
+            )
+
+            persist_content_performance_items(db_path, "batch-1", canonical)
+            items = list_content_performance_items(db_path, batch_id="batch-1")
+
+            row = items.iloc[0]
+            self.assertEqual(row["content_id"], "")
+            self.assertEqual(row["content_url"], "")
+            self.assertEqual(row["work_id"], "")
+            self.assertEqual(row["work_url"], "")
+            self.assertTrue(row["asset_key"].startswith("抖音::title_account::"))
+            self.assertNotIn("7631402274104541184", row["asset_key"])
+
+    def test_content_performance_items_keep_douyin_giant_asset_links_as_evidence(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-06-05",
+                        "period_end": "2026-06-11",
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_id": "",
+                        "material_id": "7623721481431780662",
+                        "ad_material_id": "7623721481431780662",
+                        "ad_material_url": "https://巨量.example/video.mp4",
+                        "ad_cover_url": "https://巨量.example/cover.jpg",
+                        "content_url": "",
+                        "work_id": "",
+                        "work_url": "",
+                        "title": "只有巨量素材",
+                        "account": "示例账号",
+                        "match_status": "已匹配",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                        "activations": 10.0,
+                        "first_pay_count": 1.0,
+                    }
+                ]
+            )
+
+            persist_content_performance_items(db_path, "batch-1", canonical)
+            items = list_content_performance_items(db_path, batch_id="batch-1")
+
+            row = items.iloc[0]
+            self.assertEqual(row["content_url"], "")
+            self.assertEqual(row["work_url"], "")
+            self.assertEqual(row["ad_material_id"], "7623721481431780662")
+            self.assertEqual(row["ad_material_url"], "https://巨量.example/video.mp4")
+            self.assertEqual(row["ad_cover_url"], "https://巨量.example/cover.jpg")
+
+    def test_content_performance_items_keep_analysis_status_for_evidence_status(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-06-05",
+                        "period_end": "2026-06-11",
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_id": "",
+                        "material_id": "7646251309365346347",
+                        "ad_material_id": "7646251309365346347",
+                        "ad_cover_url": "https://巨量.example/cover.jpg",
+                        "content_url": "",
+                        "work_id": "",
+                        "work_url": "",
+                        "title": "已有分类但缺作品身份",
+                        "category_l1": "社区话题",
+                        "category_l2": "同花顺产品种草",
+                        "analysis_status": "可分析",
+                        "match_status": "未匹配",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                        "activations": 10.0,
+                        "first_pay_count": 1.0,
+                    }
+                ]
+            )
+
+            persist_content_performance_items(db_path, "batch-1", canonical)
+            items = list_content_performance_items(db_path, batch_id="batch-1")
+
+            self.assertEqual(items.iloc[0]["analysis_status"], "可分析")
+
+    def test_content_performance_items_reject_polluted_douyin_work_url_from_material_id(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-06-05",
+                        "period_end": "2026-06-11",
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_id": "7623721481431780662",
+                        "material_id": "7623721481431780662",
+                        "work_id": "7623721481431780662",
+                        "work_url": "https://www.douyin.com/video/7623721481431780662",
+                        "content_url": "https://www.douyin.com/video/7623721481431780662",
+                        "link_source": "",
+                        "metadata_source": "",
+                        "title": "巨量导出素材",
+                        "account": "示例账号",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                        "activations": 10.0,
+                        "first_pay_count": 1.0,
+                    }
+                ]
+            )
+
+            persist_content_performance_items(db_path, "batch-1", canonical)
+            items = list_content_performance_items(db_path, batch_id="batch-1")
+
+            self.assertEqual(items.iloc[0]["content_url"], "")
+            self.assertTrue(items.iloc[0]["asset_key"].startswith("抖音::title_account::"))
+            self.assertNotIn("7623721481431780662", items.iloc[0]["asset_key"])
+
+    def test_content_performance_items_keep_harvester_resolved_douyin_material_equal_id(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-06-05",
+                        "period_end": "2026-06-11",
+                        "platform": "抖音",
+                        "channel": "抖音市场部",
+                        "content_id": "7632278691925609769",
+                        "material_id": "7632278691925609769",
+                        "work_id": "7632278691925609769",
+                        "work_url": "https://www.douyin.com/video/7632278691925609769",
+                        "content_url": "https://www.douyin.com/video/7632278691925609769",
+                        "link_source": "harvester_douyin_detail",
+                        "metadata_source": "harvester_douyin_detail",
+                        "title": "存多少钱才可以提前退休",
+                        "account": "投资号",
+                        "match_status": "已匹配",
+                        "match_source": "作品ID",
+                        "spend": 3000.0,
+                        "impressions": 1000.0,
+                        "activations": 10.0,
+                        "first_pay_count": 1.0,
+                    }
+                ]
+            )
+
+            persist_content_performance_items(db_path, "batch-1", canonical)
+            items = list_content_performance_items(db_path, batch_id="batch-1")
+
+            self.assertEqual(items.iloc[0]["content_url"], "https://www.douyin.com/video/7632278691925609769")
+            self.assertEqual(items.iloc[0]["asset_key"], "抖音::id::7632278691925609769")
 
     def test_content_performance_items_use_matched_title_when_bilibili_title_is_bv_placeholder(self):
         with TemporaryDirectory() as tmp:
@@ -1390,8 +2308,8 @@ class HarvesterBridgeTests(unittest.TestCase):
                     [
                         {
                             "platform": "抖音",
-                            "content_id": "dy-1",
-                            "content_url": "https://www.douyin.com/video/dy-1",
+                            "content_id": "7594830477777751338",
+                            "content_url": "https://www.douyin.com/video/7594830477777751338",
                             "title": "投教标题",
                             "account": "投资号",
                         }
@@ -1405,9 +2323,9 @@ class HarvesterBridgeTests(unittest.TestCase):
                         "period_end": "2026-06-07",
                         "platform": "抖音",
                         "channel": "抖音商业化",
-                        "content_identity_key": "抖音商业化::抖音::id::dy-1",
-                        "content_id": "dy-1",
-                        "content_url": "https://www.douyin.com/video/dy-1",
+                        "content_identity_key": "抖音商业化::抖音::id::7594830477777751338",
+                        "content_id": "7594830477777751338",
+                        "content_url": "https://www.douyin.com/video/7594830477777751338",
                         "title": "投教标题",
                         "account": "",
                         "spend": 1000,

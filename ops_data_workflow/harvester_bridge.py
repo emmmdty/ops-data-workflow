@@ -24,7 +24,13 @@ from .storage import (
     upsert_top_asset_cache_entry,
     upsert_top_asset_cache_ref,
 )
-from .top_asset_cache import asset_cache_path, asset_key_for_job, directory_size
+from .top_asset_cache import (
+    asset_key_for_job,
+    directory_size,
+    has_reusable_asset_identity,
+    reusable_asset_cache_path,
+    reusable_asset_key_for_job,
+)
 
 
 HARVESTER_NPM_SCRIPT = "materials:cache-topn"
@@ -93,21 +99,31 @@ def build_asset_jobs(
     for _, row in top_content.iterrows():
         identity = _text(row.get("content_identity_key")) or _fallback_identity(row)
         platform = _text(row.get("platform") or row.get("platform_group")) or _platform_from_channel(row.get("channel"))
+        platform_cache_name = _platform_cache_name(platform)
+        if platform_cache_name == "douyin":
+            content_id = _douyin_work_id_from_row(row)
+        else:
+            content_id = _text(row.get("content_id") or row.get("work_id"))
+            content_id = content_id or _text(row.get("material_id"))
+        content_url = _text(row.get("work_url") or row.get("content_url"))
         job = {
             "job_id": _job_id(identity),
             "batch_id": _text(batch_id),
             "platform": platform,
             "channel": _text(row.get("channel")),
             "content_identity_key": identity,
-            "content_id": _text(row.get("content_id") or row.get("work_id") or row.get("material_id")),
-            "content_url": _text(row.get("content_url") or row.get("work_url")),
+            "content_id": content_id,
+            "content_url": content_url,
             "title": _text(row.get("title")),
             "account": _text(row.get("account")),
+            "ad_material_id": _text(row.get("ad_material_id") or row.get("material_id")) if platform_cache_name == "douyin" else "",
+            "ad_material_url": _text(row.get("ad_material_url")) if platform_cache_name == "douyin" else "",
+            "ad_cover_url": _text(row.get("ad_cover_url")) if platform_cache_name == "douyin" else "",
             "period_start": _text(row.get("period_start")),
             "period_end": _text(row.get("period_end")),
             "metrics": {column: _float(row.get(column)) for column in METRIC_COLUMNS},
         }
-        if _platform_cache_name(platform) == "douyin":
+        if platform_cache_name == "douyin":
             job = _normalize_douyin_identity(job)
             job = _resolve_douyin_job(job, douyin_resolver)
         jobs.append(job)
@@ -131,11 +147,17 @@ def _build_asset_jobs_to_capture_from_jobs(db_path: Path, jobs: Sequence[Mapping
         ]
         captured_ids = set(scoped.get("job_id", pd.Series(dtype=object)).fillna("").astype(str))
     cached_asset_keys = _cached_asset_keys(db_path)
-    return [
-        dict(job)
-        for job in jobs
-        if str(job.get("job_id", "")) not in captured_ids and asset_key_for_job(job) not in cached_asset_keys
-    ]
+    pending: list[dict[str, object]] = []
+    for job in jobs:
+        if not has_reusable_asset_identity(job):
+            pending.append(dict(job))
+            continue
+        if str(job.get("job_id", "")) in captured_ids:
+            continue
+        if reusable_asset_key_for_job(job) in cached_asset_keys:
+            continue
+        pending.append(dict(job))
+    return pending
 
 
 def cache_existing_harvester_assets_for_batch(
@@ -159,12 +181,13 @@ def cache_existing_harvester_assets_for_batch(
     job_file = Path(jobs_path) if jobs_path is not None else Path(".runtime/harvester") / str(batch_id) / "jobs.jsonl"
     manifest_file = Path(manifest_path) if manifest_path is not None else Path(".runtime/harvester") / str(batch_id) / "manifest.json"
     daily_manifests = _daily_harvester_manifests_for_jobs(jobs, hroot)
+    previous_capture_manifests = _previous_ops_capture_manifests_for_jobs(jobs, root)
     reused_jobs: list[dict[str, object]] = []
     reused_manifests: list[dict[str, object]] = []
     local_manifests = _local_cached_manifests_for_jobs(db_path, jobs)
     for job in jobs:
         job_id = _text(job.get("job_id"))
-        manifest = daily_manifests.get(job_id) or local_manifests.get(job_id)
+        manifest = daily_manifests.get(job_id) or previous_capture_manifests.get(job_id) or local_manifests.get(job_id)
         if not manifest:
             continue
         cached_manifest = _copy_manifest_assets_to_ops_cache(manifest, job, root)
@@ -197,6 +220,8 @@ def cache_existing_harvester_assets_for_batch(
             if _text(row.get("job_id")) and _text(row.get("job_id")) not in existing_ids
         }
         for job in jobs:
+            if not has_reusable_asset_identity(job):
+                continue
             job_id = _text(job.get("job_id"))
             existing = manifest_by_job.get(job_id)
             if not existing:
@@ -222,7 +247,7 @@ def cache_existing_harvester_assets_for_batch(
     )
     persist_harvester_asset_manifests(db_path, batch_id, reused_manifests)
     _record_cache_entries(db_path, batch_id, reused_jobs, reused_manifests)
-    _write_manifest_json(manifest_file, reused_manifests)
+    _write_manifest_json(manifest_file, _manifest_records_for_batch(db_path, batch_id))
     return len(reused_jobs)
 
 
@@ -278,10 +303,13 @@ def run_harvester_asset_capture(
     runtime_dir = runtime_dir.expanduser().resolve()
     stable_cache_root = Path(cache_root) if cache_root is not None else Path(".runtime/top-assets")
     stable_cache_root = stable_cache_root.expanduser().resolve()
-    capture_root = _ops_capture_root(stable_cache_root, batch_id)
+    run_id = _new_run_id()
+    capture_root = _ops_capture_root(stable_cache_root, batch_id, run_id=run_id)
     batch_runtime = runtime_dir / str(batch_id)
-    jobs_path = batch_runtime / "jobs.jsonl"
-    manifest_path = batch_runtime / "manifest.json"
+    run_runtime = batch_runtime / run_id
+    jobs_path = run_runtime / "jobs.jsonl"
+    run_manifest_path = run_runtime / "manifest.json"
+    batch_manifest_path = batch_runtime / "manifest.json"
     douyin_resolver = lambda value: resolve_douyin_share_with_harvester(value, harvester_root=root)
     cache_existing_harvester_assets_for_batch(
         db_path,
@@ -289,8 +317,8 @@ def run_harvester_asset_capture(
         top_content,
         cache_root=stable_cache_root,
         harvester_root=root,
-        jobs_path=jobs_path,
-        manifest_path=manifest_path,
+        jobs_path=batch_runtime / "jobs.jsonl",
+        manifest_path=batch_manifest_path,
         douyin_resolver=douyin_resolver,
     )
     resolved_jobs = build_asset_jobs(batch_id, top_content, douyin_resolver=douyin_resolver)
@@ -303,7 +331,7 @@ def run_harvester_asset_capture(
         status="queued",
         harvester_root=root,
         jobs_path=jobs_path,
-        manifest_path=manifest_path,
+        manifest_path=run_manifest_path,
     )
 
     if not jobs:
@@ -311,7 +339,7 @@ def run_harvester_asset_capture(
             ok=True,
             message="当前周期没有需要抓取的 Top 素材。",
             jobs_path=jobs_path,
-            manifest_path=manifest_path,
+            manifest_path=batch_manifest_path,
             job_count=0,
         )
 
@@ -324,10 +352,10 @@ def run_harvester_asset_capture(
             status="failed",
             harvester_root=root,
             jobs_path=jobs_path,
-            manifest_path=manifest_path,
+            manifest_path=run_manifest_path,
             error_message=message,
         )
-        return HarvesterRunResult(False, message, jobs_path, manifest_path, len(jobs), failed_count=len(jobs))
+        return HarvesterRunResult(False, message, jobs_path, batch_manifest_path, len(jobs), failed_count=len(jobs))
 
     command = [
         npm_command,
@@ -337,7 +365,7 @@ def run_harvester_asset_capture(
         "--input",
         str(jobs_path),
         "--out",
-        str(manifest_path),
+        str(run_manifest_path),
         "--root",
         str(capture_root),
     ]
@@ -363,14 +391,14 @@ def run_harvester_asset_capture(
             status="failed",
             harvester_root=root,
             jobs_path=jobs_path,
-            manifest_path=manifest_path,
+            manifest_path=run_manifest_path,
             error_message=message,
         )
         return HarvesterRunResult(
             False,
             message,
             jobs_path,
-            manifest_path,
+            batch_manifest_path,
             len(jobs),
             failed_count=len(jobs),
             returncode=int(completed.returncode),
@@ -379,13 +407,12 @@ def run_harvester_asset_capture(
         )
 
     manifests = _cache_cli_manifests(
-        load_asset_manifests(manifest_path),
+        load_asset_manifests(run_manifest_path),
         jobs,
         stable_cache_root,
-        cleanup_source_under=capture_root,
     )
-    _write_manifest_json(manifest_path, manifests)
     persist_harvester_asset_manifests(db_path, batch_id, manifests)
+    _write_manifest_json(batch_manifest_path, _manifest_records_for_batch(db_path, batch_id))
     manifest_by_id = {str(item.get("job_id", "")): item for item in manifests}
     refreshed_jobs: list[dict[str, object]] = []
     for job in jobs:
@@ -405,7 +432,7 @@ def run_harvester_asset_capture(
         status="succeeded",
         harvester_root=root,
         jobs_path=jobs_path,
-        manifest_path=manifest_path,
+        manifest_path=run_manifest_path,
     )
     _record_cache_entries(db_path, batch_id, refreshed_jobs, manifests)
     failed_count = sum(1 for item in refreshed_jobs if _text(item.get("status")) != "succeeded")
@@ -414,7 +441,7 @@ def run_harvester_asset_capture(
         ok=failed_count == 0,
         message="harvester 素材抓取完成。" if failed_count == 0 else f"harvester 素材抓取完成，失败 {failed_count} 条。",
         jobs_path=jobs_path,
-        manifest_path=manifest_path,
+        manifest_path=batch_manifest_path,
         job_count=len(jobs),
         succeeded_count=succeeded_count,
         failed_count=failed_count,
@@ -468,6 +495,8 @@ def _daily_harvester_manifests_for_jobs(
     by_job: dict[str, dict[str, object]] = {}
     manifest_paths = list(output_root.glob("*/*/*/manifest.json"))
     for job in jobs:
+        if not has_reusable_asset_identity(job):
+            continue
         job_id = _text(job.get("job_id"))
         platform_dir = _platform_cache_name(_text(job.get("platform")))
         content_id = _text(job.get("content_id"))
@@ -480,6 +509,44 @@ def _daily_harvester_manifests_for_jobs(
         for path in candidates:
             item = _load_daily_manifest(path)
             if not item or _text(item.get("status")) != "succeeded":
+                continue
+            if not _manifest_is_usable_for_job(item, job, path):
+                continue
+            if not _daily_manifest_matches_job(item, job, path):
+                continue
+            by_job[job_id] = item
+            break
+    return by_job
+
+
+def _previous_ops_capture_manifests_for_jobs(
+    jobs: Sequence[Mapping[str, object]],
+    cache_root: Path,
+) -> dict[str, dict[str, object]]:
+    output_root = Path(cache_root) / "_capture-runs"
+    if not output_root.exists():
+        return {}
+    manifest_paths = list(output_root.glob("**/output/*/*/*/manifest.json"))
+    by_job: dict[str, dict[str, object]] = {}
+    for job in jobs:
+        if not has_reusable_asset_identity(job):
+            continue
+        job_id = _text(job.get("job_id"))
+        platform_dir = _platform_cache_name(_text(job.get("platform")))
+        content_id = _safe_path_segment(_text(job.get("content_id")))
+        if not job_id or not platform_dir or not content_id or content_id == "unknown":
+            continue
+        preferred = [
+            path
+            for path in manifest_paths
+            if path.parent.name == content_id and path.parent.parent.name == platform_dir
+        ]
+        candidates = preferred + [path for path in manifest_paths if path not in preferred]
+        for path in candidates:
+            item = _load_daily_manifest(path)
+            if not item or _text(item.get("status")) != "succeeded":
+                continue
+            if not _manifest_is_usable_for_job(item, job, path):
                 continue
             if not _daily_manifest_matches_job(item, job, path):
                 continue
@@ -544,6 +611,45 @@ def _daily_manifest_matches_job(manifest: Mapping[str, object], job: Mapping[str
     return bool(job_url_id and manifest_url_id and job_url_id == manifest_url_id)
 
 
+def _manifest_is_usable_for_job(manifest: Mapping[str, object], job: Mapping[str, object], path: Path) -> bool:
+    if _manifest_has_invalid_visual_fallback(manifest):
+        return False
+    if _platform_cache_name(_text(job.get("platform"))) != "douyin":
+        return True
+    job_id = _text(job.get("content_id"))
+    if not job_id:
+        return False
+    manifest_id = _text(manifest.get("content_id"))
+    manifest_url_id = _extract_douyin_work_id(manifest.get("content_url"))
+    path_name = path.parent.name if path.name == "manifest.json" else path.name
+    path_id = _extract_douyin_work_id(path_name) or path_name
+    ids = {value for value in [manifest_id, manifest_url_id, path_id] if value}
+    if manifest_id and manifest_url_id and manifest_id != manifest_url_id:
+        return False
+    return job_id in ids
+
+
+def _manifest_has_invalid_visual_fallback(manifest: Mapping[str, object]) -> bool:
+    text = "\n".join(
+        _text(value)
+        for value in [
+            manifest.get("error_message"),
+            manifest.get("error"),
+            manifest.get("fallbackReason"),
+            manifest.get("source"),
+            json.dumps(manifest.get("metadata") or {}, ensure_ascii=False),
+        ]
+    )
+    fallback = manifest.get("fallback")
+    if isinstance(fallback, Mapping):
+        text = f"{text}\n{json.dumps(dict(fallback), ensure_ascii=False)}"
+        fallback_kind = _text(fallback.get("kind"))
+        extracted_media = bool(fallback.get("extractedMedia") or fallback.get("extracted_media"))
+        if fallback_kind == "douyin-note-visual" and not extracted_media and "yt-dlp" in text:
+            return True
+    return any(token in text for token in ["视频不存在", "观看的视频不存在", "内容不存在", "页面不存在", "404"])
+
+
 def _platform_from_daily_platform_id(value: str) -> str:
     text = _text(value).lower()
     if text in {"douyin", "抖音"}:
@@ -603,12 +709,16 @@ def _copy_manifest_assets_to_ops_cache(
     job: Mapping[str, object],
     cache_root: Path,
 ) -> dict[str, object]:
+    if not has_reusable_asset_identity(job):
+        return {}
+    if not _manifest_is_usable_for_job(manifest, job, Path(_text(manifest.get("asset_dir")) or ".")):
+        return {}
     source_dir = Path(_text(manifest.get("asset_dir")))
     if not source_dir.exists() or not source_dir.is_dir():
         return {}
-    asset_key = asset_key_for_job(job)
+    asset_key = reusable_asset_key_for_job(job)
     source_resolved = source_dir.resolve()
-    target_dir = asset_cache_path(cache_root, job)
+    target_dir = reusable_asset_cache_path(cache_root, job)
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     if source_resolved != target_dir.resolve():
         shutil.copytree(source_resolved, target_dir, dirs_exist_ok=True)
@@ -669,6 +779,13 @@ def _write_manifest_json(path: Path, manifests: Sequence[Mapping[str, object]]) 
     )
 
 
+def _manifest_records_for_batch(db_path: Path, batch_id: str) -> list[dict[str, object]]:
+    records = list_harvester_asset_manifests(db_path, batch_id=batch_id)
+    if records.empty:
+        return []
+    return [row.to_dict() for _, row in records.iterrows()]
+
+
 def _manifest_json_item(item: Mapping[str, object]) -> dict[str, object]:
     metadata = _metadata_from_manifest(item)
     metadata.pop("ops_cache_source_asset_dir", None)
@@ -716,7 +833,9 @@ def _local_cached_manifests_for_jobs(
     }
     by_job: dict[str, dict[str, object]] = {}
     for job in jobs:
-        key = asset_key_for_job(job)
+        if not has_reusable_asset_identity(job):
+            continue
+        key = reusable_asset_key_for_job(job)
         entry = entry_by_key.get(key)
         if not entry:
             continue
@@ -741,6 +860,8 @@ def _local_cached_manifests_for_jobs(
                 "metadata": {},
                 "error_message": "",
             }
+        if not _manifest_is_usable_for_job(manifest, job, asset_dir / "manifest.json"):
+            continue
         manifest["job_id"] = _text(job.get("job_id"))
         manifest["asset_key"] = key
         by_job[_text(job.get("job_id"))] = manifest
@@ -762,7 +883,9 @@ def _record_cache_entries(
             continue
         job_id = _text(manifest.get("job_id"))
         job = job_by_id.get(job_id, {})
-        asset_key = _text(manifest.get("asset_key")) or (asset_key_for_job(job) if job else "")
+        if not job or not has_reusable_asset_identity(job):
+            continue
+        asset_key = _text(manifest.get("asset_key")) or reusable_asset_key_for_job(job)
         if not asset_key:
             continue
         upsert_top_asset_cache_entry(
@@ -798,13 +921,21 @@ def _is_external_harvester_asset(manifest: Mapping[str, object]) -> bool:
     return bool(source_dir and source_dir == _text(manifest.get("asset_dir")))
 
 
-def _ops_capture_root(cache_root: Path, batch_id: str) -> Path:
-    return Path(cache_root).expanduser().resolve() / "_capture-runs" / _safe_path_segment(batch_id)
+def _ops_capture_root(cache_root: Path, batch_id: str, *, run_id: str | None = None) -> Path:
+    run_id = run_id or _new_run_id()
+    return Path(cache_root).expanduser().resolve() / "_capture-runs" / _safe_path_segment(batch_id) / run_id
+
+
+def _new_run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _prepare_ops_capture_root(capture_root: Path, harvester_root: Path) -> None:
     capture_root.mkdir(parents=True, exist_ok=True)
-    (capture_root / "output").mkdir(parents=True, exist_ok=True)
+    output_dir = capture_root / "output"
+    if output_dir.exists() and not any(output_dir.iterdir()):
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     for name in PLATFORM_PROFILE_DIRS:
         target = capture_root / name
         source = Path(harvester_root) / name
@@ -1060,14 +1191,24 @@ def _target_date_from_jobs(jobs: Sequence[Mapping[str, object]]) -> str:
 
 def _normalize_douyin_identity(job: dict[str, object]) -> dict[str, object]:
     content_url = _text(job.get("content_url"))
-    extracted_id = _extract_douyin_work_id(content_url)
-    if not extracted_id:
+    extracted_id = _extract_douyin_work_id(_text(job.get("content_id")))
+    if extracted_id and not _trusted_douyin_job_work_id(job, extracted_id):
+        extracted_id = ""
+    if not extracted_id and _looks_like_douyin_identity_key(job.get("content_identity_key")):
         extracted_id = _extract_douyin_work_id(_text(job.get("content_identity_key")))
+        if extracted_id and not _trusted_douyin_job_work_id(job, extracted_id):
+            extracted_id = ""
     if not extracted_id:
+        extracted_id = _extract_douyin_work_id(content_url)
+        if extracted_id and not _trusted_douyin_job_work_id(job, extracted_id):
+            extracted_id = ""
+    if not extracted_id:
+        if _extract_douyin_work_id(content_url):
+            job["content_url"] = ""
+        job["content_id"] = ""
         return job
     job["content_id"] = extracted_id
-    if content_url:
-        job["content_url"] = f"https://www.douyin.com/video/{extracted_id}"
+    job["content_url"] = f"https://www.douyin.com/video/{extracted_id}"
     job["content_identity_key"] = f"{_text(job.get('channel'))}::抖音::id::{extracted_id}"
     job["job_id"] = _job_id(_text(job.get("content_identity_key")))
     return job
@@ -1103,6 +1244,8 @@ def _extract_douyin_work_id(value: object) -> str:
     text = _text(value)
     if not text:
         return ""
+    if re.fullmatch(r"\d{10,24}", text):
+        return text
     match = re.search(r"/(?:video|note)/(\d{10,24})", text)
     if match:
         return match.group(1)
@@ -1110,7 +1253,81 @@ def _extract_douyin_work_id(value: object) -> str:
     if match:
         return match.group(1)
     match = re.search(r"::抖音::id::(\d{10,24})", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"(?:抖音|douyin)_id_(\d{10,24})", text, re.IGNORECASE)
     return match.group(1) if match else ""
+
+
+def _douyin_work_id_from_row(row: pd.Series) -> str:
+    material_id = _douyin_material_id_from_row(row)
+    trusted_source = _has_trusted_douyin_link_source(row)
+    for value in [
+        row.get("work_id"),
+        row.get("work_url"),
+        row.get("content_url"),
+    ]:
+        extracted = _extract_douyin_work_id(value)
+        if extracted and (not _same_douyin_material_id(extracted, material_id) or trusted_source):
+            return extracted
+    identity = _text(row.get("content_identity_key"))
+    if _looks_like_douyin_identity_key(identity):
+        extracted = _extract_douyin_work_id(identity)
+        if extracted and (not _same_douyin_material_id(extracted, material_id) or trusted_source):
+            return extracted
+    return ""
+
+
+def _douyin_material_id_from_row(row: pd.Series) -> str:
+    return _normalized_douyin_numeric_id(row.get("ad_material_id")) or _normalized_douyin_numeric_id(row.get("material_id"))
+
+
+def _trusted_douyin_job_work_id(job: Mapping[str, object], item_id: str) -> bool:
+    material_id = _normalized_douyin_numeric_id(job.get("ad_material_id")) or _normalized_douyin_numeric_id(job.get("material_id"))
+    if not material_id:
+        return True
+    return not _same_douyin_material_id(item_id, material_id) or _has_trusted_douyin_link_source(job)
+
+
+def _same_douyin_material_id(item_id: str, material_id: str) -> bool:
+    item = _normalized_douyin_numeric_id(item_id)
+    material = _normalized_douyin_numeric_id(material_id)
+    if not item or not material:
+        return False
+    if item == material:
+        return True
+    return len(item) == len(material) and item[:15] == material[:15]
+
+
+def _normalized_douyin_numeric_id(value: object) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{10,24}", text):
+        return text
+    if re.fullmatch(r"\d+(?:\.\d+)?e\+\d+", text, flags=re.IGNORECASE):
+        try:
+            return str(int(float(text)))
+        except (OverflowError, ValueError):
+            return ""
+    match = re.search(r"(?<!\d)(\d{10,24})(?!\d)", text)
+    return match.group(1) if match else ""
+
+
+def _has_trusted_douyin_link_source(row: Mapping[str, object]) -> bool:
+    source = " ".join(
+        _text(row.get(column))
+        for column in ["link_source", "metadata_source", "match_source"]
+    ).lower()
+    return any(
+        token in source
+        for token in ["harvester_douyin_detail", "harvester_cache", "metadata_cache", "original_excel", "作品id"]
+    )
+
+
+def _looks_like_douyin_identity_key(value: object) -> bool:
+    text = _text(value)
+    return bool(re.search(r"::抖音::id::\d{10,24}$", text))
 
 
 def _job_id(identity: str) -> str:
@@ -1119,7 +1336,10 @@ def _job_id(identity: str) -> str:
 
 
 def _fallback_identity(row: pd.Series) -> str:
-    raw = "|".join(_text(row.get(column)) for column in ["channel", "content_id", "material_id", "title", "content_url"])
+    if _platform_cache_name(_text(row.get("platform") or row.get("channel"))) == "douyin":
+        raw = "|".join(_text(row.get(column)) for column in ["channel", "work_id", "work_url", "content_url", "title", "account"])
+    else:
+        raw = "|".join(_text(row.get(column)) for column in ["channel", "content_id", "material_id", "title", "content_url"])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 

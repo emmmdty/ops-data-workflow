@@ -39,7 +39,16 @@ from ops_data_workflow.dashboard import (
 )
 from ops_data_workflow.reporting import format_display_number, localize_and_sort_columns
 from ops_data_workflow.periods import PERIOD_LEVEL_MONTH, PERIOD_LEVEL_WEEK, SOURCE_TYPE_ROLLUP, SOURCE_TYPE_UPLOAD
-from ops_data_workflow.storage import init_db, load_manual_recap_report, persist_manual_recap_report, previous_successful_batch_id_for_period
+from ops_data_workflow.storage import (
+    init_db,
+    clear_manual_recap_report,
+    list_manual_high_value_supplements,
+    load_manual_recap_report,
+    load_manual_recap_status,
+    persist_manual_recap_report,
+    previous_successful_batch_id_for_period,
+    upsert_manual_high_value_supplement,
+)
 
 
 def _append_frame(conn: sqlite3.Connection, table_name: str, batch_id: str, frame: pd.DataFrame) -> None:
@@ -302,6 +311,60 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(loaded["provider"], "deepseek")
             self.assertEqual(loaded["report"]["overview"]["summary"], "整体承压")
             self.assertEqual(loaded["report"]["channels"][0]["channel"], "抖音商业化")
+
+    def test_manual_recap_status_only_answers_whether_current_batch_has_report(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+
+            missing = load_manual_recap_status(db_path, "batch-1")
+            persist_manual_recap_report(
+                db_path,
+                "batch-1",
+                provider="deepseek",
+                model="deepseek-chat",
+                report={"overview": {"summary": "已更新"}, "channels": []},
+            )
+            ready = load_manual_recap_status(db_path, "batch-1")
+
+            self.assertEqual(missing, {"batch_id": "batch-1", "has_report": False})
+            self.assertEqual(ready, {"batch_id": "batch-1", "has_report": True})
+
+    def test_manual_high_value_supplement_can_be_saved_and_make_recap_stale(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            persist_manual_recap_report(
+                db_path,
+                "batch-1",
+                provider="local",
+                model="deterministic",
+                report={"overview": {"summary": "旧结论"}, "channels": []},
+            )
+
+            supplement_id = upsert_manual_high_value_supplement(
+                db_path,
+                "batch-1",
+                {
+                    "platform": "小红书",
+                    "channel": "小红书市场部",
+                    "content_id": "note-1",
+                    "content_url": "https://www.xiaohongshu.com/explore/note-1",
+                    "title": "人工补充的高价值笔记",
+                    "category_l1": "图文",
+                    "category_l2": "理财方法",
+                    "evidence_path": "/tmp/note-1.png",
+                    "reason": "周会需要补充这条高价值内容。",
+                },
+            )
+            clear_manual_recap_report(db_path, "batch-1")
+            supplements = list_manual_high_value_supplements(db_path, batch_id="batch-1")
+
+            self.assertTrue(supplement_id)
+            self.assertEqual(len(supplements), 1)
+            self.assertEqual(supplements.iloc[0]["title"], "人工补充的高价值笔记")
+            self.assertEqual(supplements.iloc[0]["category_l2"], "理财方法")
+            self.assertFalse(load_manual_recap_status(db_path, "batch-1")["has_report"])
 
     def test_load_dashboard_items_reads_only_successful_batches(self):
         with TemporaryDirectory() as tmp:

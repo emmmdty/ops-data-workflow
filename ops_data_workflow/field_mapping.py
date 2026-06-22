@@ -17,6 +17,7 @@ ALLOWED_FIELD_ROLES = frozenset(
         "account",
         "context",
         "content",
+        "evidence",
         "additive_metric",
         "derived_metric_raw",
         "engagement",
