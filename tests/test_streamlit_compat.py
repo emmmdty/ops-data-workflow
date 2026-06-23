@@ -151,6 +151,46 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("二级曝光范围和三级阈值范围", upload_source)
         self.assertIn("auto_tier1_recap_after_upload", upload_source)
 
+    def test_upload_cleaning_has_user_friendly_failure_recovery_copy(self):
+        upload_runner_source = self._function_source("_run_upload_cleaning", "def _run_recap_tier_pipeline")
+
+        for token in [
+            "清洗未完成",
+            "已完成的清洗入库结果不会被复盘失败回滚",
+            "请检查上传文件格式、飞书台账和字段映射后重试",
+            "_render_user_recovery_hint",
+        ]:
+            self.assertIn(token, upload_runner_source)
+
+    def test_report_status_distinguishes_draft_from_final_report(self):
+        report_status_source = self._function_source("_report_status_copy", "def _report_section_view_model")
+        report_tab_source = self._function_source("_render_high_value_report_tab", "def _render_high_value_evidence_tab")
+
+        for token in [
+            "已固化，可用于汇报",
+            "页面即时参考草稿",
+            "还需要生成类型复盘并点击生成/更新口头汇报结论",
+        ]:
+            self.assertIn(token, report_status_source)
+        self.assertIn("当前内容为即时参考草稿", report_tab_source)
+
+    def test_manual_multimodal_buttons_show_status_and_recovery_hints(self):
+        recap_source = self._function_source("_render_high_value_evidence_tab", "def _render_recap_tier_panel")
+        helper_source = self._function_source("_run_manual_multimodal_recap", "def _report_section_view_model")
+        missing_type_source = recap_source[
+            recap_source.index('if c4.button("多模态补缺失类型"') : recap_source.index('if c5.button("生成/更新策略复盘"')
+        ]
+        strategy_source = recap_source[recap_source.index('if c5.button("生成/更新策略复盘"') :]
+
+        for token in ["with st.status", "status.write", "try:", "except Exception as exc", "_render_user_recovery_hint"]:
+            self.assertIn(token, helper_source)
+        for source in [missing_type_source, strategy_source]:
+            self.assertIn("_run_manual_multimodal_recap", source)
+        self.assertIn("正在执行多模态素材分析", missing_type_source)
+        self.assertIn("请检查 MiniMax 配置、素材缓存和网络状态后重试", missing_type_source)
+        self.assertIn("正在生成策略素材分析", strategy_source)
+        self.assertIn("清洗入库结果不受影响，可稍后重试策略复盘", strategy_source)
+
     def test_recap_tier_ui_runs_scoped_llm_reports_without_legacy_imports(self):
         recap_source = self._function_source("_render_recap_tier_panel", "def _render_range_recap_report")
         report_source = self._function_source("_render_range_recap_report", "def _render_high_value_quality_tab")
@@ -174,6 +214,19 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("return False", pipeline_source)
         self.assertIn("if _run_recap_tier_pipeline(batch_id, items, tier_key):", recap_source)
         self.assertNotIn("_run_recap_tier_pipeline(batch_id, items, tier_key)\n                    st.rerun()", recap_source)
+
+    def test_recap_tier_pipeline_uses_harvester_eta_progress_callback(self):
+        pipeline_source = self._function_source("_run_recap_tier_pipeline", "def _run_rollup")
+
+        for token in [
+            "progress_placeholder",
+            "progress_started_at = time.monotonic()",
+            "_harvester_progress_text",
+            "progress_callback=progress",
+            "请检查素材采集项目登录状态、素材缓存和 MiniMax 配置后重试",
+        ]:
+            self.assertIn(token, pipeline_source)
+        self.assertIn("预计还需", self.app_source)
 
     def test_missing_type_multimodal_uses_fill_missing_scope(self):
         recap_source = self._function_source("_render_high_value_evidence_tab", "def _render_recap_tier_panel")

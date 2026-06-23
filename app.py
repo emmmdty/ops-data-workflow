@@ -832,6 +832,7 @@ def _render_high_value_report_tab(
         st.success(status_copy)
     else:
         st.warning(status_copy)
+        st.caption("当前内容为即时参考草稿，适合先检查方向；点击生成后才会固化为可汇报结论。")
     st.subheader("渠道消耗前 5")
     _render_channel_top_link_cards(top_pool, manifests=manifests)
     sections = _report_section_view_model(top_pool, report_status, manual_report)
@@ -928,53 +929,35 @@ def _render_high_value_evidence_tab(
             st.rerun()
         missing_type_pool = _missing_type_pool(capture_pool)
         if c4.button("多模态补缺失类型", disabled=missing_type_pool.empty, width="stretch"):
-            reset_top_multimodal_jobs(
-                APP_DB,
+            if _run_manual_multimodal_recap(
                 batch_id,
                 missing_type_pool,
+                status_label="正在执行多模态补缺失类型",
+                start_message="正在执行多模态素材分析，仅填充当前缺失的类型字段。",
                 trigger="manual_fill_missing_type",
                 analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
-            )
-            copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
-            updated_jobs = run_top_multimodal_analysis_from_manifests(
-                APP_DB,
-                batch_id,
-                analyzer=lambda job, manifest: analyze_top_content_with_minimax(job, manifest, env_path=ENV_PATH),
-                analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
-            )
-            persisted = persist_multimodal_recap(
-                APP_DB,
-                batch_id,
-                missing_type_pool,
-                analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
-                analyzer=_analysis_job_result_analyzer(batch_id, ANALYSIS_PURPOSE_FILL_MISSING_TYPE),
-            )
-            st.success(f"已更新 {updated_jobs} 个补类型任务，写入 {persisted.item_count} 条审计记录；仅填充空类型。")
-            st.rerun()
+                pool_name="补类型任务",
+                success_message=lambda updated_jobs, persisted: (
+                    f"已更新 {updated_jobs} 个补类型任务，写入 {persisted.item_count} 条审计记录；仅填充空类型。"
+                ),
+                failure_next_step="请检查 MiniMax 配置、素材缓存和网络状态后重试。",
+            ):
+                st.rerun()
         if c5.button("生成/更新策略复盘", disabled=capture_pool.empty, width="stretch"):
-            reset_top_multimodal_jobs(
-                APP_DB,
+            if _run_manual_multimodal_recap(
                 batch_id,
                 capture_pool,
+                status_label="正在生成策略复盘",
+                start_message="正在生成策略素材分析，并更新素材复盘和渠道类型策略。",
                 trigger="manual_strategy_recap",
                 analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
-            )
-            copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
-            updated_jobs = run_top_multimodal_analysis_from_manifests(
-                APP_DB,
-                batch_id,
-                analyzer=lambda job, manifest: analyze_top_content_with_minimax(job, manifest, env_path=ENV_PATH),
-                analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
-            )
-            persisted = persist_multimodal_recap(
-                APP_DB,
-                batch_id,
-                capture_pool,
-                analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
-                analyzer=_analysis_job_result_analyzer(batch_id, ANALYSIS_PURPOSE_STRATEGY_RECAP),
-            )
-            st.success(f"已更新 {updated_jobs} 个策略任务，写入 {persisted.item_count} 条素材复盘和 {persisted.strategy_count} 条渠道类型策略。")
-            st.rerun()
+                pool_name="策略任务",
+                success_message=lambda updated_jobs, persisted: (
+                    f"已更新 {updated_jobs} 个策略任务，写入 {persisted.item_count} 条素材复盘和 {persisted.strategy_count} 条渠道类型策略。"
+                ),
+                failure_next_step="清洗入库结果不受影响，可稍后重试策略复盘；请检查 MiniMax 配置、素材缓存和网络状态后重试。",
+            ):
+                st.rerun()
 
     _render_manual_supplement_form(batch_id)
     supplements = list_manual_high_value_supplements(APP_DB, batch_id=batch_id)
@@ -1203,8 +1186,66 @@ def _render_manual_supplement_form(batch_id: str) -> None:
 
 def _report_status_copy(status: dict[str, object]) -> str:
     if bool(status.get("has_report")):
-        return "页面汇报结论已基于当前选择周期的数据；上传清洗、类型复盘、页面汇报是分步完成态。"
-    return "页面汇报结论待更新：上传清洗完成后，还需要生成类型复盘并点击生成/更新口头汇报结论。"
+        return "页面汇报结论已固化，可用于汇报；上传清洗、类型复盘、页面汇报是分步完成态。"
+    return "页面即时参考草稿待固化：上传清洗完成后，还需要生成类型复盘并点击生成/更新口头汇报结论。"
+
+
+def _render_user_recovery_hint(message: str, exc: Exception | None = None) -> None:
+    detail = f"错误信息：{exc}" if exc else ""
+    if detail:
+        st.info(f"{message}\n\n{detail}")
+    else:
+        st.info(message)
+
+
+def _run_manual_multimodal_recap(
+    batch_id: str,
+    pool: pd.DataFrame,
+    *,
+    status_label: str,
+    start_message: str,
+    trigger: str,
+    analysis_purpose: str,
+    pool_name: str,
+    success_message,
+    failure_next_step: str,
+) -> bool:
+    try:
+        with st.status(status_label, expanded=True) as status:
+            total = len(pool) if pool is not None else 0
+            status.write(f"{start_message} 本次待处理 {total} 个素材。")
+            status.write("正在重置本轮任务状态。")
+            reset_top_multimodal_jobs(
+                APP_DB,
+                batch_id,
+                pool,
+                trigger=trigger,
+                analysis_purpose=analysis_purpose,
+            )
+            status.write("正在确认 MiniMax 与素材分析环境。")
+            copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
+            status.write("正在执行多模态素材分析。")
+            updated_jobs = run_top_multimodal_analysis_from_manifests(
+                APP_DB,
+                batch_id,
+                analyzer=lambda job, manifest: analyze_top_content_with_minimax(job, manifest, env_path=ENV_PATH),
+                analysis_purpose=analysis_purpose,
+            )
+            status.write(f"{pool_name}已完成 {updated_jobs}/{total} 个素材分析任务，正在写入复盘结果。")
+            persisted = persist_multimodal_recap(
+                APP_DB,
+                batch_id,
+                pool,
+                analysis_purpose=analysis_purpose,
+                analyzer=_analysis_job_result_analyzer(batch_id, analysis_purpose),
+            )
+            status.update(label=f"{status_label}完成", state="complete")
+        st.success(success_message(updated_jobs, persisted))
+        return True
+    except Exception as exc:
+        st.warning(f"{status_label}未完成：{exc}")
+        _render_user_recovery_hint(failure_next_step, exc)
+        return False
 
 
 def _report_section_view_model(
@@ -1842,48 +1883,55 @@ def _run_upload_cleaning(
     feishu_ledger: pd.DataFrame | None = None,
 ) -> None:
     copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
-    with st.status("正在标准化清洗", expanded=True) as status:
-        materialized = materialize_uploaded_files(
-            uploads,
-            target_dir,
-            strip_common_period_root=True,
-            replace_same_channel=overwrite_existing_channels,
-        )
-        status.write("已接收上传数据，正在进入清洗流程。")
+    try:
+        with st.status("正在标准化清洗", expanded=True) as status:
+            status.write("已接收上传数据，正在保存到本周期目录。")
+            materialized = materialize_uploaded_files(
+                uploads,
+                target_dir,
+                strip_common_period_root=True,
+                replace_same_channel=overwrite_existing_channels,
+            )
+            status.write("文件已保存，正在进入字段标准化、去重和飞书台账回填流程。")
 
-        def progress(message: str) -> None:
-            status.write(message)
+            def progress(message: str) -> None:
+                status.write(message)
 
-        result = run_archived_workflow(
-            materialized.raw_dir,
-            period.period_start,
-            period.period_end,
-            output_root=APP_OUTPUTS,
-            processed_root=APP_PROCESSED,
-            db_path=APP_DB,
-            category_rules_path=CATEGORY_RULES,
-            env_path=ENV_PATH,
-            period_level=period.period_level,
-            period_key=period.period_key,
-            period_label=period.period_label,
-            data_start=period.data_start,
-            data_end=period.data_end,
-            source_type=period.source_type,
-            progress_callback=progress,
-            output_mode="ui_only",
-            enable_deepseek=False,
-            enable_external_context=False,
-            metadata_enrichment_mode="safe_public",
-            force_reclean=True,
-            enqueue_background_analysis=False,
-            preloaded_feishu_ledger=feishu_ledger,
-        )
-        status.update(label="数据清理结束", state="complete")
+            result = run_archived_workflow(
+                materialized.raw_dir,
+                period.period_start,
+                period.period_end,
+                output_root=APP_OUTPUTS,
+                processed_root=APP_PROCESSED,
+                db_path=APP_DB,
+                category_rules_path=CATEGORY_RULES,
+                env_path=ENV_PATH,
+                period_level=period.period_level,
+                period_key=period.period_key,
+                period_label=period.period_label,
+                data_start=period.data_start,
+                data_end=period.data_end,
+                source_type=period.source_type,
+                progress_callback=progress,
+                output_mode="ui_only",
+                enable_deepseek=False,
+                enable_external_context=False,
+                metadata_enrichment_mode="safe_public",
+                force_reclean=True,
+                enqueue_background_analysis=False,
+                preloaded_feishu_ledger=feishu_ledger,
+            )
+            status.update(label="数据清理结束", state="complete")
+    except Exception as exc:
+        st.warning(f"清洗未完成：{exc}")
+        _render_user_recovery_hint("请检查上传文件格式、飞书台账和字段映射后重试。", exc)
+        return
     st.success("清洗完成，本周期数据已更新。")
     _render_feishu_staleness_summary(result.feishu_staleness)
     if result.core_recap_xlsx:
         st.caption("已生成本周期核验结果。")
     if auto_tier1_recap:
+        st.caption("已完成的清洗入库结果不会被复盘失败回滚；一级复盘可失败后在高价值内容复盘页重试。")
         _run_recap_tier_pipeline(
             result.batch_id,
             result.canonical,
@@ -1913,11 +1961,24 @@ def _run_recap_tier_pipeline(
     copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
     trigger = "upload_auto_tier1" if auto_trigger else f"manual_{tier_key}"
     purpose = _recap_tier_analysis_purpose(tier_key)
+    progress_placeholder = st.empty()
+    progress_started_at = time.monotonic()
+
+    def progress(event) -> None:
+        total = int(getattr(event, "total", 0) or 0)
+        completed = int(getattr(event, "completed", 0) or 0)
+        text = _harvester_progress_text(event, progress_started_at)
+        if total:
+            progress_placeholder.progress(min(completed / total, 1.0), text=text)
+        else:
+            progress_placeholder.info(text)
+
     try:
         with st.status(f"正在处理{label}", expanded=True) as status:
             status.write(f"范围：{definition}")
             status.write("正在复用已有素材缓存并补采缺失素材。")
-            capture_result = run_harvester_asset_capture(APP_DB, batch_id, tier_pool)
+            status.write("补采在后台静默运行；只有遇到登录失效或风控验证时才需要人工处理。")
+            capture_result = run_harvester_asset_capture(APP_DB, batch_id, tier_pool, progress_callback=progress)
             if capture_result.job_count:
                 status.write(f"补采任务 {capture_result.job_count} 个，成功 {capture_result.succeeded_count} 个，失败 {capture_result.failed_count} 个。")
             else:
@@ -1955,6 +2016,7 @@ def _run_recap_tier_pipeline(
             if report_pool.empty:
                 status.update(label=f"{label}复盘未完成", state="error")
                 st.warning(f"{label}没有完成可用于 LLM 报告的素材分析；请稍后重试缺失素材。")
+                progress_placeholder.empty()
                 return False
             status.write("正在生成该范围的 LLM 复盘报告。")
             report = generate_range_recap_report(
@@ -1980,6 +2042,7 @@ def _run_recap_tier_pipeline(
                 report=report,
             )
             status.update(label=f"{label}复盘已生成", state="complete")
+        progress_placeholder.empty()
         if execution_status == "complete":
             st.success(f"{label}已完成：素材分析和 LLM 报告已更新。")
             return True
@@ -1989,7 +2052,9 @@ def _run_recap_tier_pipeline(
         )
         return False
     except Exception as exc:
+        progress_placeholder.empty()
         st.warning(f"{label}复盘未完成：{exc}。清洗入库结果不受影响，可稍后在高价值内容复盘页重试。")
+        _render_user_recovery_hint("请检查素材采集项目登录状态、素材缓存和 MiniMax 配置后重试。", exc)
         return False
 
 
