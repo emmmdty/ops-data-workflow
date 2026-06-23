@@ -19,6 +19,7 @@ RUNTIME_ENV_KEYS = [
     "FEISHU_SHEET_DOUYIN",
     "FEISHU_SHEET_XHS",
     "FEISHU_SHEET_BILIBILI",
+    "FEISHU_SHEET_STEP15_FILTERED",
     "FEISHU_SHEET_DOUYIN_HISTORY",
     "FEISHU_SHEET_XHS_HISTORY",
     "FEISHU_SHEET_BILIBILI_HISTORY",
@@ -79,23 +80,29 @@ def copy_missing_runtime_env(
     copied: list[str] = []
     kept: list[str] = []
     missing: list[str] = []
-    additions: list[str] = []
+    updates: dict[str, str] = {}
     for key in keys:
-        if target_values.get(key):
-            kept.append(key)
-            continue
+        has_source_value = key in source_values
         value = source_values.get(key, "")
-        if not value:
+        if not has_source_value:
+            if target_values.get(key):
+                kept.append(key)
+                continue
             missing.append(key)
             continue
-        additions.append(f"{key}={value}")
+        if target_values.get(key) == value:
+            kept.append(key)
+            continue
+        if target_values.get(key) and not key.startswith("FEISHU_"):
+            kept.append(key)
+            continue
+        updates[key] = value
         target_values[key] = value
         copied.append(key)
-    if additions:
+    if updates:
         existing = target_env.read_text(encoding="utf-8") if target_env.exists() else ""
-        separator = "\n" if existing and not existing.endswith("\n") else ""
         target_env.parent.mkdir(parents=True, exist_ok=True)
-        target_env.write_text(existing + separator + "\n".join(additions) + "\n", encoding="utf-8")
+        target_env.write_text(_merge_env_text(existing, updates), encoding="utf-8")
     return EnvCopyResult(source_env=source_env, target_env=target_env, copied=copied, kept=kept, missing=missing)
 
 
@@ -103,3 +110,31 @@ def _runtime_env_values(project_root: Path) -> dict[str, str]:
     values = {str(key): str(value or "") for key, value in dotenv_values(Path(project_root) / ".env").items()}
     values.update({key: value for key, value in os.environ.items() if key == "HARVESTER_ROOT"})
     return values
+
+
+def _merge_env_text(existing: str, updates: Mapping[str, str]) -> str:
+    lines = existing.splitlines()
+    seen: set[str] = set()
+    merged: list[str] = []
+    for line in lines:
+        key = _env_line_key(line)
+        if key in updates:
+            merged.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            merged.append(line)
+    additions = [f"{key}={value}" for key, value in updates.items() if key not in seen]
+    if additions:
+        if merged and merged[-1] != "":
+            merged.append("")
+        merged.extend(additions)
+    if not merged:
+        merged = additions
+    return "\n".join(merged) + "\n"
+
+
+def _env_line_key(line: str) -> str:
+    if not line or line.lstrip().startswith("#") or "=" not in line:
+        return ""
+    key = line.split("=", 1)[0].strip()
+    return key if key else ""

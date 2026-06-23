@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from ops_data_workflow.env_bridge import copy_missing_runtime_env, resolve_harvester_env_path, resolve_harvester_root
+from ops_data_workflow.env_bridge import RUNTIME_ENV_KEYS, copy_missing_runtime_env, resolve_harvester_env_path, resolve_harvester_root
 from ops_data_workflow.platform_sessions import (
     login_profile_dir,
     prepare_local_login_profile,
@@ -45,7 +45,7 @@ class EnvBridgeTests(unittest.TestCase):
                 (root / "harvester-THS").resolve(),
             )
 
-    def test_copy_missing_runtime_env_adds_feishu_minimax_without_overwriting(self):
+    def test_copy_missing_runtime_env_overwrites_feishu_from_harvester_but_keeps_local_ai_values(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "harvester.env"
@@ -55,6 +55,8 @@ class EnvBridgeTests(unittest.TestCase):
                     [
                         "FEISHU_APP_ID=harvester-app",
                         "FEISHU_APP_SECRET=harvester-secret",
+                        "FEISHU_SPREADSHEET_TOKEN=",
+                        "FEISHU_SHEET_STEP15_FILTERED=step15-sheet",
                         "MINIMAX_API_KEY=minimax-key",
                         "MINIMAX_MODEL=MiniMax-M3",
                         "DEEPSEEK_API_KEY=deepseek-key",
@@ -62,18 +64,32 @@ class EnvBridgeTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            target.write_text("FEISHU_APP_ID=ops-app\nMINIMAX_MODEL=ops-model\n", encoding="utf-8")
+            target.write_text("FEISHU_APP_ID=ops-app\nFEISHU_SPREADSHEET_TOKEN=stale-token\nMINIMAX_MODEL=ops-model\n", encoding="utf-8")
 
             result = copy_missing_runtime_env(source, target)
             values = target.read_text(encoding="utf-8")
 
-            self.assertIn("FEISHU_APP_ID=ops-app", values)
+            self.assertIn("FEISHU_APP_ID=harvester-app", values)
+            self.assertNotIn("FEISHU_APP_ID=ops-app", values)
+            self.assertIn("FEISHU_SPREADSHEET_TOKEN=\n", values)
+            self.assertNotIn("FEISHU_SPREADSHEET_TOKEN=stale-token", values)
+            self.assertIn("FEISHU_SHEET_STEP15_FILTERED=step15-sheet", values)
             self.assertIn("MINIMAX_MODEL=ops-model", values)
             self.assertIn("FEISHU_APP_SECRET=harvester-secret", values)
             self.assertIn("MINIMAX_API_KEY=minimax-key", values)
             self.assertIn("DEEPSEEK_API_KEY=deepseek-key", values)
+            self.assertIn("FEISHU_APP_ID", result.copied)
             self.assertIn("FEISHU_APP_SECRET", result.copied)
-            self.assertIn("FEISHU_APP_ID", result.kept)
+            self.assertIn("FEISHU_SHEET_STEP15_FILTERED", result.copied)
+            self.assertIn("MINIMAX_MODEL", result.kept)
+
+    def test_runtime_env_keys_include_harvester_step15_sheet(self):
+        self.assertIn("FEISHU_SHEET_STEP15_FILTERED", RUNTIME_ENV_KEYS)
+
+    def test_env_example_documents_step15_sheet_id(self):
+        env_example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("FEISHU_SHEET_STEP15_FILTERED=", env_example)
 
     def test_copy_missing_runtime_env_reports_missing_when_sibling_env_absent(self):
         with TemporaryDirectory() as tmp:
