@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 import pandas as pd
 import requests
 
+from .env_bridge import resolve_harvester_root
 from .pipeline import build_high_spend_content_pool, high_spend_content_identity_key
 from .title_matching import clean_douyin_share_title
 
@@ -50,7 +51,6 @@ DEFAULT_MODE = "off"
 SAFE_PUBLIC_MODE = "safe_public"
 REQUEST_TIMEOUT_SECONDS = 5.0
 HIGH_SPEND_REVIEW_THRESHOLD = 2000.0
-DEFAULT_HARVESTER_ROOT = Path("/Users/tjk/Documents/Codex/harvester-THS")
 BILIBILI_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json, text/plain, */*",
@@ -115,7 +115,7 @@ def enrich_content_metadata(
 
     fetched_at = fetched_at or datetime.now(timezone.utc).isoformat()
     cache = MetadataCache(cache_dir) if cache_dir is not None else None
-    harvester_cache = HarvesterMetadataCache(harvester_root or DEFAULT_HARVESTER_ROOT)
+    harvester_cache = HarvesterMetadataCache(harvester_root or resolve_harvester_root(project_root=Path.cwd()))
     high_spend_keys = _high_spend_metadata_keys(enriched)
     row_identity_keys = enriched.apply(high_spend_content_identity_key, axis=1)
     for index, row in enriched.iterrows():
@@ -426,7 +426,7 @@ def resolve_douyin_shortlink(link: str) -> str:
 def fetch_douyin_detail_from_harvester(value: str, *, harvester_root: Path | None = None) -> dict | None:
     """Resolve one Douyin copied link through the sibling harvester project."""
     text = _clean_text(value)
-    root = Path(harvester_root or DEFAULT_HARVESTER_ROOT)
+    root = Path(harvester_root) if harvester_root is not None else resolve_harvester_root(project_root=Path.cwd())
     if not text or not root.exists():
         return None
     script = root / "src" / "resolve-douyin-share.mjs"

@@ -14,6 +14,8 @@ from typing import Iterable, Mapping, Sequence
 from dotenv import dotenv_values
 import requests
 
+from .env_bridge import resolve_harvester_root
+
 
 DOUYIN_HISTORY_SHEET_TITLE = "抖音历史台账"
 
@@ -65,9 +67,6 @@ FEISHU_COPY_KEYS = [
 
 READ_CHUNK_SIZE = 5000
 DEFAULT_WRAP_ROW_LIMIT = 5000
-DEFAULT_HARVESTER_ROOT = Path("/Users/tjk/Documents/Codex/harvester-THS")
-
-
 @dataclass(frozen=True)
 class EnvCopyResult:
     copied: list[str]
@@ -347,8 +346,9 @@ def write_history_sheet_id_to_env(env_path: Path, sheet_id: str) -> None:
     env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def load_harvester_douyin_accounts(harvester_root: Path = DEFAULT_HARVESTER_ROOT) -> list[dict[str, object]]:
-    accounts_path = Path(harvester_root) / "platform-accounts.json"
+def load_harvester_douyin_accounts(harvester_root: Path | None = None) -> list[dict[str, object]]:
+    root = Path(harvester_root).expanduser() if harvester_root is not None else resolve_harvester_root()
+    accounts_path = root / "platform-accounts.json"
     payload = json.loads(accounts_path.read_text(encoding="utf-8"))
     accounts = payload.get("douyin") if isinstance(payload, Mapping) else []
     return [dict(item) for item in accounts if isinstance(item, Mapping)]
@@ -356,7 +356,7 @@ def load_harvester_douyin_accounts(harvester_root: Path = DEFAULT_HARVESTER_ROOT
 
 def run_harvester_douyin_history_crawl(
     *,
-    harvester_root: Path = DEFAULT_HARVESTER_ROOT,
+    harvester_root: Path | None = None,
     since: str = "2000-01-01",
     until: str | None = None,
     max_scrolls: int = 500,
@@ -367,7 +367,7 @@ def run_harvester_douyin_history_crawl(
     records_output_dir: Path = Path(".runtime/douyin-history"),
 ) -> HarvesterCrawlResult:
     """Run harvester-THS Douyin crawler with full-history limits, then optionally write Feishu."""
-    harvester_root = Path(harvester_root)
+    harvester_root = Path(harvester_root).expanduser() if harvester_root is not None else resolve_harvester_root()
     until = until or _current_date()
     effective_detail_pages = max_items if max_items is not None else max_detail_pages
     env = os.environ.copy()

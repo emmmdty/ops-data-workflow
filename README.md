@@ -88,17 +88,20 @@ uv run streamlit run app.py
 
 ## harvester 与环境变量
 
-素材复制优先使用同级 `../harvester-THS` 的每日采集缓存；缺素材时才调用 harvester 的 TopN 补采。
+素材复制优先使用同级 `../harvester-THS` 的每日采集缓存；缺素材时才调用 harvester 的 TopN 补采。交付部署时保持 `ops-data-workflow` 和 `harvester-THS` 在同一个父目录下即可。
 
 如果本项目缺少飞书或 MiniMax 配置，会从 harvester 的 `.env` 补齐缺失项，不覆盖本项目已有值。
 
 常用覆盖项：
 
 ```env
-HARVESTER_ROOT=/Users/tjk/Documents/Codex/harvester-THS
+# 可选；两个项目在同一个父目录下时不用填写
+HARVESTER_ROOT=../harvester-THS
 MINIMAX_API_KEY=...
 MINIMAX_MODEL=...
 ```
+
+飞书台账超过 3 天未更新或没有有效投稿时间时，系统会要求人工确认后继续。这是防止用旧台账清洗/复盘的保护提示，不代表飞书配置错误。
 
 ## 常用命令
 

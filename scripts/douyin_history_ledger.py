@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 
 from ops_data_workflow.douyin_history_ledger import (
-    DEFAULT_HARVESTER_ROOT,
     copy_harvester_feishu_env,
     history_records_from_harvester_json,
     init_douyin_history_sheet,
@@ -16,6 +15,7 @@ from ops_data_workflow.douyin_history_ledger import (
     run_harvester_douyin_history_crawl,
     upsert_douyin_history_records,
 )
+from ops_data_workflow.env_bridge import resolve_harvester_env_path, resolve_harvester_root
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -23,7 +23,7 @@ def main(argv: list[str] | None = None) -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     copy_env = subparsers.add_parser("copy-env", help="从 harvester-THS .env 复制 FEISHU_* 配置到本项目 .env。")
-    copy_env.add_argument("--source", default=str(DEFAULT_HARVESTER_ROOT / ".env"), help="harvester-THS .env 路径。")
+    copy_env.add_argument("--source", default="", help="harvester-THS .env 路径；默认使用 HARVESTER_ROOT 或同级 ../harvester-THS。")
     copy_env.add_argument("--target", default=".env", help="本项目 .env 路径。")
 
     init_sheet = subparsers.add_parser("init-sheet", help="创建或初始化飞书 Sheet：抖音历史台账。")
@@ -32,14 +32,14 @@ def main(argv: list[str] | None = None) -> None:
 
     import_json = subparsers.add_parser("import-json", help="把 harvester Douyin JSON 输出导入抖音历史台账。")
     import_json.add_argument("--json", required=True, help="harvester output/douyin_notes_*.json 路径。")
-    import_json.add_argument("--harvester-root", default=str(DEFAULT_HARVESTER_ROOT), help="harvester-THS 项目路径。")
+    import_json.add_argument("--harvester-root", default="", help="harvester-THS 项目路径；默认使用 HARVESTER_ROOT 或同级 ../harvester-THS。")
     import_json.add_argument("--env", default=".env", help="本项目 .env 路径。")
     import_json.add_argument("--batch-size", type=int, default=100, help="每批追加写入行数。")
     import_json.add_argument("--records-output", default=".runtime/douyin-history/imported-records.json", help="本地审计副本路径。")
     import_json.add_argument("--skip-feishu", action="store_true", help="只生成本地审计副本，不写入飞书。")
 
     crawl = subparsers.add_parser("crawl", help="调用 harvester-THS 抖音爬虫采集当前可见历史作品。")
-    crawl.add_argument("--harvester-root", default=str(DEFAULT_HARVESTER_ROOT), help="harvester-THS 项目路径。")
+    crawl.add_argument("--harvester-root", default="", help="harvester-THS 项目路径；默认使用 HARVESTER_ROOT 或同级 ../harvester-THS。")
     crawl.add_argument("--env", default=".env", help="本项目 .env 路径。")
     crawl.add_argument("--since", default="2000-01-01", help="采集起始日期；历史全量默认 2000-01-01。")
     crawl.add_argument("--until", default="", help="采集结束日期；默认今天。")
@@ -52,7 +52,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "copy-env":
-        result = copy_harvester_feishu_env(Path(args.source), Path(args.target))
+        source = Path(args.source) if args.source else resolve_harvester_env_path()
+        result = copy_harvester_feishu_env(source, Path(args.target))
         print(
             "飞书配置复制完成："
             f" copied={len(result.copied)} kept={len(result.kept)} skipped_empty={len(result.skipped_empty)} "
@@ -72,7 +73,8 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "import-json":
-        accounts = load_harvester_douyin_accounts(Path(args.harvester_root))
+        harvester_root = Path(args.harvester_root) if args.harvester_root else resolve_harvester_root()
+        accounts = load_harvester_douyin_accounts(harvester_root)
         records = history_records_from_harvester_json(Path(args.json), accounts=accounts, source="harvester-THS")
         records_output = Path(args.records_output)
         records_output.parent.mkdir(parents=True, exist_ok=True)
@@ -89,8 +91,9 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "crawl":
+        harvester_root = Path(args.harvester_root) if args.harvester_root else None
         result = run_harvester_douyin_history_crawl(
-            harvester_root=Path(args.harvester_root),
+            harvester_root=harvester_root,
             since=args.since,
             until=args.until or None,
             max_scrolls=args.max_scrolls,

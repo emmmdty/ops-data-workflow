@@ -28,7 +28,7 @@ from ops_data_workflow.dashboard import (
     load_dashboard_items_for_batch,
     summarize_period_metric_trends,
 )
-from ops_data_workflow.env_bridge import copy_missing_runtime_env
+from ops_data_workflow.env_bridge import copy_missing_runtime_env, resolve_harvester_env_path
 from ops_data_workflow.feishu_ledger import load_feishu_content_ledger
 from ops_data_workflow.harvester_bridge import (
     cache_existing_harvester_assets_for_batch,
@@ -117,7 +117,7 @@ APP_DB = _app_path_from_env("OPS_WORKFLOW_DB", ".runtime/workflow.sqlite3")
 APP_OUTPUTS = _app_path_from_env("OPS_OUTPUTS_ROOT", "outputs")
 CATEGORY_RULES = Path("config/category_rules.yml")
 ENV_PATH = Path(".env")
-HARVESTER_ENV_PATH = Path("/Users/tjk/Documents/Codex/harvester-THS/.env")
+HARVESTER_ENV_PATH = resolve_harvester_env_path(project_root=Path.cwd())
 
 NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
 INTEGER_DISPLAY_COLUMNS = {
