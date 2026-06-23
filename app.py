@@ -661,6 +661,7 @@ def _page_upload_cleaning() -> None:
         inferred = infer_period_from_upload_names(uploads or [])
         default_start = inferred[0] if inferred else date.today() - timedelta(days=6)
         default_end = inferred[1] if inferred else date.today()
+        _sync_inferred_upload_period(uploads or [], inferred)
         level_label = st.segmented_control(
             "周期维度",
             [PERIOD_LEVEL_LABELS[level] for level in PERIOD_LEVELS],
@@ -753,6 +754,35 @@ def _page_upload_cleaning() -> None:
             _show_frame(_rollup_components_display(components), height=180)
         if st.button("生成汇总数据", disabled=not components, width="stretch"):
             _run_rollup(period, components)
+
+
+def _upload_batch_signature(uploads: list[object]) -> tuple[str, ...]:
+    return tuple(sorted(str(getattr(upload, "name", "")) for upload in uploads))
+
+
+def _sync_inferred_upload_period(
+    uploads: list[object],
+    inferred: tuple[date, date] | None,
+    *,
+    session_state=None,
+) -> None:
+    if not uploads or inferred is None:
+        return
+    state = st.session_state if session_state is None else session_state
+    signature = _upload_batch_signature(uploads)
+    signature_key = "upload_inferred_period_signature"
+    if state.get(signature_key) == signature:
+        return
+
+    state[signature_key] = signature
+    start_date, end_date = inferred
+    for key_prefix, value in (
+        ("upload_data_start", start_date),
+        ("upload_data_end", end_date),
+    ):
+        state[f"{key_prefix}_year"] = value.year
+        state[f"{key_prefix}_month"] = value.month
+        state[f"{key_prefix}_day"] = value.day
 
 
 def _page_high_value_recap() -> None:
@@ -1186,8 +1216,8 @@ def _render_manual_supplement_form(batch_id: str) -> None:
 
 def _report_status_copy(status: dict[str, object]) -> str:
     if bool(status.get("has_report")):
-        return "页面汇报结论已固化，可用于汇报；上传清洗、类型复盘、页面汇报是分步完成态。"
-    return "页面即时参考草稿待固化：上传清洗完成后，还需要生成类型复盘并点击生成/更新口头汇报结论。"
+        return "页面汇报结论已基于当前选择周期的数据；上传清洗、类型复盘、页面汇报是分步完成态。"
+    return "页面汇报结论待更新：上传清洗完成后，还需要生成类型复盘并点击生成/更新口头汇报结论。"
 
 
 def _render_user_recovery_hint(message: str, exc: Exception | None = None) -> None:

@@ -94,6 +94,11 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         upload_source = self._function_source("_page_upload_cleaning", "_page_high_value_recap")
 
         self.assertIn('accept_multiple_files="directory"', upload_source)
+        self.assertIn("_sync_inferred_upload_period", upload_source)
+        self.assertLess(
+            upload_source.index("_sync_inferred_upload_period"),
+            upload_source.index("_chinese_date_input"),
+        )
         self.assertIn("_chinese_date_input", upload_source)
         self.assertIn("月", self._function_source("_chinese_date_input", "def _run_upload_cleaning"))
         self.assertNotIn(".date_input(", upload_source)
@@ -167,8 +172,8 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         report_tab_source = self._function_source("_render_high_value_report_tab", "def _render_high_value_evidence_tab")
 
         for token in [
-            "已固化，可用于汇报",
-            "页面即时参考草稿",
+            "已基于当前选择周期的数据",
+            "页面汇报结论待更新",
             "还需要生成类型复盘并点击生成/更新口头汇报结论",
         ]:
             self.assertIn(token, report_status_source)

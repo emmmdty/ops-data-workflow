@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from pathlib import Path
 import tempfile
 import unittest
@@ -53,6 +54,7 @@ from app import (
     _run_upload_cleaning,
     _split_type_recap_tables,
     _show_frame,
+    _sync_inferred_upload_period,
     _top_asset_cache_entries_display,
     _top_pool_with_value,
     _quality_items_with_manual_supplements,
@@ -64,6 +66,43 @@ from ops_data_workflow.top_asset_service import RECAP_TIER_1_SPEND_TOP
 
 
 class AppOverviewTests(unittest.TestCase):
+    def test_sync_inferred_upload_period_sets_new_upload_dates_once(self):
+        session_state = {}
+        uploads = [
+            type("Upload", (), {"name": "20260515-20260521/B站.xlsx"})(),
+            type("Upload", (), {"name": "20260515-20260521/抖音商业化.xlsx"})(),
+        ]
+
+        _sync_inferred_upload_period(
+            uploads,
+            (date(2026, 5, 15), date(2026, 5, 21)),
+            session_state=session_state,
+        )
+
+        self.assertEqual(session_state["upload_data_start_year"], 2026)
+        self.assertEqual(session_state["upload_data_start_month"], 5)
+        self.assertEqual(session_state["upload_data_start_day"], 15)
+        self.assertEqual(session_state["upload_data_end_year"], 2026)
+        self.assertEqual(session_state["upload_data_end_month"], 5)
+        self.assertEqual(session_state["upload_data_end_day"], 21)
+
+        session_state["upload_data_start_day"] = 16
+        _sync_inferred_upload_period(
+            uploads,
+            (date(2026, 5, 15), date(2026, 5, 21)),
+            session_state=session_state,
+        )
+        self.assertEqual(session_state["upload_data_start_day"], 16)
+
+        _sync_inferred_upload_period(
+            [type("Upload", (), {"name": "20260605-20260611/B站.xlsx"})()],
+            (date(2026, 6, 5), date(2026, 6, 11)),
+            session_state=session_state,
+        )
+        self.assertEqual(session_state["upload_data_start_month"], 6)
+        self.assertEqual(session_state["upload_data_start_day"], 5)
+        self.assertEqual(session_state["upload_data_end_day"], 11)
+
     def test_feishu_staleness_helpers_require_confirmation_for_stale_channels(self):
         staleness = {
             "needs_check": True,
