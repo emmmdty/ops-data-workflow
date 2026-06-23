@@ -113,11 +113,38 @@ def _media_content(manifest: Mapping[str, object], values: Mapping[str, str]) ->
     image_limit = max(_int(values.get("MINIMAX_IMAGE_LIMIT"), DEFAULT_IMAGE_LIMIT), 0)
     max_edge = max(_int(values.get("MINIMAX_IMAGE_MAX_EDGE"), DEFAULT_IMAGE_MAX_EDGE), 64)
     quality = min(max(_int(values.get("MINIMAX_IMAGE_JPEG_QUALITY"), DEFAULT_IMAGE_JPEG_QUALITY), 35), 95)
+    for url in _remote_image_urls(manifest)[:image_limit]:
+        items.append({"type": "image_url", "image_url": {"url": url}})
     for path in _image_paths(manifest)[:image_limit]:
+        if len(items) >= image_limit:
+            break
         data_url = _file_to_data_url(path, max_edge=max_edge, quality=quality)
         if data_url:
             items.append({"type": "image_url", "image_url": {"url": data_url}})
     return items
+
+
+def _remote_image_urls(manifest: Mapping[str, object]) -> list[str]:
+    raw_values: list[object] = []
+    raw_values.extend(_json_list(manifest.get("remote_media_urls")))
+    for key in ["ad_cover_url", "cover_url", "coverUrl"]:
+        value = manifest.get(key)
+        if value:
+            raw_values.append(value)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        url = _text(value)
+        if not url or url in seen or not _looks_like_remote_image_url(url):
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def _looks_like_remote_image_url(url: str) -> bool:
+    lower = url.split("?", 1)[0].lower()
+    return lower.startswith(("http://", "https://")) and lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
 
 
 def _image_paths(manifest: Mapping[str, object]) -> list[Path]:

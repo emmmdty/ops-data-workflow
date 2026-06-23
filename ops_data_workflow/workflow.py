@@ -146,6 +146,7 @@ def run_archived_workflow(
     enqueue_background_analysis: bool = False,
     background_trigger: str = "",
     top_analysis_prompt_hint: str = "",
+    preloaded_feishu_ledger: pd.DataFrame | None = None,
 ) -> WorkflowResult:
     def progress(message: str) -> None:
         if progress_callback is not None:
@@ -189,6 +190,7 @@ def run_archived_workflow(
             enrichment_queue_root=enrichment_queue_root,
             env_path=env_path,
             allow_public_api_metadata=allow_public_api_metadata,
+            preloaded_feishu_ledger=preloaded_feishu_ledger,
         )
         cleaned_workbook = cleaned_bucket.cleaned_workbook
         archived_files = _source_file_records(input_dir)
@@ -210,6 +212,7 @@ def run_archived_workflow(
         default_year=date.fromisoformat(period.data_start).year,
         reference_root=reference_root,
         env_path=env_path,
+        preloaded_feishu_ledger=preloaded_feishu_ledger,
     )
     local_content_assets = _refresh_local_content_assets_from_feishu(db_path, batch_id, content_ledger)
     analysis = analyze_canonical_frame(
@@ -352,6 +355,7 @@ def run_archived_workflow(
         unmatched_attribution=unmatched_attribution,
         account_filter_rules=analysis.account_filter_rules,
         account_filter_details=analysis.account_filter_details,
+        feishu_staleness=dict(content_ledger.attrs.get("feishu_staleness") or {}),
     )
 
 

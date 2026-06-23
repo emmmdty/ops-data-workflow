@@ -57,6 +57,7 @@ from ops_data_workflow.platform_taxonomy import (
     normalize_platform_classification,
 )
 from ops_data_workflow.recap_settings import get_recap_settings, update_recap_settings
+from ops_data_workflow.range_recap_report import generate_range_recap_report
 from ops_data_workflow.reporting import DISPLAY_NUMERIC_COLUMNS, format_display_number, localize_columns
 from ops_data_workflow.rollups import rollup_period_for, select_rollup_component_batches
 from ops_data_workflow.source_storage import source_dir_for_period, source_storage_key
@@ -71,19 +72,31 @@ from ops_data_workflow.storage import (
     list_manual_high_value_supplements,
     load_manual_recap_report,
     load_manual_recap_status,
+    load_range_recap_report,
+    load_range_recap_status,
     list_multimodal_recap_items,
     list_period_channel_totals,
     list_strategy_recap_items,
     list_top_asset_cache_entries,
     list_type_recap_items,
     persist_feishu_ledger_snapshot,
+    persist_range_recap_report,
     persist_oral_recap_report,
     previous_successful_batch_id_for_period,
     read_batch_record,
     upsert_manual_high_value_supplement,
     upsert_content_assets_from_feishu,
 )
-from ops_data_workflow.top_asset_service import build_executable_top_content_pool, build_high_spend_content_pool
+from ops_data_workflow.top_asset_service import (
+    RECAP_TIER_1_SPEND_TOP,
+    RECAP_TIER_2_EXPOSURE_TOP,
+    RECAP_TIER_3_THRESHOLD,
+    RECAP_TIER_LABELS,
+    build_executable_top_content_pool,
+    build_high_spend_content_pool,
+    build_recap_tier_pool,
+    filter_executable_top_content_pool,
+)
 from ops_data_workflow.top_asset_cache import cleanup_top_asset_cache
 from ops_data_workflow.upload_input import (
     detect_upload_channel_conflicts,
@@ -141,6 +154,11 @@ REPORT_CHANNEL_SECTIONS = [
     ("五、小红书市场部内容分析", "小红书市场部"),
     ("六、B站数据", "B站"),
 ]
+RECAP_TIER_DEFINITIONS = {
+    RECAP_TIER_1_SPEND_TOP: "抖音按消耗取分渠道 Top20，其他平台按消耗取分渠道 Top10。",
+    RECAP_TIER_2_EXPOSURE_TOP: "抖音按曝光取分渠道 Top20，其他平台按曝光取分渠道 Top10。",
+    RECAP_TIER_3_THRESHOLD: "纳入单条消耗大于 2000 元或单条曝光大于 100000 的素材。",
+}
 
 
 st.set_page_config(page_title="原生内容投放分析工作台", layout="wide", initial_sidebar_state="collapsed")
@@ -668,12 +686,46 @@ def _page_upload_cleaning() -> None:
             channels = "、".join(conflict.channel for conflict in conflicts)
             st.warning(f"该周期已有渠道数据：{channels}。勾选后会用本次上传替换对应渠道。")
             overwrite_existing_channels = st.checkbox("替换对应渠道", key="overwrite_existing_channels")
+        auto_tier1_recap = st.checkbox(
+            "清洗完成后自动补采并分析一级素材",
+            value=False,
+            key="auto_tier1_recap_after_upload",
+            help="一级范围为抖音消耗Top20、其他平台消耗Top10。清洗成功和复盘任务分开提示；复盘失败不会回滚清洗入库结果。",
+        )
+        st.caption("二级曝光范围和三级阈值范围在高价值内容复盘页手动触发，避免上传等待时间过长。")
 
         if st.button("开始标准化清洗", type="primary", disabled=not uploads, width="stretch"):
             if data_end < data_start:
                 st.error("数据开始日期不能晚于结束日期。")
             else:
-                _run_upload_cleaning(uploads or [], target_dir, period, overwrite_existing_channels)
+                ledger = _load_feishu_ledger_for_check()
+                st.session_state["pending_upload_feishu_ledger"] = ledger
+                if _feishu_staleness_needs_confirmation(_ledger_staleness(ledger)):
+                    _render_feishu_staleness_prompt(
+                        _ledger_staleness(ledger),
+                        action_label="继续清洗前请先确认飞书台账是否需要补充。",
+                    )
+                else:
+                    _run_upload_cleaning(
+                        uploads or [],
+                        target_dir,
+                        period,
+                        overwrite_existing_channels,
+                        auto_tier1_recap,
+                        feishu_ledger=ledger,
+                    )
+        pending_upload_ledger = st.session_state.get("pending_upload_feishu_ledger")
+        if pending_upload_ledger is not None and _feishu_staleness_needs_confirmation(_ledger_staleness(pending_upload_ledger)):
+            if st.button("已检查飞书台账，继续清洗", width="stretch", key="confirm_stale_feishu_upload"):
+                _run_upload_cleaning(
+                    uploads or [],
+                    target_dir,
+                    period,
+                    overwrite_existing_channels,
+                    auto_tier1_recap,
+                    feishu_ledger=pending_upload_ledger,
+                )
+                st.session_state.pop("pending_upload_feishu_ledger", None)
 
     with st.container(border=True):
         st.subheader("生成季度/年度汇总")
@@ -724,12 +776,17 @@ def _page_high_value_recap() -> None:
         activation_weight=settings.activation_weight,
         first_pay_weight=settings.first_pay_weight,
     )
-    executable_top_pool = _top_pool_with_value(
-        build_executable_top_content_pool(items),
-        activation_weight=settings.activation_weight,
-        first_pay_weight=settings.first_pay_weight,
+    executable_top_pool = filter_executable_top_content_pool(top_pool)
+    asset_jobs = list_harvester_asset_jobs(APP_DB, batch_id=batch_id)
+    manifests = _manifests_with_job_context(
+        list_harvester_asset_manifests(APP_DB, batch_id=batch_id),
+        asset_jobs,
     )
-    manifests = list_harvester_asset_manifests(APP_DB, batch_id=batch_id)
+    display_manifests = _display_manifests_with_reusable_cache(
+        top_pool,
+        manifests,
+        _reusable_cache_manifests_for_top_pool(top_pool, list_top_asset_cache_entries(APP_DB)),
+    )
     recap_tables = _build_local_recap_tables(APP_DB, batch_id, top_pool)
     totals = list_period_channel_totals(APP_DB, batch_id=batch_id)
     total_metrics = _overview_metrics(
@@ -752,9 +809,10 @@ def _page_high_value_recap() -> None:
             manual_report=loaded_report.get("report", {}),
             recap_tables=recap_tables,
             total_metrics=total_metrics,
-            manifests=manifests,
+            manifests=display_manifests,
         )
     with evidence_tab:
+        _render_recap_tier_panel(items, manifests, analysis_jobs, batch_id=batch_id)
         _render_high_value_evidence_tab(report_pool, executable_top_pool, manifests, analysis_jobs, batch_id=batch_id)
     with quality_tab:
         _render_high_value_quality_tab(quality_items, report_pool, batch_id=batch_id)
@@ -882,6 +940,7 @@ def _render_high_value_evidence_tab(
                 APP_DB,
                 batch_id,
                 analyzer=lambda job, manifest: analyze_top_content_with_minimax(job, manifest, env_path=ENV_PATH),
+                analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE,
             )
             persisted = persist_multimodal_recap(
                 APP_DB,
@@ -905,6 +964,7 @@ def _render_high_value_evidence_tab(
                 APP_DB,
                 batch_id,
                 analyzer=lambda job, manifest: analyze_top_content_with_minimax(job, manifest, env_path=ENV_PATH),
+                analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP,
             )
             persisted = persist_multimodal_recap(
                 APP_DB,
@@ -939,6 +999,87 @@ def _render_high_value_evidence_tab(
     with st.expander("素材缓存记录与复盘任务", expanded=False):
         _show_frame(_asset_cache_records_display(manifests), height=260)
         _show_frame(_analysis_jobs_display(analysis_jobs), height=260)
+
+
+def _render_recap_tier_panel(
+    items: pd.DataFrame,
+    manifests: pd.DataFrame,
+    analysis_jobs: pd.DataFrame,
+    *,
+    batch_id: str,
+) -> None:
+    st.subheader("分级复盘任务")
+    st.caption("一级可在上传清洗后自动触发；二级曝光范围和三级阈值范围在这里手动触发。每个范围会生成独立 LLM 报告，不覆盖其他范围。")
+    tabs = st.tabs([RECAP_TIER_LABELS[key] for key in [RECAP_TIER_1_SPEND_TOP, RECAP_TIER_2_EXPOSURE_TOP, RECAP_TIER_3_THRESHOLD]])
+    for tab, tier_key in zip(tabs, [RECAP_TIER_1_SPEND_TOP, RECAP_TIER_2_EXPOSURE_TOP, RECAP_TIER_3_THRESHOLD]):
+        with tab:
+            label = RECAP_TIER_LABELS[tier_key]
+            definition = RECAP_TIER_DEFINITIONS[tier_key]
+            tier_pool = _top_pool_with_value(
+                build_recap_tier_pool(items, tier_key),
+                activation_weight=get_recap_settings(APP_DB).activation_weight,
+                first_pay_weight=get_recap_settings(APP_DB).first_pay_weight,
+            )
+            report_status = load_range_recap_status(APP_DB, batch_id, tier_key)
+            status = _recap_tier_status_summary(tier_key, tier_pool, manifests, analysis_jobs, report_status)
+            st.caption(definition)
+            columns = st.columns(len(status))
+            for column, (name, value) in zip(columns, status.items()):
+                column.metric(name, value if isinstance(value, str) else format_display_number(value, 0))
+            if tier_pool.empty:
+                st.warning("当前范围没有可执行素材。请先确认清洗匹配状态，或补充本地内容库后重跑清洗。")
+            else:
+                action_label = "生成/更新一级 LLM 复盘" if tier_key == RECAP_TIER_1_SPEND_TOP else f"生成/更新{label} LLM 复盘"
+                if st.button(action_label, width="stretch", key=f"run_{tier_key}_{batch_id}"):
+                    if _run_recap_tier_pipeline(batch_id, items, tier_key):
+                        st.rerun()
+                report = load_range_recap_report(APP_DB, batch_id, tier_key)
+                if report:
+                    _render_range_recap_report(report.get("report", {}))
+                with st.expander("查看该范围素材", expanded=False):
+                    _show_frame(_top_pool_display(tier_pool), height=360)
+
+
+def _render_range_recap_report(report: object) -> None:
+    if not isinstance(report, dict):
+        return
+    overview = report.get("overview") if isinstance(report.get("overview"), dict) else {}
+    if overview:
+        st.markdown("#### LLM 复盘报告")
+        main_text = _text(overview.get("report") or overview.get("summary"))
+        if main_text:
+            st.markdown(main_text)
+        direction = _text(overview.get("next_cycle_direction"))
+        if direction:
+            st.markdown(f"**下周期方向**：{direction}")
+        for section in overview.get("sections", []) if isinstance(overview.get("sections"), list) else []:
+            if not isinstance(section, dict):
+                continue
+            title = _text(section.get("title"))
+            if title:
+                st.markdown(f"**{title}**")
+            for item in section.get("items", []) if isinstance(section.get("items"), list) else []:
+                st.markdown(f"- {_text(item)}")
+    channels = report.get("channels") if isinstance(report.get("channels"), list) else []
+    for channel in channels:
+        if not isinstance(channel, dict):
+            continue
+        name = _text(channel.get("channel")) or "未命名渠道"
+        with st.expander(name, expanded=False):
+            analysis = _text(channel.get("analysis"))
+            if analysis:
+                st.markdown(analysis)
+            direction = _text(channel.get("next_cycle_direction"))
+            if direction:
+                st.markdown(f"**执行方向**：{direction}")
+            for section in channel.get("sections", []) if isinstance(channel.get("sections"), list) else []:
+                if not isinstance(section, dict):
+                    continue
+                title = _text(section.get("title"))
+                if title:
+                    st.markdown(f"**{title}**")
+                for item in section.get("items", []) if isinstance(section.get("items"), list) else []:
+                    st.markdown(f"- {_text(item)}")
 
 
 def _render_high_value_quality_tab(items: pd.DataFrame, top_pool: pd.DataFrame, *, batch_id: str) -> None:
@@ -1062,8 +1203,8 @@ def _render_manual_supplement_form(batch_id: str) -> None:
 
 def _report_status_copy(status: dict[str, object]) -> str:
     if bool(status.get("has_report")):
-        return "结论已基于当前选择周期的数据。"
-    return "结论待更新：当前选择周期还没有生成口头汇报结论。"
+        return "页面汇报结论已基于当前选择周期的数据；上传清洗、类型复盘、页面汇报是分步完成态。"
+    return "页面汇报结论待更新：上传清洗完成后，还需要生成类型复盘并点击生成/更新口头汇报结论。"
 
 
 def _report_section_view_model(
@@ -1584,7 +1725,12 @@ def _page_local_assets() -> None:
     with st.container(border=True):
         st.subheader("本地总素材表")
         if st.button("从线上飞书读取并更新本地总表", width="stretch"):
-            _sync_feishu_ledger_to_local("manual:feishu")
+            _sync_feishu_ledger_to_local("manual:feishu", confirm_stale=False)
+        pending_manual_ledger = st.session_state.get("pending_manual_feishu_ledger")
+        if pending_manual_ledger is not None and _feishu_staleness_needs_confirmation(_ledger_staleness(pending_manual_ledger)):
+            if st.button("已检查飞书台账，继续更新本地总表", width="stretch", key="confirm_stale_feishu_manual"):
+                _sync_feishu_ledger_to_local("manual:feishu", ledger=pending_manual_ledger, confirm_stale=True)
+                st.session_state.pop("pending_manual_feishu_ledger", None)
         _render_feishu_sync_diff()
         _show_frame(_local_content_assets_display(list_local_content_assets(APP_DB)), height=420)
 
@@ -1687,7 +1833,14 @@ def _chinese_date_input(parent, label: str, value: date, *, key_prefix: str) -> 
     return date(year, month, day)
 
 
-def _run_upload_cleaning(uploads: list[object], target_dir: Path, period, overwrite_existing_channels: bool) -> None:
+def _run_upload_cleaning(
+    uploads: list[object],
+    target_dir: Path,
+    period,
+    overwrite_existing_channels: bool,
+    auto_tier1_recap: bool = False,
+    feishu_ledger: pd.DataFrame | None = None,
+) -> None:
     copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
     with st.status("正在标准化清洗", expanded=True) as status:
         materialized = materialize_uploaded_files(
@@ -1723,11 +1876,121 @@ def _run_upload_cleaning(uploads: list[object], target_dir: Path, period, overwr
             metadata_enrichment_mode="safe_public",
             force_reclean=True,
             enqueue_background_analysis=False,
+            preloaded_feishu_ledger=feishu_ledger,
         )
         status.update(label="数据清理结束", state="complete")
     st.success("清洗完成，本周期数据已更新。")
+    _render_feishu_staleness_summary(result.feishu_staleness)
     if result.core_recap_xlsx:
         st.caption("已生成本周期核验结果。")
+    if auto_tier1_recap:
+        _run_recap_tier_pipeline(
+            result.batch_id,
+            result.canonical,
+            RECAP_TIER_1_SPEND_TOP,
+            auto_trigger=True,
+        )
+
+
+def _run_recap_tier_pipeline(
+    batch_id: str,
+    items: pd.DataFrame,
+    tier_key: str,
+    *,
+    auto_trigger: bool = False,
+) -> bool:
+    label = RECAP_TIER_LABELS.get(tier_key, tier_key)
+    definition = RECAP_TIER_DEFINITIONS.get(tier_key, "")
+    settings = get_recap_settings(APP_DB)
+    tier_pool = _top_pool_with_value(
+        build_recap_tier_pool(items, tier_key),
+        activation_weight=settings.activation_weight,
+        first_pay_weight=settings.first_pay_weight,
+    )
+    if tier_pool.empty:
+        st.warning(f"{label}没有可执行素材，未启动补采或报告生成。")
+        return False
+    copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
+    trigger = "upload_auto_tier1" if auto_trigger else f"manual_{tier_key}"
+    purpose = _recap_tier_analysis_purpose(tier_key)
+    try:
+        with st.status(f"正在处理{label}", expanded=True) as status:
+            status.write(f"范围：{definition}")
+            status.write("正在复用已有素材缓存并补采缺失素材。")
+            capture_result = run_harvester_asset_capture(APP_DB, batch_id, tier_pool)
+            if capture_result.job_count:
+                status.write(f"补采任务 {capture_result.job_count} 个，成功 {capture_result.succeeded_count} 个，失败 {capture_result.failed_count} 个。")
+            else:
+                status.write("没有新增素材需要补采，直接进入多模态分析。")
+            partial_capture = (not capture_result.ok) or int(capture_result.failed_count or 0) > 0
+            if partial_capture:
+                status.write("补采未全部完成；继续分析已有素材证据，并将报告标记为部分完成。")
+            status.write("正在执行多模态素材分析。")
+            reset_top_multimodal_jobs(
+                APP_DB,
+                batch_id,
+                tier_pool,
+                trigger=trigger,
+                analysis_purpose=purpose,
+            )
+            copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
+            updated_jobs = run_top_multimodal_analysis_from_manifests(
+                APP_DB,
+                batch_id,
+                analyzer=lambda job, manifest: analyze_top_content_with_minimax(job, manifest, env_path=ENV_PATH),
+                analysis_purpose=purpose,
+            )
+            persisted = persist_multimodal_recap(
+                APP_DB,
+                batch_id,
+                tier_pool,
+                analysis_purpose=purpose,
+                analyzer=_analysis_job_result_analyzer(batch_id, purpose),
+            )
+            status.write(f"多模态完成 {updated_jobs} 个任务，写入 {persisted.item_count} 条素材复盘和 {persisted.strategy_count} 条策略聚合。")
+            successful_identities = _successful_analysis_identities(batch_id, purpose)
+            report_pool = _filter_pool_by_identities(tier_pool, successful_identities) if successful_identities else tier_pool.iloc[0:0].copy()
+            partial_analysis = len(report_pool) < len(tier_pool)
+            execution_status = "partial" if partial_capture or partial_analysis else "complete"
+            if report_pool.empty:
+                status.update(label=f"{label}复盘未完成", state="error")
+                st.warning(f"{label}没有完成可用于 LLM 报告的素材分析；请稍后重试缺失素材。")
+                return False
+            status.write("正在生成该范围的 LLM 复盘报告。")
+            report = generate_range_recap_report(
+                batch_id=batch_id,
+                range_key=tier_key,
+                range_label=label,
+                range_definition=definition,
+                top_pool=report_pool,
+                period_totals=list_period_channel_totals(APP_DB, batch_id=batch_id),
+                period_level=_batch_period_level(read_batch_record(APP_DB, batch_id)),
+                env_path=ENV_PATH,
+            )
+            report["range_execution_status"] = execution_status
+            report["range_total_items"] = int(len(tier_pool))
+            report["range_report_items"] = int(len(report_pool))
+            report["capture_failed_count"] = int(capture_result.failed_count or 0)
+            persist_range_recap_report(
+                APP_DB,
+                batch_id,
+                tier_key,
+                provider="llm",
+                model="manual-recap-report",
+                report=report,
+            )
+            status.update(label=f"{label}复盘已生成", state="complete")
+        if execution_status == "complete":
+            st.success(f"{label}已完成：素材分析和 LLM 报告已更新。")
+            return True
+        st.warning(
+            f"{label}部分完成：已基于 {len(report_pool)}/{len(tier_pool)} 条完成分析的素材生成 LLM 报告；"
+            "缺失素材可稍后重试后更新报告。"
+        )
+        return False
+    except Exception as exc:
+        st.warning(f"{label}复盘未完成：{exc}。清洗入库结果不受影响，可稍后在高价值内容复盘页重试。")
+        return False
 
 
 def _run_rollup(period, component_batch_ids: list[str]) -> None:
@@ -1748,10 +2011,24 @@ def _run_rollup(period, component_batch_ids: list[str]) -> None:
     st.success("汇总完成，对应周期数据已更新。")
 
 
-def _sync_feishu_ledger_to_local(batch_id: str) -> None:
+def _sync_feishu_ledger_to_local(
+    batch_id: str,
+    *,
+    ledger: pd.DataFrame | None = None,
+    confirm_stale: bool = True,
+) -> None:
     copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
     with st.status("正在读取线上飞书台账", expanded=True) as status:
-        ledger = load_feishu_content_ledger(env_path=ENV_PATH)
+        ledger = ledger if ledger is not None else load_feishu_content_ledger(env_path=ENV_PATH)
+        staleness = _ledger_staleness(ledger)
+        if _feishu_staleness_needs_confirmation(staleness) and not confirm_stale:
+            st.session_state["pending_manual_feishu_ledger"] = ledger
+            status.update(label="飞书台账需要人工确认", state="error")
+            _render_feishu_staleness_prompt(
+                staleness,
+                action_label="需要人工确认飞书台账后，才能更新本地总表。",
+            )
+            return
         diff = build_feishu_content_asset_diff(APP_DB, batch_id, ledger)
         written = upsert_content_assets_from_feishu(APP_DB, batch_id, ledger)
         snapshot = ledger.attrs.get("feishu_snapshot")
@@ -1766,6 +2043,73 @@ def _sync_feishu_ledger_to_local(batch_id: str) -> None:
         )
     else:
         st.warning("本次飞书没有更新内容，请先在飞书补充或修正后再同步。")
+    _render_feishu_staleness_summary(_ledger_staleness(ledger))
+
+
+def _load_feishu_ledger_for_check() -> pd.DataFrame:
+    copy_missing_runtime_env(HARVESTER_ENV_PATH, ENV_PATH)
+    with st.status("正在读取线上飞书台账并检查更新状态", expanded=True) as status:
+        ledger = load_feishu_content_ledger(env_path=ENV_PATH)
+        staleness = _ledger_staleness(ledger)
+        if _feishu_staleness_needs_confirmation(staleness):
+            status.update(label="飞书台账需要人工确认", state="error")
+        else:
+            status.update(label="飞书台账更新状态正常", state="complete")
+    _render_feishu_staleness_summary(_ledger_staleness(ledger))
+    return ledger
+
+
+def _ledger_staleness(ledger: pd.DataFrame | None) -> dict[str, object]:
+    if ledger is None:
+        return {}
+    staleness = getattr(ledger, "attrs", {}).get("feishu_staleness")
+    return staleness if isinstance(staleness, dict) else {}
+
+
+def _feishu_staleness_needs_confirmation(staleness: dict[str, object] | None) -> bool:
+    return bool(isinstance(staleness, dict) and staleness.get("needs_check"))
+
+
+def _feishu_staleness_status_lines(staleness: dict[str, object] | None) -> list[str]:
+    if not isinstance(staleness, dict):
+        return []
+    lines: list[str] = []
+    for item in staleness.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        platform = _text(item.get("platform"))
+        latest = _text(item.get("latest_published_date"))
+        days = item.get("days_since_latest")
+        needs_check = bool(item.get("needs_check"))
+        if not platform:
+            continue
+        if latest:
+            if days is None:
+                line = f"{platform}：{latest}"
+            else:
+                line = f"{platform}：{latest}，距今天 {int(days)} 天"
+        else:
+            line = f"{platform}：无有效投稿时间"
+        if needs_check:
+            line = f"{line}，需要检查"
+        lines.append(line)
+    return lines
+
+
+def _render_feishu_staleness_summary(staleness: dict[str, object] | None) -> None:
+    lines = _feishu_staleness_status_lines(staleness)
+    if not lines:
+        return
+    if _feishu_staleness_needs_confirmation(staleness):
+        st.warning("飞书台账更新状态需要人工确认检查：\n\n" + "\n".join(f"- {line}" for line in lines))
+    else:
+        st.caption("飞书台账更新状态：" + "；".join(lines))
+
+
+def _render_feishu_staleness_prompt(staleness: dict[str, object] | None, *, action_label: str) -> None:
+    st.warning("飞书台账超过 3 天未更新或缺少有效投稿时间，需要人工确认后继续。")
+    _render_feishu_staleness_summary(staleness)
+    st.info(action_label)
 
 
 def _render_feishu_sync_diff() -> None:
@@ -1908,6 +2252,11 @@ def _batch_period_value_label(row: pd.Series) -> str:
         return compact
     label = str(row.get("period_label", "") or row.get("period_key", "") or row.get("batch_id", ""))
     return label
+
+
+def _batch_period_level(record: pd.Series | dict[str, object]) -> str:
+    level = _text(record.get("period_level"))
+    return level or PERIOD_LEVEL_WEEK
 
 
 def _batch_caption(record: dict[str, str]) -> str:
@@ -2094,9 +2443,24 @@ def _metric_source_frame(totals: pd.DataFrame, items: pd.DataFrame) -> pd.DataFr
     if not explicit_totals.empty and "is_channel_total" in explicit_totals.columns:
         mask = explicit_totals["is_channel_total"].astype(str).str.lower().isin({"1", "true", "yes"})
         explicit_totals = explicit_totals[mask]
-    if not explicit_totals.empty:
+    detail = items.copy() if items is not None else pd.DataFrame()
+    if explicit_totals.empty:
+        return detail
+    if detail.empty or "channel" not in detail.columns or "channel" not in explicit_totals.columns:
         return explicit_totals
-    return items.copy() if items is not None else pd.DataFrame()
+    total_channels = {
+        _text(value)
+        for value in explicit_totals["channel"].tolist()
+        if _text(value) and _text(value) != "总计"
+    }
+    if not total_channels:
+        return explicit_totals
+    detail = detail.copy()
+    detail["channel"] = detail["channel"].map(_text)
+    missing_detail = detail[~detail["channel"].isin(total_channels) & detail["channel"].ne("")]
+    if missing_detail.empty:
+        return explicit_totals
+    return pd.concat([explicit_totals, missing_detail], ignore_index=True, sort=False)
 
 
 def _total_metric_source_frame(totals: pd.DataFrame, items: pd.DataFrame) -> pd.DataFrame:
@@ -2329,6 +2693,16 @@ def _content_performance_display(items: pd.DataFrame) -> pd.DataFrame:
 
 
 def _local_content_assets_display(assets: pd.DataFrame) -> pd.DataFrame:
+    display = _dedupe_local_content_assets(assets)
+    if display is not None and not display.empty:
+        display = display.copy()
+        if "work_url" not in display.columns:
+            display["work_url"] = ""
+        if "content_url" in display.columns:
+            display["work_url"] = display.apply(
+                lambda row: _text(row.get("work_url")) or _text(row.get("content_url")),
+                axis=1,
+            )
     columns = [
         "platform",
         "content_id",
@@ -2339,13 +2713,10 @@ def _local_content_assets_display(assets: pd.DataFrame) -> pd.DataFrame:
         "category_l1",
         "category_l2",
         "bilibili_content_type",
-        "content_url",
-        "ad_material_url",
-        "ad_cover_url",
         "published_date",
         "updated_at",
     ]
-    return _format_display_time_columns(_platform_type_display_columns(_select_display_columns(_dedupe_local_content_assets(assets), columns)))
+    return _format_display_time_columns(_platform_type_display_columns(_select_display_columns(display, columns)))
 
 
 def _dedupe_local_content_assets(assets: pd.DataFrame) -> pd.DataFrame:
@@ -2407,6 +2778,7 @@ def _multimodal_recap_display(items: pd.DataFrame) -> pd.DataFrame:
 
 def _strategy_recap_display(items: pd.DataFrame) -> pd.DataFrame:
     columns = [
+        "analysis_purpose",
         "channel",
         "platform",
         "type_level",
@@ -2567,6 +2939,35 @@ def _render_asset_cache_status(summary: dict[str, object], cache_summary: dict[s
             st.warning(f"失败原因：{failure}")
 
 
+def _recap_tier_analysis_purpose(tier_key: str) -> str:
+    return f"{ANALYSIS_PURPOSE_STRATEGY_RECAP}:{_text(tier_key)}"
+
+
+def _recap_tier_status_summary(
+    tier_key: str,
+    tier_pool: pd.DataFrame,
+    manifests: pd.DataFrame,
+    jobs: pd.DataFrame,
+    report_status: dict[str, object],
+) -> dict[str, object]:
+    purpose = _recap_tier_analysis_purpose(tier_key)
+    tier_count = len(tier_pool) if tier_pool is not None else 0
+    succeeded_manifests = _scoped_succeeded_manifest_count(manifests, tier_pool)
+    scoped_jobs = jobs.copy() if jobs is not None else pd.DataFrame()
+    if not scoped_jobs.empty and "analysis_purpose" in scoped_jobs.columns:
+        scoped_jobs = scoped_jobs[scoped_jobs["analysis_purpose"].map(_text).eq(purpose)]
+    completed_jobs = 0
+    if not scoped_jobs.empty and "status" in scoped_jobs.columns:
+        completed_jobs = int(scoped_jobs["status"].map(_text).eq("succeeded").sum())
+    return {
+        "范围素材": tier_count,
+        "已缓存素材": succeeded_manifests,
+        "已完成多模态": completed_jobs,
+        "待分析": max(tier_count - completed_jobs, 0),
+        "LLM报告": "已生成" if bool(report_status.get("has_report")) else "未生成",
+    }
+
+
 def _top_asset_cache_entries_display(entries: pd.DataFrame) -> pd.DataFrame:
     if entries is None or entries.empty:
         return localize_columns(
@@ -2720,6 +3121,206 @@ def _render_channel_top_link_cards(top_pool: pd.DataFrame, *, manifests: pd.Data
                     _channel_top_link_card_html(row, cover_lookup, rank=index),
                     unsafe_allow_html=True,
                 )
+
+
+def _display_manifests_with_reusable_cache(
+    top_pool: pd.DataFrame,
+    manifests: pd.DataFrame | None,
+    cached_manifests: pd.DataFrame | None,
+) -> pd.DataFrame:
+    base = manifests.copy() if manifests is not None else pd.DataFrame()
+    cache = cached_manifests.copy() if cached_manifests is not None else pd.DataFrame()
+    if cache.empty:
+        return base
+    needed_keys = set(_asset_key_candidates_for_top_pool(top_pool))
+    if not needed_keys:
+        return base
+    for column in ["asset_key", "status", "cover_path"]:
+        if column not in cache.columns:
+            cache[column] = ""
+    cache = cache[
+        cache["asset_key"].fillna("").astype(str).isin(needed_keys)
+        & cache["status"].fillna("").astype(str).eq("succeeded")
+        & cache["cover_path"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+    if cache.empty:
+        return base
+    if base.empty:
+        return cache.reset_index(drop=True)
+    if "asset_key" not in base.columns:
+        base["asset_key"] = ""
+    existing_keys = set(base["asset_key"].fillna("").astype(str))
+    missing_cache = cache[~cache["asset_key"].fillna("").astype(str).isin(existing_keys)].copy()
+    if missing_cache.empty:
+        return base.reset_index(drop=True)
+    return pd.concat([base, missing_cache], ignore_index=True, sort=False)
+
+
+def _asset_key_candidates_for_top_pool(top_pool: pd.DataFrame) -> list[str]:
+    if top_pool is None or top_pool.empty:
+        return []
+    candidates: list[str] = []
+    for _, row in top_pool.iterrows():
+        candidates.extend(_asset_key_candidates_for_row(row))
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def _reusable_cache_manifests_for_top_pool(top_pool: pd.DataFrame, entries: pd.DataFrame | None) -> pd.DataFrame:
+    if entries is None or entries.empty:
+        return pd.DataFrame()
+    needed_keys = set(_asset_key_candidates_for_top_pool(top_pool))
+    if not needed_keys:
+        return pd.DataFrame()
+    frame = entries.copy()
+    for column in ["asset_key", "asset_dir", "platform", "content_id"]:
+        if column not in frame.columns:
+            frame[column] = ""
+    frame = frame[frame["asset_key"].fillna("").astype(str).isin(needed_keys)].copy()
+    if frame.empty:
+        return pd.DataFrame()
+    manifests: list[dict[str, object]] = []
+    for _, row in frame.iterrows():
+        manifest = _cached_manifest_from_entry(row)
+        if manifest:
+            manifests.append(manifest)
+    return pd.DataFrame(manifests)
+
+
+def _cached_manifest_from_entry(row: pd.Series) -> dict[str, object]:
+    asset_key = _text(row.get("asset_key"))
+    asset_dir = Path(_text(row.get("asset_dir"))).expanduser()
+    if not asset_key or not asset_dir.exists() or not asset_dir.is_dir():
+        return {}
+    platform = _text(row.get("platform")) or _asset_key_platform(asset_key)
+    fallback_cover_path = _first_local_image_in_dir(asset_dir, platform=platform)
+    manifest = _read_cached_asset_manifest(asset_dir / "manifest.json", asset_key=asset_key)
+    if not manifest:
+        manifest = {
+            "status": "succeeded",
+            "platform": platform,
+            "asset_key": asset_key,
+            "asset_dir": str(asset_dir),
+            "cover_path": fallback_cover_path,
+            "video_path": "",
+            "screenshots_json": "[]",
+            "frames_json": "[]",
+            "metadata_json": "{}",
+            "error_message": "",
+        }
+    if _is_douyin_screenshot_only_manifest(manifest, asset_dir):
+        return {}
+    cover_path = _text(manifest.get("cover_path"))
+    if not cover_path or not Path(cover_path).expanduser().is_file():
+        cover_path = fallback_cover_path
+    if not cover_path or not Path(cover_path).expanduser().is_file():
+        return {}
+    manifest["job_id"] = _text(manifest.get("job_id"))
+    manifest["batch_id"] = _text(manifest.get("batch_id")) or "_reusable_cache"
+    manifest["status"] = "succeeded"
+    manifest["platform"] = _text(manifest.get("platform")) or platform
+    manifest["asset_key"] = asset_key
+    manifest["asset_dir"] = _text(manifest.get("asset_dir")) or str(asset_dir)
+    manifest["cover_path"] = cover_path
+    manifest["video_path"] = _text(manifest.get("video_path"))
+    manifest["screenshots_json"] = _manifest_list_json(manifest.get("screenshots_json") or manifest.get("screenshots"))
+    manifest["frames_json"] = _manifest_list_json(manifest.get("frames_json") or manifest.get("frames"))
+    manifest["metadata_json"] = _manifest_mapping_json(manifest.get("metadata_json") or manifest.get("metadata"))
+    manifest["error_message"] = ""
+    return manifest
+
+
+def _read_cached_asset_manifest(path: Path, *, asset_key: str) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _text(item.get("asset_key")) != asset_key:
+            continue
+        if _text(item.get("status")) != "succeeded":
+            continue
+        return dict(item)
+    return {}
+
+
+def _first_local_image_in_dir(asset_dir: Path, *, platform: str = "") -> str:
+    suffixes = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    image_paths = [path for path in sorted(asset_dir.rglob("*")) if path.is_file() and path.suffix.lower() in suffixes]
+    if _text(platform) == "抖音":
+        preferred = [
+            path
+            for path in image_paths
+            if path.parent.name in {"images", "frames"} or path.parent == asset_dir
+        ]
+        image_paths = preferred
+    for path in image_paths:
+        if path.is_file() and path.suffix.lower() in suffixes:
+            return str(path)
+    return ""
+
+
+def _asset_key_platform(asset_key: str) -> str:
+    return _text(asset_key).split("::", 1)[0] if "::" in _text(asset_key) else ""
+
+
+def _is_douyin_screenshot_only_manifest(manifest: dict[str, object], asset_dir: Path) -> bool:
+    platform = _text(manifest.get("platform")) or _asset_key_platform(_text(manifest.get("asset_key")))
+    if platform != "抖音":
+        return False
+    if _text(manifest.get("video_path")):
+        return False
+    if _manifest_list(manifest.get("frames_json") or manifest.get("frames")):
+        return False
+    cover_path = Path(_text(manifest.get("cover_path"))).expanduser()
+    screenshots = [Path(path).expanduser() for path in _manifest_list(manifest.get("screenshots_json") or manifest.get("screenshots"))]
+    if cover_path and str(cover_path) != "." and cover_path.parent.name not in {"screenshots", ""}:
+        return False
+    image_paths = [
+        path
+        for path in asset_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    ]
+    if any(path.parent.name in {"images", "frames"} or path.parent == asset_dir for path in image_paths):
+        return False
+    return bool(screenshots or image_paths)
+
+
+def _manifest_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [_text(item) for item in value if _text(item)]
+    text = _text(value)
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return [text]
+    if isinstance(parsed, list):
+        return [_text(item) for item in parsed if _text(item)]
+    return []
+
+
+def _manifest_list_json(value: object) -> str:
+    if isinstance(value, str):
+        text = _text(value)
+        return text if text.startswith("[") else "[]"
+    if isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False)
+    return "[]"
+
+
+def _manifest_mapping_json(value: object) -> str:
+    if isinstance(value, str):
+        text = _text(value)
+        return text if text.startswith("{") else "{}"
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return "{}"
 
 
 def _channel_top_link_card_html(row: pd.Series, cover_lookup: dict[str, str], *, rank: int) -> str:
@@ -3173,6 +3774,25 @@ def _analysis_job_result_analyzer(batch_id: str, analysis_purpose: str = ANALYSI
     return analyzer
 
 
+def _successful_analysis_identities(batch_id: str, analysis_purpose: str) -> set[str]:
+    jobs = list_analysis_jobs(APP_DB, batch_id=batch_id)
+    if jobs.empty:
+        return set()
+    scoped = jobs[
+        jobs.get("analysis_purpose", pd.Series(dtype=object)).map(_text).eq(analysis_purpose)
+        & jobs.get("status", pd.Series(dtype=object)).map(_text).eq("succeeded")
+    ].copy()
+    if scoped.empty or "content_identity_key" not in scoped.columns:
+        return set()
+    return {value for value in scoped["content_identity_key"].map(_text).tolist() if value}
+
+
+def _filter_pool_by_identities(pool: pd.DataFrame, identities: set[str]) -> pd.DataFrame:
+    if pool is None or pool.empty or not identities or "content_identity_key" not in pool.columns:
+        return pool.iloc[0:0].copy() if pool is not None else pd.DataFrame()
+    return pool[pool["content_identity_key"].map(_text).isin(identities)].copy()
+
+
 def _asset_source_label(value: object) -> str:
     text = _text(value)
     if not text:
@@ -3265,7 +3885,17 @@ def _image_data_uri(path: object) -> str:
     if not mime_type:
         return ""
     try:
-        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        stat = image_path.stat()
+    except OSError:
+        return ""
+    return _image_data_uri_cached(str(image_path), mime_type, int(stat.st_size), int(stat.st_mtime_ns))
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _image_data_uri_cached(path: str, mime_type: str, size_bytes: int, modified_ns: int) -> str:
+    del size_bytes, modified_ns
+    try:
+        encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
     except OSError:
         return ""
     return f"data:{mime_type};base64,{encoded}"
@@ -3448,6 +4078,29 @@ def _succeeded_manifest_count(manifests: pd.DataFrame) -> int:
     if manifests.empty or "status" not in manifests.columns:
         return 0
     return int(manifests["status"].astype(str).eq("succeeded").sum())
+
+
+def _scoped_succeeded_manifest_count(manifests: pd.DataFrame, scope: pd.DataFrame) -> int:
+    if manifests is None or manifests.empty or scope is None or scope.empty or "status" not in manifests.columns:
+        return 0
+    succeeded = manifests[manifests["status"].map(_text).eq("succeeded")].copy()
+    if succeeded.empty:
+        return 0
+    scope_identities = _non_blank_set(scope, "content_identity_key")
+    if scope_identities and "content_identity_key" in succeeded.columns:
+        matched = succeeded[succeeded["content_identity_key"].map(_text).isin(scope_identities)]
+        return int(len(matched))
+    scope_job_ids = _non_blank_set(scope, "job_id")
+    if scope_job_ids and "job_id" in succeeded.columns:
+        matched = succeeded[succeeded["job_id"].map(_text).isin(scope_job_ids)]
+        return int(len(matched))
+    return 0
+
+
+def _non_blank_set(frame: pd.DataFrame, column: str) -> set[str]:
+    if frame is None or frame.empty or column not in frame.columns:
+        return set()
+    return {value for value in frame[column].map(_text).tolist() if value}
 
 
 def _sum(frame: pd.DataFrame, column: str) -> float:

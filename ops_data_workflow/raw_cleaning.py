@@ -246,12 +246,19 @@ def clean_raw_period_dir(
     fetch_bilibili_metadata=None,
     allow_public_api_metadata: bool = True,
     resolve_douyin_shortlink=None,
+    preloaded_feishu_ledger: pd.DataFrame | None = None,
 ) -> CleanedPeriodBucket:
     """Clean an already-materialized raw source directory into an output dir."""
     raw_dir = Path(raw_dir)
     clean_dir = Path(output_dir) if output_dir is not None else raw_dir
     clean_dir.mkdir(parents=True, exist_ok=True)
-    ledger = load_cleaning_ledger(raw_dir, default_year=default_year, reference_root=reference_root, env_path=env_path)
+    ledger = load_cleaning_ledger(
+        raw_dir,
+        default_year=default_year,
+        reference_root=reference_root,
+        env_path=env_path,
+        preloaded_feishu_ledger=preloaded_feishu_ledger,
+    )
     ledger_warnings = [str(value) for value in ledger.attrs.get("ledger_warnings", []) if str(value).strip()]
     ledger_source_files = {Path(path).resolve() for path in ledger.attrs.get("source_files", set())}
     source_paths = [
@@ -1419,17 +1426,26 @@ def load_cleaning_ledger(
     default_year: int,
     reference_root: Path | None,
     env_path: Path | None = None,
+    preloaded_feishu_ledger: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     warnings: list[str] = []
     frames: list[pd.DataFrame] = []
     source_files: set[str] = set()
     feishu_snapshot: dict[str, object] | None = None
+    feishu_staleness: dict[str, object] | None = None
 
     try:
-        feishu_ledger = load_feishu_content_ledger(default_year=default_year, env_path=env_path)
+        feishu_ledger = (
+            preloaded_feishu_ledger
+            if preloaded_feishu_ledger is not None
+            else load_feishu_content_ledger(default_year=default_year, env_path=env_path)
+        )
         raw_snapshot = feishu_ledger.attrs.get("feishu_snapshot")
         if isinstance(raw_snapshot, dict):
             feishu_snapshot = raw_snapshot
+        raw_staleness = feishu_ledger.attrs.get("feishu_staleness")
+        if isinstance(raw_staleness, dict):
+            feishu_staleness = raw_staleness
         if bool(feishu_ledger.attrs.get("feishu_enabled", True)):
             warnings.extend(str(value) for value in feishu_ledger.attrs.get("ledger_warnings", []))
         if not feishu_ledger.empty:
@@ -1448,6 +1464,8 @@ def load_cleaning_ledger(
     ledger.attrs["ledger_warnings"] = warnings
     if feishu_snapshot is not None:
         ledger.attrs["feishu_snapshot"] = feishu_snapshot
+    if feishu_staleness is not None:
+        ledger.attrs["feishu_staleness"] = feishu_staleness
     return ledger
 
 

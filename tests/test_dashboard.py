@@ -45,7 +45,10 @@ from ops_data_workflow.storage import (
     list_manual_high_value_supplements,
     load_manual_recap_report,
     load_manual_recap_status,
+    load_range_recap_report,
+    load_range_recap_status,
     persist_manual_recap_report,
+    persist_range_recap_report,
     previous_successful_batch_id_for_period,
     upsert_manual_high_value_supplement,
 )
@@ -329,6 +332,45 @@ class DashboardTests(unittest.TestCase):
 
             self.assertEqual(missing, {"batch_id": "batch-1", "has_report": False})
             self.assertEqual(ready, {"batch_id": "batch-1", "has_report": True})
+
+    def test_range_recap_reports_are_persisted_per_scope_without_overwriting_manual_report(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+
+            persist_manual_recap_report(
+                db_path,
+                "batch-1",
+                provider="local",
+                model="oral-report-v1",
+                report={"overview": {"summary": "旧口头报告"}, "channels": []},
+            )
+            persist_range_recap_report(
+                db_path,
+                "batch-1",
+                "tier1_spend_top",
+                provider="deepseek",
+                model="deepseek-chat",
+                report={"range_key": "tier1_spend_top", "overview": {"report": "一级报告"}},
+            )
+            persist_range_recap_report(
+                db_path,
+                "batch-1",
+                "tier2_exposure_top",
+                provider="deepseek",
+                model="deepseek-chat",
+                report={"range_key": "tier2_exposure_top", "overview": {"report": "二级报告"}},
+            )
+
+            manual = load_manual_recap_report(db_path, "batch-1")
+            tier1 = load_range_recap_report(db_path, "batch-1", "tier1_spend_top")
+            tier2 = load_range_recap_report(db_path, "batch-1", "tier2_exposure_top")
+
+            self.assertEqual(manual["report"]["overview"]["summary"], "旧口头报告")
+            self.assertEqual(tier1["report"]["overview"]["report"], "一级报告")
+            self.assertEqual(tier2["report"]["overview"]["report"], "二级报告")
+            self.assertEqual(load_range_recap_status(db_path, "batch-1", "tier1_spend_top")["has_report"], True)
+            self.assertEqual(load_range_recap_status(db_path, "batch-1", "tier3_threshold")["has_report"], False)
 
     def test_manual_high_value_supplement_can_be_saved_and_make_recap_stale(self):
         with TemporaryDirectory() as tmp:

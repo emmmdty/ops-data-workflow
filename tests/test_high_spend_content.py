@@ -3,7 +3,14 @@ import unittest
 import pandas as pd
 
 from ops_data_workflow.pipeline import build_high_spend_content_pool
-from ops_data_workflow.top_asset_service import build_executable_top_content_pool
+from ops_data_workflow.top_asset_service import (
+    RECAP_TIER_1_SPEND_TOP,
+    RECAP_TIER_2_EXPOSURE_TOP,
+    RECAP_TIER_3_THRESHOLD,
+    build_executable_top_content_pool,
+    filter_executable_top_content_pool,
+    build_recap_tier_pool,
+)
 
 
 class HighSpendContentPoolTests(unittest.TestCase):
@@ -283,6 +290,19 @@ class HighSpendContentPoolTests(unittest.TestCase):
 
         self.assertEqual(set(pool["content_id"]), {"dy-analyzable", "note-matched"})
 
+    def test_executable_top_content_pool_can_filter_existing_display_pool(self):
+        display_pool = pd.DataFrame(
+            [
+                {"content_id": "dy-analyzable", "analysis_status": "可分析", "match_status": "未匹配"},
+                {"content_id": "note-matched", "analysis_status": "不可分析", "match_status": "已匹配"},
+                {"content_id": "BVunmatched", "analysis_status": "不可分析", "match_status": "未匹配"},
+            ]
+        )
+
+        pool = filter_executable_top_content_pool(display_pool)
+
+        self.assertEqual(set(pool["content_id"]), {"dy-analyzable", "note-matched"})
+
     def test_executable_top_content_pool_returns_empty_without_status_fields(self):
         frame = pd.DataFrame(
             [
@@ -298,6 +318,91 @@ class HighSpendContentPoolTests(unittest.TestCase):
         )
 
         self.assertTrue(build_executable_top_content_pool(frame).empty)
+
+    def test_recap_tier_pool_splits_spend_exposure_and_threshold_scopes(self):
+        rows = []
+        rows.extend(
+            {
+                "platform": "抖音",
+                "platform_group": "抖音",
+                "channel": "抖音商业化",
+                "content_id": f"dy-{index:02d}",
+                "title": f"抖音{index:02d}",
+                "account": "投放号",
+                "content_url": f"https://www.douyin.com/video/{index:02d}",
+                "spend": float(5000 - index * 10),
+                "impressions": float(1000 + index),
+                "analysis_status": "可分析",
+            }
+            for index in range(22)
+        )
+        rows.extend(
+            {
+                "platform": "小红书",
+                "platform_group": "小红书",
+                "channel": "小红书市场部",
+                "content_id": f"note-{index:02d}",
+                "title": f"小红书{index:02d}",
+                "account": "投放号",
+                "content_url": f"https://www.xiaohongshu.com/explore/note-{index:02d}",
+                "spend": float(3000 - index * 10),
+                "impressions": float(1000 + index),
+                "match_status": "已匹配",
+            }
+            for index in range(12)
+        )
+        rows.extend(
+            {
+                "platform": "B站",
+                "platform_group": "B站",
+                "channel": "B站市场部",
+                "content_id": f"BV{index:02d}",
+                "title": f"B站{index:02d}",
+                "account": "投放号",
+                "content_url": f"https://www.bilibili.com/video/BV{index:02d}",
+                "spend": float(100 - index),
+                "impressions": float(500000 - index * 100) if index >= 10 else float(200000 - index * 100),
+                "match_status": "已匹配",
+            }
+            for index in range(12)
+        )
+        rows.append(
+            {
+                "platform": "小红书",
+                "platform_group": "小红书",
+                "channel": "小红书市场部",
+                "content_id": "note-threshold",
+                "title": "阈值补充",
+                "account": "投放号",
+                "content_url": "https://www.xiaohongshu.com/explore/note-threshold",
+                "spend": 2100.0,
+                "impressions": 1000.0,
+                "match_status": "已匹配",
+            }
+        )
+
+        canonical = pd.DataFrame(rows)
+        tier1 = build_recap_tier_pool(canonical, RECAP_TIER_1_SPEND_TOP)
+        tier2 = build_recap_tier_pool(canonical, RECAP_TIER_2_EXPOSURE_TOP)
+        tier3 = build_recap_tier_pool(canonical, RECAP_TIER_3_THRESHOLD)
+
+        self.assertEqual(len(tier1[tier1["channel"].eq("抖音商业化")]), 20)
+        self.assertEqual(len(tier1[tier1["channel"].eq("小红书市场部")]), 10)
+        self.assertNotIn("dy-20", set(tier1["content_id"]))
+        self.assertIn("note-09", set(tier1["content_id"]))
+        self.assertNotIn("note-10", set(tier1["content_id"]))
+        self.assertEqual(set(tier2[tier2["channel"].eq("B站市场部")]["content_id"]), {"BV10", "BV11"})
+        tier1_ids = set(tier1["content_identity_key"])
+        tier2_ids = set(tier2["content_identity_key"])
+        tier3_ids = set(tier3["content_identity_key"])
+        self.assertFalse(tier1_ids & tier2_ids)
+        self.assertFalse((tier1_ids | tier2_ids) & tier3_ids)
+        self.assertIn("note-threshold", set(tier3["content_id"]))
+        self.assertNotIn("dy-20", set(tier3["content_id"]))
+        self.assertNotIn("dy-21", set(tier3["content_id"]))
+        self.assertTrue(tier1["recap_tier"].eq(RECAP_TIER_1_SPEND_TOP).all())
+        self.assertTrue(tier2["recap_tier"].eq(RECAP_TIER_2_EXPOSURE_TOP).all())
+        self.assertTrue(tier3["recap_tier"].eq(RECAP_TIER_3_THRESHOLD).all())
 
 
 if __name__ == "__main__":

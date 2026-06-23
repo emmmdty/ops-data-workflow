@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
 from typing import Iterable, Protocol
+from zipfile import ZipFile
 
 from .generated_artifacts import is_generated_tabular_artifact
 from .source_channels import infer_channel_from_path
@@ -59,9 +60,11 @@ def materialize_uploaded_files(
 ) -> MaterializedUploads:
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    normalized_uploads = [(upload, _normalize_upload_relative_path(upload.name)) for upload in uploads]
-    period_root = _common_period_root(normalized_uploads) if strip_common_period_root else ""
-    incoming_channels = _incoming_channels(normalized_uploads, period_root)
+    uploads = list(uploads)
+    normalized_sources = _normalized_upload_sources(uploads)
+    normalized_inputs = _normalized_uploads_with_zip_members(uploads)
+    period_root = _common_period_root(normalized_inputs) if strip_common_period_root else ""
+    incoming_channels = _incoming_channels(normalized_inputs, period_root)
     conflicts = _channel_conflicts_for_channels(target_dir, incoming_channels)
     if conflicts and not replace_same_channel:
         channels = "、".join(conflict.channel for conflict in conflicts)
@@ -74,7 +77,7 @@ def materialize_uploaded_files(
     materialized_files: list[Path] = []
     with TemporaryDirectory() as tmp:
         staging_dir = Path(tmp)
-        for upload, relative_path in normalized_uploads:
+        for upload, relative_path in normalized_sources:
             destination_relative_path = _strip_period_root(relative_path, period_root)
             safe_name = relative_path.name
             suffix = relative_path.suffix.lower()
@@ -84,7 +87,7 @@ def materialize_uploaded_files(
             if suffix == ".zip":
                 staged_zip = staging_dir / relative_path.name
                 staged_zip.write_bytes(upload.getvalue())
-                extract_zip(staged_zip, target_dir)
+                extract_zip(staged_zip, target_dir, strip_root=period_root)
             else:
                 destination = target_dir / destination_relative_path
                 _validate_path_within_root(destination, target_dir, destination_relative_path.as_posix())
@@ -101,7 +104,7 @@ def detect_upload_channel_conflicts(
     *,
     strip_common_period_root: bool = False,
 ) -> list[UploadChannelConflict]:
-    normalized_uploads = [(upload, _normalize_upload_relative_path(upload.name)) for upload in uploads]
+    normalized_uploads = _normalized_uploads_with_zip_members(uploads)
     period_root = _common_period_root(normalized_uploads) if strip_common_period_root else ""
     incoming_channels = _incoming_channels(normalized_uploads, period_root)
     return _channel_conflicts_for_channels(Path(target_dir), incoming_channels, normalized_uploads, period_root)
@@ -115,6 +118,29 @@ def _normalize_upload_relative_path(upload_name: str) -> Path:
     return path
 
 
+def _normalized_upload_sources(uploads: Iterable[UploadedFileLike]) -> list[tuple[UploadedFileLike, Path]]:
+    return [(upload, _normalize_upload_relative_path(upload.name)) for upload in uploads]
+
+
+def _normalized_uploads_with_zip_members(uploads: Iterable[UploadedFileLike]) -> list[tuple[UploadedFileLike, Path]]:
+    normalized_uploads: list[tuple[UploadedFileLike, Path]] = []
+    for upload, relative_path in _normalized_upload_sources(uploads):
+        normalized_uploads.append((upload, relative_path))
+        if relative_path.suffix.lower() != ".zip":
+            continue
+        with TemporaryDirectory() as tmp:
+            staged_zip = Path(tmp) / relative_path.name
+            staged_zip.write_bytes(upload.getvalue())
+            with ZipFile(staged_zip) as archive:
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+                    member_path = _normalize_upload_relative_path(member.filename)
+                    if member_path.suffix.lower() in SUPPORTED_UPLOAD_SUFFIXES - {".zip"}:
+                        normalized_uploads.append((upload, member_path))
+    return normalized_uploads
+
+
 def _validate_path_within_root(path: Path, root: Path, source_name: str) -> None:
     resolved = path.resolve()
     root_resolved = root.resolve()
@@ -125,6 +151,8 @@ def _validate_path_within_root(path: Path, root: Path, source_name: str) -> None
 def _common_period_root(normalized_uploads: list[tuple[UploadedFileLike, Path]]) -> str:
     roots = []
     for _, relative_path in normalized_uploads:
+        if relative_path.suffix.lower() == ".zip":
+            continue
         if len(relative_path.parts) < 2:
             return ""
         root = relative_path.parts[0]

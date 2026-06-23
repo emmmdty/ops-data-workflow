@@ -6,6 +6,7 @@ import unittest
 import pandas as pd
 
 from ops_data_workflow.cleaning_pipeline import split_channel_total_rows
+from ops_data_workflow.storage import init_db
 from ops_data_workflow.storage import (
     list_content_performance_items,
     list_period_channel_totals,
@@ -157,6 +158,45 @@ class CleaningPipelineTests(unittest.TestCase):
             self.assertTrue(performance.empty)
             self.assertEqual(len(totals), 2)
             self.assertIn("总计", set(totals["channel"]))
+
+    def test_period_channel_totals_falls_back_to_total_summary_for_legacy_batches(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with sqlite3.connect(db_path) as conn:
+                pd.DataFrame(
+                    [
+                        {
+                            "batch_id": "legacy-batch",
+                            "channel": "抖音商业化",
+                            "platform": "抖音",
+                            "spend": 1000,
+                            "impressions": 20000,
+                            "clicks": 0,
+                            "activations": 20,
+                            "first_pay_count": 5,
+                            "activation_cost": 50,
+                            "first_pay_cost": 200,
+                        },
+                        {
+                            "batch_id": "legacy-batch",
+                            "channel": "总计",
+                            "platform": "",
+                            "spend": 1000,
+                            "impressions": 20000,
+                            "clicks": 0,
+                            "activations": 20,
+                            "first_pay_count": 5,
+                            "activation_cost": 50,
+                            "first_pay_cost": 200,
+                        },
+                    ]
+                ).to_sql("total_summary_items", conn, if_exists="append", index=False)
+
+            totals = list_period_channel_totals(db_path, batch_id="legacy-batch")
+
+            self.assertEqual(set(totals["channel"]), {"抖音商业化", "总计"})
+            self.assertTrue(totals["is_channel_total"].astype(bool).all())
 
     def test_douyin_primary_without_secondaries_keeps_empty_performance_l2(self):
         with TemporaryDirectory() as tmp:

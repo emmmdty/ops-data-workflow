@@ -106,6 +106,45 @@ class AnalysisJobTests(unittest.TestCase):
             self.assertEqual(set(jobs["analysis_purpose"]), {ANALYSIS_PURPOSE_FILL_MISSING_TYPE, ANALYSIS_PURPOSE_STRATEGY_RECAP})
             self.assertIn(ANALYSIS_PURPOSE_FILL_MISSING_TYPE, jobs.iloc[0]["payload_json"])
 
+    def test_strategy_jobs_are_distinct_per_recap_tier_purpose(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite3"
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "channel": "抖音商业化",
+                        "platform": "抖音",
+                        "content_identity_key": "douyin-1",
+                        "title": "抖音Top",
+                        "content_url": "https://www.douyin.com/video/1",
+                    }
+                ]
+            )
+
+            tier1 = enqueue_top_multimodal_jobs(
+                db_path,
+                "batch-1",
+                top_content,
+                trigger="tier1",
+                analysis_purpose="strategy_recap:tier1_spend_top",
+            )
+            tier2 = enqueue_top_multimodal_jobs(
+                db_path,
+                "batch-1",
+                top_content,
+                trigger="tier2",
+                analysis_purpose="strategy_recap:tier2_exposure_top",
+            )
+            jobs = list_analysis_jobs(db_path, batch_id="batch-1")
+
+            self.assertEqual(len(tier1), 1)
+            self.assertEqual(len(tier2), 1)
+            self.assertNotEqual(tier1[0], tier2[0])
+            self.assertEqual(
+                set(jobs["analysis_purpose"]),
+                {"strategy_recap:tier1_spend_top", "strategy_recap:tier2_exposure_top"},
+            )
+
     def test_manual_top_analysis_reset_requeues_existing_jobs_with_new_prompt(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "jobs.sqlite3"
@@ -362,3 +401,114 @@ class AnalysisJobTests(unittest.TestCase):
             self.assertEqual(jobs.iloc[0]["status"], "queued")
             self.assertFalse(bool(jobs.iloc[0]["visible_alert"]))
             self.assertEqual(jobs.iloc[0]["error_message"], "")
+
+    def test_multimodal_analysis_uses_douyin_ad_material_evidence_without_manifest(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite3"
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "channel": "抖音商业化",
+                        "platform": "抖音",
+                        "content_identity_key": "dy-giant-1",
+                        "content_id": "",
+                        "title": "巨量素材可先分析",
+                        "content_url": "",
+                        "ad_material_url": "https://巨量.example/video.mp4",
+                        "ad_cover_url": "https://巨量.example/cover.jpg",
+                        "spend": 3000.0,
+                        "impressions": 120000.0,
+                    }
+                ]
+            )
+            enqueue_top_multimodal_jobs(db_path, "batch-1", top_content, trigger="upload")
+
+            seen = {}
+            updated = run_top_multimodal_analysis_from_manifests(
+                db_path,
+                "batch-1",
+                analyzer=lambda job, manifest: seen.setdefault(
+                    "payload",
+                    {
+                        "内容形态": "视频",
+                        "一级内容类型": "视频",
+                        "二级内容类型": "投顾观点",
+                        "视觉结构": ",".join(manifest["remote_media_urls"]),
+                        "共性总结": manifest["metadata"]["evidence_source"],
+                    },
+                ),
+            )
+            jobs = list_analysis_jobs(db_path, batch_id="batch-1")
+
+            self.assertEqual(updated, 1)
+            self.assertEqual(jobs.iloc[0]["status"], "succeeded")
+            self.assertEqual(seen["payload"]["视觉结构"], "https://巨量.example/cover.jpg,https://巨量.example/video.mp4")
+            self.assertIn('"共性总结": "douyin_ad_material"', jobs.iloc[0]["result_json"])
+
+    def test_multimodal_analysis_can_run_only_one_tier_purpose(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite3"
+            top_content = pd.DataFrame(
+                [
+                    {
+                        "channel": "抖音商业化",
+                        "platform": "抖音",
+                        "content_identity_key": "dy-1",
+                        "title": "抖音Top",
+                        "content_url": "https://www.douyin.com/video/1",
+                    }
+                ]
+            )
+            reset_top_multimodal_jobs(
+                db_path,
+                "batch-1",
+                top_content,
+                trigger="tier1",
+                analysis_purpose="strategy_recap:tier1_spend_top",
+            )
+            reset_top_multimodal_jobs(
+                db_path,
+                "batch-1",
+                top_content,
+                trigger="tier2",
+                analysis_purpose="strategy_recap:tier2_exposure_top",
+            )
+            persist_harvester_asset_jobs(
+                db_path,
+                "batch-1",
+                [
+                    {
+                        "job_id": "harvester-job-1",
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "dy-1",
+                    }
+                ],
+                status="succeeded",
+                harvester_root=Path(tmp) / "harvester",
+                jobs_path=Path(tmp) / "jobs.jsonl",
+                manifest_path=Path(tmp) / "manifest.json",
+            )
+            persist_harvester_asset_manifests(
+                db_path,
+                "batch-1",
+                [
+                    {
+                        "job_id": "harvester-job-1",
+                        "status": "succeeded",
+                        "platform": "抖音",
+                        "asset_dir": "/tmp/assets/dy-1",
+                    }
+                ],
+            )
+
+            updated = run_top_multimodal_analysis_from_manifests(
+                db_path,
+                "batch-1",
+                analysis_purpose="strategy_recap:tier1_spend_top",
+            )
+            jobs = list_analysis_jobs(db_path, batch_id="batch-1").set_index("analysis_purpose")
+
+            self.assertEqual(updated, 1)
+            self.assertEqual(jobs.loc["strategy_recap:tier1_spend_top", "status"], "succeeded")
+            self.assertEqual(jobs.loc["strategy_recap:tier2_exposure_top", "status"], "queued")

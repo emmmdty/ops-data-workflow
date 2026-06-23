@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import date
 import re
 from tempfile import TemporaryDirectory
 import unittest
@@ -6,7 +7,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from ops_data_workflow.feishu_ledger import load_feishu_content_ledger
+from ops_data_workflow.feishu_ledger import build_feishu_staleness_summary, load_feishu_content_ledger
 from ops_data_workflow.periods import period_metadata_from_dates
 from ops_data_workflow.raw_cleaning import clean_raw_period_dir, load_cleaning_ledger
 
@@ -70,6 +71,63 @@ class FakeSession:
 
 
 class FeishuLedgerTests(unittest.TestCase):
+    def test_build_feishu_staleness_summary_flags_only_channels_over_three_days_or_missing_dates(self):
+        ledger = pd.DataFrame(
+            [
+                {"platform": "抖音", "published_date": "2026-06-20"},
+                {"platform": "抖音", "published_date": "2026-06-18"},
+                {"platform": "小红书", "published_date": "2026年6月19日"},
+                {"platform": "小红书", "published_date": "06 18"},
+                {"platform": "B站", "published_date": ""},
+            ]
+        )
+
+        summary = build_feishu_staleness_summary(ledger, today=date(2026, 6, 23), default_year=2026)
+
+        by_platform = {item["platform"]: item for item in summary["items"]}
+        self.assertFalse(by_platform["抖音"]["needs_check"])
+        self.assertEqual(by_platform["抖音"]["latest_published_date"], "2026-06-20")
+        self.assertEqual(by_platform["抖音"]["days_since_latest"], 3)
+        self.assertTrue(by_platform["小红书"]["needs_check"])
+        self.assertEqual(by_platform["小红书"]["latest_published_date"], "2026-06-19")
+        self.assertEqual(by_platform["小红书"]["days_since_latest"], 4)
+        self.assertTrue(by_platform["B站"]["needs_check"])
+        self.assertEqual(by_platform["B站"]["latest_published_date"], "")
+        self.assertIsNone(by_platform["B站"]["days_since_latest"])
+        self.assertTrue(summary["needs_check"])
+        self.assertEqual(summary["needs_check_platforms"], ["小红书", "B站"])
+
+    def test_load_feishu_content_ledger_attaches_staleness_to_attrs_and_snapshot(self):
+        session = FakeSession(
+            {
+                "dySheet": [
+                    ["编号", "投稿时间", "内容链接", "作品ID", "标题", "账号", "内容类型"],
+                    ["1", "2026-06-20", "https://www.douyin.com/video/7594830477777751338", "7594830477777751338", "抖音标题", "投资号", "资讯"],
+                ],
+                "xhsSheet": [
+                    ["编号", "投稿时间", "内容链接", "笔记ID", "标题", "账号", "内容类型"],
+                    ["1", "2026-06-18", "https://www.xiaohongshu.com/explore/note-1", "note-1", "小红书标题", "投资号", "图文"],
+                ],
+                "biliSheet": [["编号", "投稿时间", "内容链接", "短链id", "账号", "标题", "tag词"]],
+            }
+        )
+        env = {
+            "FEISHU_APP_ID": "app-id",
+            "FEISHU_APP_SECRET": "app-secret",
+            "FEISHU_SPREADSHEET_TOKEN": "spreadsheet-token",
+            "FEISHU_SHEET_DOUYIN": "dySheet",
+            "FEISHU_SHEET_XHS": "xhsSheet",
+            "FEISHU_SHEET_BILIBILI": "biliSheet",
+        }
+
+        ledger = load_feishu_content_ledger(env=env, session=session, today=date(2026, 6, 23))
+
+        staleness = ledger.attrs["feishu_staleness"]
+        snapshot_staleness = ledger.attrs["feishu_snapshot"]["staleness"]
+        self.assertEqual(staleness, snapshot_staleness)
+        self.assertTrue(staleness["needs_check"])
+        self.assertEqual(staleness["needs_check_platforms"], ["小红书", "B站"])
+
     def test_missing_feishu_config_returns_empty_disabled_ledger(self):
         with TemporaryDirectory() as tmp:
             empty_env = Path(tmp) / ".env"

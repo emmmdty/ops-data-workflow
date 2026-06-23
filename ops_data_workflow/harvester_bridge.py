@@ -647,7 +647,7 @@ def _manifest_has_invalid_visual_fallback(manifest: Mapping[str, object]) -> boo
         extracted_media = bool(fallback.get("extractedMedia") or fallback.get("extracted_media"))
         if fallback_kind == "douyin-note-visual" and not extracted_media and "yt-dlp" in text:
             return True
-    return any(token in text for token in ["视频不存在", "观看的视频不存在", "内容不存在", "页面不存在", "404"])
+    return any(token in text for token in ["视频数据加载中", "视频不存在", "观看的视频不存在", "内容不存在", "页面不存在", "404"])
 
 
 def _platform_from_daily_platform_id(value: str) -> str:

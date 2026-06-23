@@ -70,6 +70,7 @@ TYPE_RECAP_COLUMNS = [
 ]
 STRATEGY_RECAP_COLUMNS = [
     "batch_id",
+    "analysis_purpose",
     "channel",
     "platform",
     "type_level",
@@ -112,7 +113,13 @@ def persist_multimodal_recap(
         updates = _classification_updates(items)
         fill_missing_content_performance_types(db_path, batch_id, updates)
     else:
-        strategy_recap = build_strategy_recap_items(db_path, batch_id, top_content, multimodal_results=items)
+        strategy_recap = build_strategy_recap_items(
+            db_path,
+            batch_id,
+            top_content,
+            multimodal_results=items,
+            analysis_purpose=analysis_purpose,
+        )
         strategy_count = persist_strategy_recap_items(db_path, batch_id, strategy_recap)
     return PersistedMultimodalRecap(item_count=int(len(items)), type_count=type_count, strategy_count=int(strategy_count))
 
@@ -245,6 +252,7 @@ def build_strategy_recap_items(
     top_content: pd.DataFrame,
     *,
     multimodal_results: pd.DataFrame | None = None,
+    analysis_purpose: str = ANALYSIS_PURPOSE_STRATEGY_RECAP,
 ) -> pd.DataFrame:
     if top_content is None or top_content.empty:
         return pd.DataFrame(columns=STRATEGY_RECAP_COLUMNS)
@@ -268,6 +276,7 @@ def build_strategy_recap_items(
             records.append(
                 {
                     "batch_id": batch_id,
+                    "analysis_purpose": analysis_purpose,
                     "channel": _text(row.get("channel")),
                     "platform": platform,
                     "type_level": type_level,
@@ -302,6 +311,7 @@ def build_strategy_recap_items(
         rows.append(
             {
                 "batch_id": keys[0],
+                "analysis_purpose": analysis_purpose,
                 "channel": keys[1],
                 "platform": keys[2],
                 "type_level": keys[3],

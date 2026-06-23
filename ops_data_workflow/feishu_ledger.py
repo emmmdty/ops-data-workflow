@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import os
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from typing import Mapping
 
@@ -66,6 +67,7 @@ def load_feishu_content_ledger(
     env_path: Path | None = None,
     session: object | None = None,
     default_year: int = 2026,
+    today: date | None = None,
 ) -> pd.DataFrame:
     """Return harvester Feishu rows as content ledger records.
 
@@ -77,7 +79,9 @@ def load_feishu_content_ledger(
         empty = _empty_ledger()
         empty.attrs["feishu_enabled"] = False
         empty.attrs["ledger_warnings"] = warnings
-        empty.attrs["feishu_snapshot"] = _snapshot(empty, enabled=False, warnings=warnings)
+        staleness = build_feishu_staleness_summary(empty, today=today, default_year=default_year)
+        empty.attrs["feishu_staleness"] = staleness
+        empty.attrs["feishu_snapshot"] = _snapshot(empty, enabled=False, warnings=warnings, staleness=staleness)
         return empty
 
     client = _FeishuSheetsClient(config, session=session)
@@ -94,13 +98,16 @@ def load_feishu_content_ledger(
 
     if not records_by_platform:
         empty = _empty_ledger()
+        staleness = build_feishu_staleness_summary(empty, today=today, default_year=default_year)
         empty.attrs["feishu_enabled"] = True
         empty.attrs["ledger_warnings"] = warnings
+        empty.attrs["feishu_staleness"] = staleness
         empty.attrs["feishu_snapshot"] = _snapshot(
             empty,
             enabled=True,
             warnings=warnings,
             sheet_row_counts=sheet_row_counts,
+            staleness=staleness,
         )
         return empty
 
@@ -119,13 +126,59 @@ def load_feishu_content_ledger(
     result.attrs["source_files"] = source_files
     result.attrs["feishu_enabled"] = True
     result.attrs["ledger_warnings"] = warnings
+    staleness = build_feishu_staleness_summary(result, today=today, default_year=default_year)
+    result.attrs["feishu_staleness"] = staleness
     result.attrs["feishu_snapshot"] = _snapshot(
         result,
         enabled=True,
         warnings=warnings,
         sheet_row_counts=sheet_row_counts,
+        staleness=staleness,
     )
     return result
+
+
+def build_feishu_staleness_summary(
+    ledger: pd.DataFrame,
+    *,
+    today: date | None = None,
+    default_year: int = 2026,
+    stale_after_days: int = 3,
+) -> dict[str, object]:
+    """Summarize whether each Feishu platform ledger appears stale."""
+    today = today or datetime.now(timezone.utc).date()
+    items: list[dict[str, object]] = []
+    for platform_name, latest_date in _latest_published_dates_by_platform(ledger, default_year=default_year).items():
+        days_since_latest = (today - latest_date).days if latest_date is not None else None
+        needs_check = latest_date is None or (days_since_latest is not None and days_since_latest > stale_after_days)
+        latest_text = latest_date.isoformat() if latest_date is not None else ""
+        if latest_date is None:
+            status = "missing_date"
+            message = f"{platform_name}没有可识别的最新投稿时间，请检查飞书台账。"
+        elif needs_check:
+            status = "stale"
+            message = f"{platform_name}最新投稿时间 {latest_text}，已 {days_since_latest} 天未更新，请检查飞书台账。"
+        else:
+            status = "fresh"
+            message = f"{platform_name}最新投稿时间 {latest_text}，距今天 {days_since_latest} 天。"
+        items.append(
+            {
+                "platform": platform_name,
+                "latest_published_date": latest_text,
+                "days_since_latest": days_since_latest,
+                "needs_check": bool(needs_check),
+                "status": status,
+                "message": message,
+            }
+        )
+    needs_check_platforms = [str(item["platform"]) for item in items if bool(item["needs_check"])]
+    return {
+        "checked_at": today.isoformat(),
+        "stale_after_days": int(stale_after_days),
+        "needs_check": bool(needs_check_platforms),
+        "needs_check_platforms": needs_check_platforms,
+        "items": items,
+    }
 
 
 def _snapshot(
@@ -134,6 +187,7 @@ def _snapshot(
     enabled: bool,
     warnings: list[str],
     sheet_row_counts: dict[str, int] | None = None,
+    staleness: dict[str, object] | None = None,
 ) -> dict[str, object]:
     total = int(len(ledger))
     platform_counts = ledger.get("platform", pd.Series(dtype=object)).value_counts(dropna=False).to_dict() if total else {}
@@ -162,7 +216,59 @@ def _snapshot(
         "sheet_row_counts": sheet_row_counts or {},
         "field_completeness": completeness,
         "warnings": list(warnings),
+        "staleness": staleness or build_feishu_staleness_summary(ledger),
     }
+
+
+def _latest_published_dates_by_platform(ledger: pd.DataFrame, *, default_year: int) -> dict[str, date | None]:
+    result = {platform_name: None for platform_name, _ in PLATFORM_SHEETS.values()}
+    if ledger is None or ledger.empty or "platform" not in ledger.columns or "published_date" not in ledger.columns:
+        return result
+    for platform_name in result:
+        dates = [
+            parsed
+            for parsed in (
+                _parse_published_date(value, default_year)
+                for value in ledger.loc[ledger["platform"].astype(str).eq(platform_name), "published_date"].tolist()
+            )
+            if parsed is not None
+        ]
+        result[platform_name] = max(dates) if dates else None
+    return result
+
+
+def _parse_published_date(value: object, default_year: int) -> date | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = _text(value)
+    if not text:
+        return None
+    year_match = re.search(r"(?<!\d)(20\d{2})[./年\-\s]*(\d{1,2})[./月\-\s]*(\d{1,2})日?(?!\d)", text)
+    if year_match:
+        return _date_or_none(int(year_match.group(1)), int(year_match.group(2)), int(year_match.group(3)))
+    month_day_match = re.search(r"(?<!\d)(\d{1,2})[./月\-\s]+(\d{1,2})日?(?!\d)", text)
+    if month_day_match:
+        return _date_or_none(default_year, int(month_day_match.group(1)), int(month_day_match.group(2)))
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.notna(parsed):
+        return parsed.date()
+    return None
+
+
+def _date_or_none(year: int, month: int, day: int) -> date | None:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
 
 
 def _load_config(

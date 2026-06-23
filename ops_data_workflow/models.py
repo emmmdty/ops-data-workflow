@@ -42,3 +42,4 @@ class WorkflowResult:
     unmatched_attribution: pd.DataFrame = field(default_factory=pd.DataFrame)
     account_filter_rules: pd.DataFrame = field(default_factory=pd.DataFrame)
     account_filter_details: pd.DataFrame = field(default_factory=pd.DataFrame)
+    feishu_staleness: dict[str, object] = field(default_factory=dict)

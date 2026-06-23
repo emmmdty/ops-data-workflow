@@ -306,6 +306,7 @@ def run_top_multimodal_analysis_from_manifests(
     batch_id: str,
     *,
     analyzer: Callable[[Mapping[str, object], Mapping[str, object]], Mapping[str, object]] | None = None,
+    analysis_purpose: str = "",
 ) -> int:
     jobs = list_analysis_jobs(db_path, batch_id=batch_id)
     if jobs.empty:
@@ -328,13 +329,18 @@ def run_top_multimodal_analysis_from_manifests(
             if identity:
                 manifest_by_identity[identity] = manifest
     updated = 0
+    purpose_filter = _text(analysis_purpose)
     for _, row in jobs.iterrows():
         if _text(row.get("job_type")) != TOP_MULTIMODAL_JOB_TYPE:
+            continue
+        if purpose_filter and _text(row.get("analysis_purpose")) != purpose_filter:
             continue
         if _text(row.get("status")) not in {JOB_STATUS_QUEUED, JOB_STATUS_RETRY, JOB_STATUS_RUNNING}:
             continue
         job_id = _text(row.get("job_id"))
         manifest = manifest_by_job.get(job_id) or manifest_by_identity.get(_text(row.get("content_identity_key")))
+        if manifest is None:
+            manifest = _remote_evidence_manifest(row.to_dict())
         if manifest is None:
             continue
         try:
@@ -470,9 +476,39 @@ def _job_id(batch_id: str, job_type: str, analysis_purpose: str, identity: str) 
 
 def _analysis_purpose(value: object) -> str:
     text = _text(value)
-    if text == ANALYSIS_PURPOSE_FILL_MISSING_TYPE:
+    if text == ANALYSIS_PURPOSE_FILL_MISSING_TYPE or text.startswith(f"{ANALYSIS_PURPOSE_FILL_MISSING_TYPE}:"):
         return ANALYSIS_PURPOSE_FILL_MISSING_TYPE
-    return ANALYSIS_PURPOSE_STRATEGY_RECAP
+    if text.startswith(f"{ANALYSIS_PURPOSE_STRATEGY_RECAP}:"):
+        return text
+    return text or ANALYSIS_PURPOSE_STRATEGY_RECAP
+
+
+def _remote_evidence_manifest(job: Mapping[str, object]) -> dict[str, object] | None:
+    payload = _metadata_dict(job.get("payload_json"))
+    platform = _text(job.get("platform")) or _text(payload.get("platform"))
+    ad_material_url = _text(job.get("ad_material_url")) or _text(payload.get("ad_material_url"))
+    ad_cover_url = _text(job.get("ad_cover_url")) or _text(payload.get("ad_cover_url"))
+    if platform != "抖音" or not (ad_material_url or ad_cover_url):
+        return None
+    remote_media_urls = [url for url in [ad_cover_url, ad_material_url] if url]
+    return {
+        "job_id": _text(job.get("job_id")),
+        "status": "succeeded",
+        "platform": platform,
+        "asset_key": _text(job.get("content_identity_key")),
+        "asset_dir": "",
+        "cover_path": "",
+        "video_path": "",
+        "screenshots_json": "[]",
+        "frames_json": "[]",
+        "remote_media_urls": remote_media_urls,
+        "metadata": {
+            "evidence_source": "douyin_ad_material",
+            "ad_material_url": ad_material_url,
+            "ad_cover_url": ad_cover_url,
+        },
+        "error_message": "",
+    }
 
 
 def _ensure_analysis_job_columns(conn: sqlite3.Connection) -> None:

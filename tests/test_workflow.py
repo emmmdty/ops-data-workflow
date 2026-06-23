@@ -789,6 +789,53 @@ xiaohongshu:
             self.assertAlmostEqual(xhs["activations"].sum(), 12.0)
             self.assertAlmostEqual(xhs["first_pay_count"].sum(), 6.0)
 
+    def test_archived_workflow_reuses_preloaded_feishu_ledger_and_exposes_staleness(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "workflow.sqlite3"
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            _write_raw_fixture(raw_dir)
+            ledger = _feishu_ledger_fixture()
+            staleness = {
+                "needs_check": True,
+                "needs_check_platforms": ["抖音"],
+                "items": [
+                    {
+                        "platform": "抖音",
+                        "latest_published_date": "2026-04-03",
+                        "days_since_latest": 81,
+                        "needs_check": True,
+                        "status": "stale",
+                        "message": "抖音最新投稿时间 2026-04-03，已 81 天未更新，请检查飞书台账。",
+                    }
+                ],
+            }
+            ledger.attrs["feishu_staleness"] = staleness
+            ledger.attrs["feishu_snapshot"]["staleness"] = staleness
+
+            with patch("ops_data_workflow.raw_cleaning.load_feishu_content_ledger") as load_feishu:
+                result = run_archived_workflow(
+                    raw_dir,
+                    "2026-04-01",
+                    "2026-04-30",
+                    output_root=tmp_path / "outputs",
+                    archive_root=tmp_path / "archive",
+                    db_path=db_path,
+                    env_path=tmp_path / "missing.env",
+                    preloaded_feishu_ledger=ledger,
+                )
+
+            load_feishu.assert_not_called()
+            self.assertEqual(result.feishu_staleness, staleness)
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = conn.execute(
+                    "select staleness_json from feishu_ledger_snapshots where batch_id = ?",
+                    (result.batch_id,),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(json.loads(row[0])["needs_check_platforms"], ["抖音"])
+
     def test_xiaohongshu_market_link_only_rows_keep_link_out_of_title(self):
         with TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"

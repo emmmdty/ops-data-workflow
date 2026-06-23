@@ -13,6 +13,14 @@ from .title_matching import normalized_title_key
 HIGH_SPEND_ABSOLUTE_THRESHOLD = 2000.0
 HIGH_IMPRESSIONS_ABSOLUTE_THRESHOLD = 100000.0
 TARGET_TOP_PLATFORMS = {"抖音", "小红书", "B站"}
+RECAP_TIER_1_SPEND_TOP = "tier1_spend_top"
+RECAP_TIER_2_EXPOSURE_TOP = "tier2_exposure_top"
+RECAP_TIER_3_THRESHOLD = "tier3_threshold"
+RECAP_TIER_LABELS = {
+    RECAP_TIER_1_SPEND_TOP: "一级：消耗优先",
+    RECAP_TIER_2_EXPOSURE_TOP: "二级：曝光补充",
+    RECAP_TIER_3_THRESHOLD: "三级：阈值补充",
+}
 DEFAULT_NUMERIC_COLUMNS = ["spend", "impressions", "clicks", "activations", "first_pay_count"]
 DEFAULT_STANDARD_COLUMNS = [
     "platform",
@@ -162,17 +170,63 @@ def build_executable_top_content_pool(
         standard_columns=standard_columns,
         numeric_columns=numeric_columns,
     )
-    has_analysis_status = "analysis_status" in display_pool.columns
-    has_match_status = "match_status" in display_pool.columns
-    if not has_analysis_status and not has_match_status:
-        return display_pool.iloc[0:0].copy()
+    return filter_executable_top_content_pool(display_pool)
 
-    executable_mask = pd.Series(False, index=display_pool.index)
-    if has_analysis_status:
-        executable_mask |= display_pool["analysis_status"].fillna("").astype(str).str.strip().eq("可分析")
-    if has_match_status:
-        executable_mask |= display_pool["match_status"].fillna("").astype(str).str.strip().eq("已匹配")
-    return display_pool[executable_mask].copy().reset_index(drop=True)
+
+def filter_executable_top_content_pool(display_pool: pd.DataFrame) -> pd.DataFrame:
+    """Filter an already-built Top pool down to rows safe for capture or analysis."""
+    return _filter_executable(display_pool).reset_index(drop=True)
+
+
+def build_recap_tier_pool(
+    canonical: pd.DataFrame,
+    tier: str,
+    *,
+    executable_only: bool = True,
+    standard_columns: list[str] | None = None,
+    numeric_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Build one non-overlapping recap scope for staged capture/analysis."""
+    display_pool = build_high_spend_content_pool(
+        canonical,
+        standard_columns=standard_columns,
+        numeric_columns=numeric_columns,
+    )
+    if display_pool.empty:
+        return _empty_tier_pool(display_pool)
+    frame = display_pool.copy()
+    for column in ["rank_in_channel", "impressions_rank_in_channel", "channel_top_limit", "channel_exposure_top_limit"]:
+        if column not in frame.columns:
+            frame[column] = 0
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
+    for column in ["spend", "impressions"]:
+        if column not in frame.columns:
+            frame[column] = 0.0
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+
+    spend_mask = frame["rank_in_channel"].le(frame["channel_top_limit"])
+    exposure_mask = frame["impressions_rank_in_channel"].le(frame["channel_exposure_top_limit"])
+    threshold_mask = frame["spend"].gt(HIGH_SPEND_ABSOLUTE_THRESHOLD) | frame["impressions"].gt(HIGH_IMPRESSIONS_ABSOLUTE_THRESHOLD)
+    tier1_identities = set(frame.loc[spend_mask, "content_identity_key"].astype(str))
+    tier2_raw_mask = exposure_mask & ~frame["content_identity_key"].astype(str).isin(tier1_identities)
+    tier2_identities = set(frame.loc[tier2_raw_mask, "content_identity_key"].astype(str))
+    if tier == RECAP_TIER_1_SPEND_TOP:
+        scoped = frame[spend_mask].copy()
+    elif tier == RECAP_TIER_2_EXPOSURE_TOP:
+        scoped = frame[tier2_raw_mask].copy()
+    elif tier == RECAP_TIER_3_THRESHOLD:
+        covered = tier1_identities | tier2_identities
+        scoped = frame[threshold_mask & ~frame["content_identity_key"].astype(str).isin(covered)].copy()
+    else:
+        raise ValueError(f"未知复盘分级：{tier}")
+
+    if executable_only:
+        scoped = _filter_executable(scoped)
+    if scoped.empty:
+        return _empty_tier_pool(frame)
+    scoped["recap_tier"] = tier
+    scoped["recap_tier_label"] = RECAP_TIER_LABELS[tier]
+    return scoped.reset_index(drop=True)
 
 
 def high_spend_content_identity_key(row: pd.Series) -> str:
@@ -226,6 +280,29 @@ def _empty_high_spend_pool(standard_columns: list[str]) -> pd.DataFrame:
             "missing_high_spend_link",
         ]
     )
+
+
+def _empty_tier_pool(template: pd.DataFrame) -> pd.DataFrame:
+    columns = list(getattr(template, "columns", []))
+    for column in ["recap_tier", "recap_tier_label"]:
+        if column not in columns:
+            columns.append(column)
+    return pd.DataFrame(columns=columns)
+
+
+def _filter_executable(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    has_analysis_status = "analysis_status" in frame.columns
+    has_match_status = "match_status" in frame.columns
+    if not has_analysis_status and not has_match_status:
+        return frame.iloc[0:0].copy()
+    executable_mask = pd.Series(False, index=frame.index)
+    if has_analysis_status:
+        executable_mask |= frame["analysis_status"].fillna("").astype(str).str.strip().eq("可分析")
+    if has_match_status:
+        executable_mask |= frame["match_status"].fillna("").astype(str).str.strip().eq("已匹配")
+    return frame[executable_mask].copy()
 
 
 def _platform_label(row: pd.Series) -> str:

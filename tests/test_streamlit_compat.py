@@ -142,6 +142,56 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("_asset_cache_status_summary", self.app_source)
         self.assertIn("cleanup_top_asset_cache", self.app_source)
 
+    def test_upload_page_exposes_tier1_auto_recap_as_separate_state(self):
+        upload_source = self._function_source("_page_upload_cleaning", "_page_high_value_recap")
+
+        self.assertIn("清洗完成后自动补采并分析一级素材", upload_source)
+        self.assertIn("清洗成功和复盘任务分开提示", upload_source)
+        self.assertIn("复盘失败不会回滚清洗入库结果", upload_source)
+        self.assertIn("二级曝光范围和三级阈值范围", upload_source)
+        self.assertIn("auto_tier1_recap_after_upload", upload_source)
+
+    def test_recap_tier_ui_runs_scoped_llm_reports_without_legacy_imports(self):
+        recap_source = self._function_source("_render_recap_tier_panel", "def _render_range_recap_report")
+        report_source = self._function_source("_render_range_recap_report", "def _render_high_value_quality_tab")
+        pipeline_source = self._function_source("_run_recap_tier_pipeline", "def _run_rollup")
+
+        for token in [
+            "分级复盘任务",
+            "一级可在上传清洗后自动触发",
+            "每个范围会生成独立 LLM 报告",
+            "RECAP_TIER_1_SPEND_TOP",
+            "RECAP_TIER_2_EXPOSURE_TOP",
+            "RECAP_TIER_3_THRESHOLD",
+            "generate_range_recap_report",
+            "persist_range_recap_report",
+        ]:
+            self.assertIn(token, self.app_source)
+        self.assertIn("load_range_recap_report", recap_source)
+        self.assertNotIn("analysis_jobs", report_source)
+        self.assertIn("analysis_purpose=purpose", pipeline_source)
+        self.assertIn("return True", pipeline_source)
+        self.assertIn("return False", pipeline_source)
+        self.assertIn("if _run_recap_tier_pipeline(batch_id, items, tier_key):", recap_source)
+        self.assertNotIn("_run_recap_tier_pipeline(batch_id, items, tier_key)\n                    st.rerun()", recap_source)
+
+    def test_missing_type_multimodal_uses_fill_missing_scope(self):
+        recap_source = self._function_source("_render_high_value_evidence_tab", "def _render_recap_tier_panel")
+        missing_type_source = recap_source[
+            recap_source.index('if c4.button("多模态补缺失类型"') : recap_source.index('if c5.button("生成/更新策略复盘"')
+        ]
+
+        self.assertIn("ANALYSIS_PURPOSE_FILL_MISSING_TYPE", missing_type_source)
+        self.assertIn("analysis_purpose=ANALYSIS_PURPOSE_FILL_MISSING_TYPE", missing_type_source)
+        self.assertNotIn("analysis_purpose=purpose", missing_type_source)
+
+    def test_strategy_multimodal_uses_default_strategy_scope(self):
+        recap_source = self._function_source("_render_high_value_evidence_tab", "def _render_recap_tier_panel")
+        strategy_source = recap_source[recap_source.index('if c5.button("生成/更新策略复盘"') :]
+
+        self.assertIn("ANALYSIS_PURPOSE_STRATEGY_RECAP", strategy_source)
+        self.assertIn("analysis_purpose=ANALYSIS_PURPOSE_STRATEGY_RECAP", strategy_source)
+
     def test_high_value_capture_progress_shows_eta_and_background_status(self):
         recap_source = self._function_source("_page_high_value_recap", "_page_local_assets")
 

@@ -578,6 +578,70 @@ export { DOUYIN_CHANNEL_PRIMARY_TYPES, secondaryLabelsForPrimary };
                 {ANALYSIS_PURPOSE_FILL_MISSING_TYPE, ANALYSIS_PURPOSE_STRATEGY_RECAP},
             )
 
+    def test_strategy_recap_persistence_keeps_distinct_tier_purposes(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            batch_id = "batch-1"
+            tier1_pool = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "dy-tier1",
+                        "content_id": "dy-tier1",
+                        "title": "一级素材",
+                        "category_l1": "股友说",
+                        "category_l2": "股民教学",
+                        "spend": 3000,
+                        "impressions": 10000,
+                    }
+                ]
+            )
+            tier2_pool = pd.DataFrame(
+                [
+                    {
+                        "platform": "抖音",
+                        "channel": "抖音商业化",
+                        "content_identity_key": "dy-tier2",
+                        "content_id": "dy-tier2",
+                        "title": "二级素材",
+                        "category_l1": "社区话题",
+                        "category_l2": "股市段子互动",
+                        "spend": 1000,
+                        "impressions": 200000,
+                    }
+                ]
+            )
+
+            persist_multimodal_recap(
+                db_path,
+                batch_id,
+                tier1_pool,
+                analysis_purpose="strategy_recap:tier1_spend_top",
+                analyzer=lambda row: {"共性总结": "一级共性"},
+            )
+            persist_multimodal_recap(
+                db_path,
+                batch_id,
+                tier2_pool,
+                analysis_purpose="strategy_recap:tier2_exposure_top",
+                analyzer=lambda row: {"共性总结": "二级共性"},
+            )
+
+            items = list_multimodal_recap_items(db_path, batch_id=batch_id)
+            strategies = list_strategy_recap_items(db_path, batch_id=batch_id)
+
+            self.assertEqual(
+                set(items["analysis_purpose"]),
+                {"strategy_recap:tier1_spend_top", "strategy_recap:tier2_exposure_top"},
+            )
+            self.assertEqual(
+                set(strategies["analysis_purpose"]),
+                {"strategy_recap:tier1_spend_top", "strategy_recap:tier2_exposure_top"},
+            )
+            self.assertIn("一级共性", "；".join(strategies["common_patterns"]))
+            self.assertIn("二级共性", "；".join(strategies["common_patterns"]))
+
 
 if __name__ == "__main__":
     unittest.main()

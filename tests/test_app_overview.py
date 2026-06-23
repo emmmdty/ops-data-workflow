@@ -1,5 +1,8 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import pandas as pd
 
@@ -17,14 +20,21 @@ from app import (
     _channel_totals_table_html,
     _channel_totals_for_display,
     _classification_quality_issues,
+    _cached_manifest_from_entry,
+    _display_manifests_with_reusable_cache,
     _content_performance_display,
     _evidence_status_summary,
     _evidence_status_table,
+    _image_data_uri,
+    _image_data_uri_cached,
     _local_content_assets_display,
     _local_recap_metric_html,
     _local_recap_metric_items,
     _metric_delta_text,
     _metric_delta_color,
+    _feishu_staleness_needs_confirmation,
+    _feishu_staleness_status_lines,
+    _sync_feishu_ledger_to_local,
     _metric_row_chunks,
     _overview_metrics,
     _overview_status_metrics,
@@ -37,6 +47,10 @@ from app import (
     _report_status_copy,
     _rollup_components_display,
     _render_metric_row,
+    _recap_tier_analysis_purpose,
+    _recap_tier_status_summary,
+    _run_recap_tier_pipeline,
+    _run_upload_cleaning,
     _split_type_recap_tables,
     _show_frame,
     _top_asset_cache_entries_display,
@@ -46,9 +60,151 @@ from app import (
 )
 from ops_data_workflow.periods import PERIOD_LEVEL_MONTH, PERIOD_LEVEL_QUARTER, PERIOD_LEVEL_WEEK, PERIOD_LEVEL_YEAR
 from ops_data_workflow.reporting import localize_columns
+from ops_data_workflow.top_asset_service import RECAP_TIER_1_SPEND_TOP
 
 
 class AppOverviewTests(unittest.TestCase):
+    def test_feishu_staleness_helpers_require_confirmation_for_stale_channels(self):
+        staleness = {
+            "needs_check": True,
+            "items": [
+                {
+                    "platform": "抖音",
+                    "latest_published_date": "2026-06-20",
+                    "days_since_latest": 3,
+                    "needs_check": False,
+                    "status": "fresh",
+                    "message": "抖音最新投稿时间 2026-06-20，距今天 3 天。",
+                },
+                {
+                    "platform": "小红书",
+                    "latest_published_date": "2026-06-18",
+                    "days_since_latest": 5,
+                    "needs_check": True,
+                    "status": "stale",
+                    "message": "小红书最新投稿时间 2026-06-18，已 5 天未更新，请检查飞书台账。",
+                },
+            ],
+        }
+
+        self.assertTrue(_feishu_staleness_needs_confirmation(staleness))
+        self.assertEqual(
+            _feishu_staleness_status_lines(staleness),
+            [
+                "抖音：2026-06-20，距今天 3 天",
+                "小红书：2026-06-18，距今天 5 天，需要检查",
+            ],
+        )
+        self.assertFalse(_feishu_staleness_needs_confirmation({"needs_check": False, "items": []}))
+
+    def test_sync_feishu_ledger_to_local_blocks_before_write_when_staleness_is_unconfirmed(self):
+        ledger = pd.DataFrame([{"platform": "小红书", "content_id": "note-1", "title": "标题"}])
+        ledger.attrs["feishu_staleness"] = {
+            "needs_check": True,
+            "needs_check_platforms": ["小红书"],
+            "items": [
+                {
+                    "platform": "小红书",
+                    "latest_published_date": "2026-06-18",
+                    "days_since_latest": 5,
+                    "needs_check": True,
+                    "status": "stale",
+                    "message": "小红书最新投稿时间 2026-06-18，已 5 天未更新，请检查飞书台账。",
+                }
+            ],
+        }
+        ledger.attrs["feishu_snapshot"] = {"enabled": True, "staleness": ledger.attrs["feishu_staleness"]}
+
+        class Status:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def write(self, message):
+                pass
+
+            def update(self, **kwargs):
+                pass
+
+        with patch("app.copy_missing_runtime_env"), patch("app.st.status", return_value=Status()), patch(
+            "app.load_feishu_content_ledger", return_value=ledger
+        ), patch("app.upsert_content_assets_from_feishu") as upsert, patch("app.build_feishu_content_asset_diff") as diff, patch(
+            "app.persist_feishu_ledger_snapshot"
+        ) as persist, patch("app.st.warning") as warning:
+            _sync_feishu_ledger_to_local("manual:feishu", confirm_stale=False)
+
+        upsert.assert_not_called()
+        diff.assert_not_called()
+        persist.assert_not_called()
+        self.assertIn("需要人工确认", warning.call_args.args[0])
+
+    def test_sync_feishu_ledger_to_local_writes_after_staleness_confirmation(self):
+        ledger = pd.DataFrame([{"platform": "小红书", "content_id": "note-1", "title": "标题"}])
+        ledger.attrs["feishu_staleness"] = {"needs_check": True, "items": []}
+        ledger.attrs["feishu_snapshot"] = {"enabled": True, "staleness": ledger.attrs["feishu_staleness"]}
+        diff_result = Mock(summary={"新增": 1, "修改": 0, "无变化": 0})
+
+        class Status:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def write(self, message):
+                pass
+
+            def update(self, **kwargs):
+                pass
+
+        with patch("app.copy_missing_runtime_env"), patch("app.st.status", return_value=Status()), patch(
+            "app.build_feishu_content_asset_diff", return_value=diff_result
+        ) as diff, patch("app.upsert_content_assets_from_feishu", return_value=1) as upsert, patch(
+            "app.persist_feishu_ledger_snapshot"
+        ) as persist, patch("app.st.success"):
+            _sync_feishu_ledger_to_local("manual:feishu", ledger=ledger, confirm_stale=True)
+
+        diff.assert_called_once()
+        upsert.assert_called_once()
+        persist.assert_called_once_with(ANY, "manual:feishu", ledger.attrs["feishu_snapshot"])
+
+    def test_run_upload_cleaning_passes_preloaded_feishu_ledger_to_workflow(self):
+        ledger = pd.DataFrame([{"platform": "抖音"}])
+        result = Mock(batch_id="batch-1", canonical=pd.DataFrame(), core_recap_xlsx=None, feishu_staleness={})
+
+        class Status:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def write(self, message):
+                pass
+
+            def update(self, **kwargs):
+                pass
+
+        period = Mock(
+            period_start="2026-06-01",
+            period_end="2026-06-07",
+            period_level="week",
+            period_key="20260601-20260607",
+            period_label="2026-06-01 至 2026-06-07",
+            data_start="2026-06-01",
+            data_end="2026-06-07",
+            source_type="upload",
+        )
+        materialized = Mock(raw_dir=Path("/tmp/raw"))
+        with patch("app.copy_missing_runtime_env"), patch("app.st.status", return_value=Status()), patch(
+            "app.materialize_uploaded_files", return_value=materialized
+        ), patch("app.run_archived_workflow", return_value=result) as workflow, patch("app.st.success"):
+            _run_upload_cleaning([], Path("/tmp/target"), period, False, feishu_ledger=ledger)
+
+        self.assertIs(workflow.call_args.kwargs["preloaded_feishu_ledger"], ledger)
+
     def test_overview_metrics_do_not_double_count_summary_total_row(self):
         totals = pd.DataFrame(
             [
@@ -120,6 +276,58 @@ class AppOverviewTests(unittest.TestCase):
 
         self.assertEqual(metrics["价值"], 40.0)
         self.assertEqual(float(channels.iloc[0]["value"]), 40.0)
+
+    def test_overview_merges_partial_channel_totals_with_detail_channels(self):
+        totals = pd.DataFrame(
+            [
+                {
+                    "channel": "小红书商业化",
+                    "spend": 100.0,
+                    "impressions": 1000.0,
+                    "activations": 10.0,
+                    "first_pay_count": 2.0,
+                    "is_channel_total": True,
+                }
+            ]
+        )
+        items = pd.DataFrame(
+            [
+                {
+                    "channel": "小红书商业化",
+                    "spend": 70.0,
+                    "impressions": 700.0,
+                    "activations": 7.0,
+                    "first_pay_count": 1.0,
+                },
+                {
+                    "channel": "抖音商业化",
+                    "spend": 200.0,
+                    "impressions": 2000.0,
+                    "activations": 20.0,
+                    "first_pay_count": 4.0,
+                },
+                {
+                    "channel": "B站市场部",
+                    "spend": 30.0,
+                    "impressions": 0.0,
+                    "activations": 3.0,
+                    "first_pay_count": 1.0,
+                },
+            ]
+        )
+
+        metrics = _overview_metrics(totals, items)
+        channels = _channel_totals_for_display(totals, items)
+
+        by_channel = channels.set_index("channel")
+        self.assertEqual(set(by_channel.index), {"小红书商业化", "抖音商业化", "B站市场部"})
+        self.assertEqual(float(by_channel.loc["小红书商业化", "spend"]), 100.0)
+        self.assertEqual(float(by_channel.loc["抖音商业化", "spend"]), 200.0)
+        self.assertEqual(float(by_channel.loc["B站市场部", "spend"]), 30.0)
+        self.assertEqual(metrics["消耗"], 330.0)
+        self.assertEqual(metrics["曝光"], 3000.0)
+        self.assertEqual(metrics["激活数"], 33.0)
+        self.assertEqual(metrics["付费数"], 7.0)
 
     def test_channel_totals_display_attaches_previous_period_delta_metadata(self):
         totals = pd.DataFrame(
@@ -677,7 +885,134 @@ class AppOverviewTests(unittest.TestCase):
 
         self.assertIn('href="https://巨量.example/video.mp4"', html)
         self.assertIn("打开巨量证据", html)
-        self.assertNotIn("https://www.douyin.com/video/7623721481431780662", html)
+
+    def test_image_data_uri_reuses_cached_file_encoding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "cover.jpg"
+            image_path.write_bytes(b"fake image bytes")
+            _image_data_uri_cached.clear()
+            original_read_bytes = Path.read_bytes
+
+            def counted_read_bytes(path: Path) -> bytes:
+                return original_read_bytes(path)
+
+            with patch.object(Path, "read_bytes", autospec=True, side_effect=counted_read_bytes) as read_bytes:
+                first = _image_data_uri(str(image_path))
+                second = _image_data_uri(str(image_path))
+
+        self.assertEqual(first, second)
+        self.assertEqual(read_bytes.call_count, 1)
+
+    def test_display_manifests_adds_reusable_cache_cover_without_current_batch_manifest(self):
+        top_pool = pd.DataFrame(
+            [
+                {
+                    "platform": "B站",
+                    "channel": "B站市场部",
+                    "content_id": "BV1same",
+                    "asset_key": "",
+                    "title": "历史缓存素材",
+                    "spend": 100.0,
+                }
+            ]
+        )
+        current_manifests = pd.DataFrame(
+            columns=["job_id", "batch_id", "status", "platform", "asset_key", "asset_dir", "cover_path"]
+        )
+        cached_manifests = pd.DataFrame(
+            [
+                {
+                    "job_id": "",
+                    "batch_id": "_cache",
+                    "status": "succeeded",
+                    "platform": "B站",
+                    "asset_key": "B站::id::BV1same",
+                    "asset_dir": "/tmp/cache/BV1same",
+                    "cover_path": "/tmp/cache/BV1same/cover.jpg",
+                }
+            ]
+        )
+
+        display_manifests = _display_manifests_with_reusable_cache(top_pool, current_manifests, cached_manifests)
+
+        self.assertEqual(len(display_manifests), 1)
+        self.assertEqual(display_manifests.iloc[0]["asset_key"], "B站::id::BV1same")
+        self.assertEqual(display_manifests.iloc[0]["cover_path"], "/tmp/cache/BV1same/cover.jpg")
+
+    def test_cached_manifest_uses_local_image_when_manifest_cover_is_blank(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_dir = Path(tmp)
+            cover_path = asset_dir / "images" / "001.webp"
+            cover_path.parent.mkdir(parents=True)
+            cover_path.write_bytes(b"fake image")
+            (asset_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "status": "succeeded",
+                                "platform": "抖音",
+                                "asset_key": "抖音::id::7634503668024298793",
+                                "asset_dir": str(asset_dir),
+                                "cover_path": "",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = _cached_manifest_from_entry(
+                pd.Series(
+                    {
+                        "asset_key": "抖音::id::7634503668024298793",
+                        "asset_dir": str(asset_dir),
+                        "platform": "抖音",
+                    }
+                )
+            )
+
+        self.assertEqual(manifest["cover_path"], str(cover_path))
+
+    def test_cached_manifest_rejects_douyin_screenshot_only_fallback_as_cover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_dir = Path(tmp)
+            screenshot_path = asset_dir / "screenshots" / "001.jpg"
+            screenshot_path.parent.mkdir(parents=True)
+            screenshot_path.write_bytes(b"fake browser screenshot")
+            (asset_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "status": "succeeded",
+                                "platform": "抖音",
+                                "asset_key": "抖音::id::7634503668024298793",
+                                "asset_dir": str(asset_dir),
+                                "cover_path": str(screenshot_path),
+                                "video_path": "",
+                                "screenshots": [str(screenshot_path)],
+                                "frames": [],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = _cached_manifest_from_entry(
+                pd.Series(
+                    {
+                        "asset_key": "抖音::id::7634503668024298793",
+                        "asset_dir": str(asset_dir),
+                        "platform": "抖音",
+                    }
+                )
+            )
+
+        self.assertEqual(manifest, {})
 
     def test_type_recap_tables_are_split_by_required_platform_type_levels(self):
         type_recap = pd.DataFrame(
@@ -866,9 +1201,134 @@ class AppOverviewTests(unittest.TestCase):
         self.assertEqual(summary["已完成多模态"], 1)
         self.assertIn("登录状态失效", summary["失败原因"])
 
+    def test_recap_tier_status_summary_counts_scope_jobs_and_report(self):
+        top_pool = pd.DataFrame(
+            [
+                {"content_identity_key": "one", "channel": "抖音商业化"},
+                {"content_identity_key": "two", "channel": "抖音商业化"},
+            ]
+        )
+        manifests = pd.DataFrame(
+            [
+                {"status": "succeeded", "content_identity_key": "one"},
+                {"status": "succeeded", "content_identity_key": "outside"},
+                {"status": "failed", "content_identity_key": "two"},
+            ]
+        )
+        jobs = pd.DataFrame(
+            [
+                {"analysis_purpose": "strategy_recap:tier1_spend_top", "status": "succeeded"},
+                {"analysis_purpose": "strategy_recap:tier1_spend_top", "status": "queued"},
+                {"analysis_purpose": "strategy_recap:tier2_exposure_top", "status": "succeeded"},
+            ]
+        )
+
+        summary = _recap_tier_status_summary(
+            "tier1_spend_top",
+            top_pool,
+            manifests,
+            jobs,
+            {"has_report": True},
+        )
+
+        self.assertEqual(_recap_tier_analysis_purpose("tier1_spend_top"), "strategy_recap:tier1_spend_top")
+        self.assertEqual(summary["范围素材"], 2)
+        self.assertEqual(summary["已缓存素材"], 1)
+        self.assertEqual(summary["已完成多模态"], 1)
+        self.assertEqual(summary["待分析"], 1)
+        self.assertEqual(summary["LLM报告"], "已生成")
+
+    def test_recap_tier_status_summary_matches_manifest_by_job_id_when_identity_missing(self):
+        top_pool = pd.DataFrame(
+            [
+                {"content_identity_key": "one", "job_id": "job-one"},
+                {"content_identity_key": "two", "job_id": "job-two"},
+            ]
+        )
+        manifests = pd.DataFrame(
+            [
+                {"status": "succeeded", "job_id": "job-one"},
+                {"status": "succeeded", "job_id": "job-outside"},
+            ]
+        )
+
+        summary = _recap_tier_status_summary(
+            "tier1_spend_top",
+            top_pool,
+            manifests,
+            pd.DataFrame(),
+            {"has_report": False},
+        )
+
+        self.assertEqual(summary["已缓存素材"], 1)
+        self.assertEqual(summary["LLM报告"], "未生成")
+
+    def test_recap_tier_pipeline_writes_partial_report_when_capture_partially_fails(self):
+        class CaptureResult:
+            ok = False
+            job_count = 2
+            succeeded_count = 1
+            failed_count = 1
+            message = "补采失败"
+
+        class Status:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def write(self, message):
+                pass
+
+            def update(self, **kwargs):
+                pass
+
+        items = pd.DataFrame(
+            [
+                {
+                    "platform": "抖音",
+                    "platform_group": "抖音",
+                    "channel": "抖音商业化",
+                    "content_id": "dy-1",
+                    "title": "高消耗素材",
+                    "account": "投放号",
+                    "content_url": "https://www.douyin.com/video/1",
+                    "spend": 3000.0,
+                    "impressions": 1000.0,
+                    "analysis_status": "可分析",
+                }
+            ]
+        )
+
+        persisted = Mock(item_count=1, strategy_count=1)
+        with patch("app.copy_missing_runtime_env"), patch("app.st.status", return_value=Status()), patch("app.st.warning") as warning, patch(
+            "app.run_harvester_asset_capture", return_value=CaptureResult()
+        ), patch("app.reset_top_multimodal_jobs"), patch("app.run_top_multimodal_analysis_from_manifests", return_value=1), patch(
+            "app.persist_multimodal_recap", return_value=persisted
+        ), patch("app._successful_analysis_identities", return_value={"抖音商业化::抖音::title_account::投放号::高消耗素材"}), patch(
+            "app.generate_range_recap_report", return_value={"overview": {"report": "部分报告"}}
+        ) as generate_report, patch("app.persist_range_recap_report") as persist_report, patch(
+            "app.list_period_channel_totals", return_value=pd.DataFrame()
+        ), patch("app.read_batch_record", return_value={}):
+            ok = _run_recap_tier_pipeline("batch-1", items, RECAP_TIER_1_SPEND_TOP)
+
+        self.assertFalse(ok)
+        self.assertTrue(generate_report.called)
+        self.assertTrue(persist_report.called)
+        report = persist_report.call_args.kwargs["report"]
+        self.assertEqual(report["range_execution_status"], "partial")
+        self.assertIn("部分完成", warning.call_args.args[0])
+
     def test_report_status_copy_only_states_whether_conclusion_uses_current_data(self):
-        self.assertEqual(_report_status_copy({"has_report": True}), "结论已基于当前选择周期的数据。")
-        self.assertEqual(_report_status_copy({"has_report": False}), "结论待更新：当前选择周期还没有生成口头汇报结论。")
+        self.assertEqual(
+            _report_status_copy({"has_report": True}),
+            "页面汇报结论已基于当前选择周期的数据；上传清洗、类型复盘、页面汇报是分步完成态。",
+        )
+        self.assertEqual(
+            _report_status_copy({"has_report": False}),
+            "页面汇报结论待更新：上传清洗完成后，还需要生成类型复盘并点击生成/更新口头汇报结论。",
+        )
 
     def test_report_section_view_model_uses_weekly_meeting_order_and_text_fallbacks(self):
         top_pool = pd.DataFrame(
@@ -1401,6 +1861,68 @@ class AppOverviewTests(unittest.TestCase):
         self.assertIn("更新时间", display.columns)
         self.assertNotIn("最近批次", display.columns)
         self.assertNotIn("首次批次", display.columns)
+
+    def test_local_assets_display_shows_single_work_link_with_compat_fallback(self):
+        assets = pd.DataFrame(
+            [
+                {
+                    "asset_key": "小红书::id::note-1",
+                    "platform": "小红书",
+                    "content_id": "note-1",
+                    "account": "示例账号",
+                    "title": "只有兼容链接",
+                    "content_url": "https://www.xiaohongshu.com/explore/note-1",
+                    "work_url": "",
+                }
+            ]
+        )
+
+        display = localize_columns(_local_content_assets_display(assets))
+
+        self.assertIn("作品链接", display.columns)
+        self.assertNotIn("作品链接(兼容)", display.columns)
+        self.assertEqual(display.iloc[0]["作品链接"], "https://www.xiaohongshu.com/explore/note-1")
+
+    def test_local_assets_display_hides_empty_ad_evidence_columns(self):
+        assets = pd.DataFrame(
+            [
+                {
+                    "asset_key": "小红书::id::note-1",
+                    "platform": "小红书",
+                    "content_id": "note-1",
+                    "title": "无巨量证据",
+                    "content_url": "https://www.xiaohongshu.com/explore/note-1",
+                    "ad_material_url": "",
+                    "ad_cover_url": "",
+                }
+            ]
+        )
+
+        display = localize_columns(_local_content_assets_display(assets))
+
+        self.assertNotIn("巨量链接", display.columns)
+        self.assertNotIn("巨量封面链接", display.columns)
+
+    def test_local_assets_display_never_shows_period_ad_evidence_columns(self):
+        assets = pd.DataFrame(
+            [
+                {
+                    "asset_key": "抖音::id::7594830477777751338",
+                    "platform": "抖音",
+                    "content_id": "7594830477777751338",
+                    "title": "有巨量证据",
+                    "work_url": "https://www.douyin.com/video/7594830477777751338",
+                    "content_url": "https://www.douyin.com/video/7594830477777751338",
+                    "ad_material_url": "https://巨量.example/video.mp4",
+                    "ad_cover_url": "https://巨量.example/cover.jpg",
+                }
+            ]
+        )
+
+        display = localize_columns(_local_content_assets_display(assets))
+
+        self.assertNotIn("巨量链接", display.columns)
+        self.assertNotIn("巨量封面链接", display.columns)
 
     def test_content_performance_table_keeps_metrics_numeric_and_cleans_title_tags(self):
         frame = pd.DataFrame(

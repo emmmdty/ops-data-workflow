@@ -22,6 +22,7 @@ from ops_data_workflow.harvester_bridge import (
     resolve_harvester_root,
     run_harvester_asset_capture,
     write_jobs_jsonl,
+    _manifest_has_invalid_visual_fallback,
     _run_command_with_progress,
 )
 from ops_data_workflow.storage import (
@@ -39,6 +40,7 @@ from ops_data_workflow.storage import (
     persist_harvester_asset_manifests,
     upsert_top_asset_cache_entry,
     upsert_content_assets_from_feishu,
+    _load_content_asset_backfill_rows,
 )
 
 
@@ -172,6 +174,24 @@ class HarvesterBridgeTests(unittest.TestCase):
 
             self.assertEqual(manifests[0]["status"], "failed")
             self.assertIn("缺少素材目录", manifests[0]["error_message"])
+
+    def test_manifest_rejects_douyin_loading_or_missing_video_snapshots(self):
+        self.assertTrue(
+            _manifest_has_invalid_visual_fallback(
+                {
+                    "metadata": {"ocr_text": "视频数据加载中"},
+                    "screenshots": ["/tmp/loading.jpg"],
+                }
+            )
+        )
+        self.assertTrue(
+            _manifest_has_invalid_visual_fallback(
+                {
+                    "metadata": {"ocr_text": "你要观看的视频不存在"},
+                    "screenshots": ["/tmp/missing.jpg"],
+                }
+            )
+        )
 
     def test_build_asset_jobs_resolves_douyin_share_link_before_capture(self):
         top_content = pd.DataFrame(
@@ -2340,6 +2360,69 @@ class HarvesterBridgeTests(unittest.TestCase):
             items = list_content_performance_items(db_path, batch_id="batch-1")
 
             self.assertEqual(items.iloc[0]["account"], "投资号")
+
+    def test_content_performance_items_only_loads_relevant_local_assets_for_backfill(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.executemany(
+                    """
+                    insert into content_assets (
+                        asset_key, platform, content_id, content_url, work_id, work_url,
+                        ad_material_id, ad_material_url, ad_cover_url, title, account, tags,
+                        raw_content_type, category_l1, category_l2, bilibili_content_type,
+                        content_type, content_type_review, filter_status, published_date,
+                        source_file, source_sheet, source_row, title_key, title_key_no_tags,
+                        first_seen_batch_id, last_seen_batch_id, created_at, updated_at
+                    )
+                    values (?, '小红书', ?, '', '', '', '', '', '', ?, ?, '', '', '', '', '', '', '', '', '', '', '', 0, '', '', 'ledger', 'ledger', '2026-06-01T00:00:00+00:00', '2026-06-01T00:00:00+00:00')
+                    """,
+                    [
+                        (f"小红书::id::note-{index}", f"note-{index}", f"无关标题 {index}", "无关账号")
+                        for index in range(80)
+                    ],
+                )
+                conn.execute(
+                    """
+                    insert into content_assets (
+                        asset_key, platform, content_id, content_url, work_id, work_url,
+                        ad_material_id, ad_material_url, ad_cover_url, title, account, tags,
+                        raw_content_type, category_l1, category_l2, bilibili_content_type,
+                        content_type, content_type_review, filter_status, published_date,
+                        source_file, source_sheet, source_row, title_key, title_key_no_tags,
+                        first_seen_batch_id, last_seen_batch_id, created_at, updated_at
+                    )
+                    values ('小红书::id::target-note', '小红书', 'target-note', '', '', '', '', '', '', '目标标题', '目标账号', '', '', '', '', '', '', '', '', '', '', '', 0, '', '', 'ledger', 'ledger', '2026-06-01T00:00:00+00:00', '2026-06-01T00:00:00+00:00')
+                    """
+                )
+                conn.commit()
+            canonical = pd.DataFrame(
+                [
+                    {
+                        "period_start": "2026-06-01",
+                        "period_end": "2026-06-07",
+                        "platform": "小红书",
+                        "channel": "小红书商业化",
+                        "content_identity_key": "小红书商业化::小红书::id::target-note",
+                        "content_id": "target-note",
+                        "title": "",
+                        "account": "",
+                        "spend": 1000,
+                        "impressions": 10000,
+                        "activations": 10,
+                        "first_pay_count": 2,
+                    }
+                ]
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                scoped_assets = _load_content_asset_backfill_rows(conn, asset_keys={"小红书::id::target-note"})
+            persist_content_performance_items(db_path, "batch-1", canonical)
+            items = list_content_performance_items(db_path, batch_id="batch-1")
+
+            self.assertEqual(set(scoped_assets), {"小红书::id::target-note"})
+            self.assertEqual(items.iloc[0]["account"], "目标账号")
 
     def test_content_performance_items_backfill_xhs_fields_when_title_is_link(self):
         with TemporaryDirectory() as tmp:

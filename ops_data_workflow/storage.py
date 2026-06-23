@@ -204,6 +204,7 @@ TYPE_RECAP_COLUMNS = [
 ]
 STRATEGY_RECAP_COLUMNS = [
     "batch_id",
+    "analysis_purpose",
     "channel",
     "platform",
     "type_level",
@@ -671,7 +672,34 @@ def persist_oral_recap_report(
     )
 
 
+def persist_range_recap_report(
+    db_path: Path,
+    batch_id: str,
+    range_key: str,
+    *,
+    provider: str,
+    model: str,
+    report: dict[str, object],
+) -> None:
+    _persist_report(
+        db_path,
+        batch_id,
+        report_type=_range_recap_report_type(range_key),
+        provider=provider,
+        model=model,
+        report=report,
+    )
+
+
 def load_manual_recap_report(db_path: Path, batch_id: str) -> dict[str, object]:
+    return _load_report(db_path, batch_id, report_type="manual_recap")
+
+
+def load_range_recap_report(db_path: Path, batch_id: str, range_key: str) -> dict[str, object]:
+    return _load_report(db_path, batch_id, report_type=_range_recap_report_type(range_key))
+
+
+def _load_report(db_path: Path, batch_id: str, *, report_type: str) -> dict[str, object]:
     if not batch_id or not Path(db_path).exists():
         return {}
     init_db(db_path)
@@ -680,9 +708,9 @@ def load_manual_recap_report(db_path: Path, batch_id: str) -> dict[str, object]:
             """
             select provider, model, summary, report_json, created_at
             from ai_reports
-            where batch_id = ? and report_type = 'manual_recap'
+            where batch_id = ? and report_type = ?
             """,
-            (batch_id,),
+            (batch_id, report_type),
         ).fetchone()
     if row is None:
         return {}
@@ -701,6 +729,14 @@ def load_manual_recap_report(db_path: Path, batch_id: str) -> dict[str, object]:
 
 
 def load_manual_recap_status(db_path: Path, batch_id: str) -> dict[str, object]:
+    return _load_report_status(db_path, batch_id, report_type="manual_recap")
+
+
+def load_range_recap_status(db_path: Path, batch_id: str, range_key: str) -> dict[str, object]:
+    return _load_report_status(db_path, batch_id, report_type=_range_recap_report_type(range_key))
+
+
+def _load_report_status(db_path: Path, batch_id: str, *, report_type: str) -> dict[str, object]:
     if not batch_id or not Path(db_path).exists():
         return {"batch_id": str(batch_id or ""), "has_report": False}
     init_db(db_path)
@@ -709,10 +745,10 @@ def load_manual_recap_status(db_path: Path, batch_id: str) -> dict[str, object]:
             """
             select 1
             from ai_reports
-            where batch_id = ? and report_type = 'manual_recap'
+            where batch_id = ? and report_type = ?
             limit 1
             """,
-            (batch_id,),
+            (batch_id, report_type),
         ).fetchone()
     return {"batch_id": str(batch_id or ""), "has_report": row is not None}
 
@@ -727,6 +763,38 @@ def clear_manual_recap_report(db_path: Path, batch_id: str) -> None:
             (batch_id,),
         )
         conn.commit()
+
+
+def _persist_report(
+    db_path: Path,
+    batch_id: str,
+    *,
+    report_type: str,
+    provider: str,
+    model: str,
+    report: dict[str, object],
+) -> None:
+    init_db(db_path)
+    created_at = datetime.now(timezone.utc).isoformat()
+    report_json = json.dumps(report, ensure_ascii=False)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            insert or replace into ai_reports (
+                batch_id, provider, model, summary, created_at, report_type, report_json
+            )
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (batch_id, provider, model, report_json, created_at, report_type, report_json),
+        )
+        conn.commit()
+
+
+def _range_recap_report_type(range_key: str) -> str:
+    key = _clean_text(range_key)
+    if not key:
+        raise ValueError("range_key is required")
+    return f"range_recap:{key}"
 
 
 def upsert_manual_high_value_supplement(
@@ -1405,6 +1473,8 @@ def list_period_channel_totals(db_path: Path, *, batch_id: str = "") -> pd.DataF
     for column in columns:
         if column not in frame.columns:
             frame[column] = ""
+    if frame.empty and batch_id:
+        return _period_channel_totals_from_stored_summary(db_path, batch_id, columns)
     return frame[columns]
 
 
@@ -1502,7 +1572,15 @@ def persist_strategy_recap_items(db_path: Path, batch_id: str, items: pd.DataFra
             frame[column] = ""
     frame = frame[STRATEGY_RECAP_COLUMNS].drop(columns=["batch_id"], errors="ignore")
     with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute("delete from strategy_recap_items where batch_id = ?", (batch_id,))
+        purposes = sorted({_clean_text(value) for value in frame.get("analysis_purpose", pd.Series(dtype=object)).tolist() if _clean_text(value)})
+        if purposes:
+            placeholders = ",".join("?" for _ in purposes)
+            conn.execute(
+                f"delete from strategy_recap_items where batch_id = ? and analysis_purpose in ({placeholders})",
+                [batch_id, *purposes],
+            )
+        else:
+            conn.execute("delete from strategy_recap_items where batch_id = ?", (batch_id,))
         _append_frame(conn, "strategy_recap_items", batch_id, frame)
         conn.commit()
     return int(len(frame))
@@ -2258,11 +2336,18 @@ def _init_lightweight_middle_platform_tables(conn: sqlite3.Connection) -> None:
             platform_counts_json text not null default '{}',
             sheet_row_counts_json text not null default '{}',
             field_completeness_json text not null default '{}',
+            staleness_json text not null default '{}',
             warnings_json text not null default '[]',
             created_at text not null
         )
         """
     )
+    existing_snapshot_columns = {
+        row[1]
+        for row in conn.execute('pragma table_info("feishu_ledger_snapshots")').fetchall()
+    }
+    if "staleness_json" not in existing_snapshot_columns:
+        conn.execute('alter table "feishu_ledger_snapshots" add column "staleness_json" text not null default "{}"')
     conn.execute(
         """
         create table if not exists content_assets (
@@ -2652,9 +2737,9 @@ def _persist_feishu_ledger_snapshot_with_conn(
         insert or replace into feishu_ledger_snapshots (
             snapshot_id, batch_id, enabled, fetched_at, total_rows,
             platform_counts_json, sheet_row_counts_json, field_completeness_json,
-            warnings_json, created_at
+            staleness_json, warnings_json, created_at
         )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             snapshot_id,
@@ -2665,6 +2750,7 @@ def _persist_feishu_ledger_snapshot_with_conn(
             json.dumps(snapshot.get("platform_counts") or {}, ensure_ascii=False, sort_keys=True),
             json.dumps(snapshot.get("sheet_row_counts") or {}, ensure_ascii=False, sort_keys=True),
             json.dumps(snapshot.get("field_completeness") or {}, ensure_ascii=False, sort_keys=True),
+            json.dumps(snapshot.get("staleness") or {}, ensure_ascii=False, sort_keys=True),
             json.dumps(snapshot.get("warnings") or [], ensure_ascii=False),
             created_at,
         ),
@@ -2838,7 +2924,7 @@ def _backfill_performance_fields_with_conn(conn: sqlite3.Connection, frame: pd.D
     ]:
         if column not in filled.columns:
             filled[column] = ""
-    asset_rows = _load_content_asset_backfill_rows(conn)
+    asset_rows = _load_content_asset_backfill_rows(conn, asset_keys=_content_asset_backfill_keys(filled))
     match_by_identity, match_by_platform_id = _load_asset_match_backfill_rows(conn, batch_id=batch_id)
     for index, row in filled.iterrows():
         asset = asset_rows.get(_clean_text(row.get("asset_key")), {})
@@ -2873,15 +2959,41 @@ def _backfill_performance_fields_with_conn(conn: sqlite3.Connection, frame: pd.D
     return filled
 
 
-def _load_content_asset_backfill_rows(conn: sqlite3.Connection) -> dict[str, dict[str, str]]:
+def _content_asset_backfill_keys(frame: pd.DataFrame) -> set[str]:
+    if frame is None or frame.empty:
+        return set()
+    keys: set[str] = set()
+    for _, row in frame.iterrows():
+        asset_key = _clean_text(row.get("asset_key"))
+        if asset_key:
+            keys.add(asset_key)
+        platform = _clean_text(row.get("platform"))
+        content_id = _clean_text(row.get("content_id"))
+        if platform and content_id:
+            keys.add(f"{platform}::id::{content_id}")
+    return keys
+
+
+def _load_content_asset_backfill_rows(conn: sqlite3.Connection, *, asset_keys: set[str] | None = None) -> dict[str, dict[str, str]]:
     try:
+        params: list[object] = []
+        where_clause = ""
+        if asset_keys is not None:
+            scoped_keys = sorted(_clean_text(key) for key in asset_keys if _clean_text(key))
+            if not scoped_keys:
+                return {}
+            placeholders = ", ".join("?" for _ in scoped_keys)
+            where_clause = f"where asset_key in ({placeholders})"
+            params = scoped_keys
         assets = pd.read_sql_query(
-            """
+            f"""
             select asset_key, platform, content_id, content_url, title, account, tags,
                    category_l1, category_l2, bilibili_content_type, content_type
             from content_assets
+            {where_clause}
             """,
             conn,
+            params=params,
         )
     except Exception:
         return {}
@@ -3384,6 +3496,21 @@ def _period_totals_from_summary(batch_id: str, canonical: pd.DataFrame, total_su
             }
         )
     return pd.DataFrame(rows, columns=PERIOD_CHANNEL_TOTAL_COLUMNS)
+
+
+def _period_channel_totals_from_stored_summary(db_path: Path, batch_id: str, columns: list[str]) -> pd.DataFrame:
+    summary = read_total_summary(db_path, batch_id)
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+    totals = _period_totals_from_summary(batch_id, pd.DataFrame(), summary)
+    if totals.empty:
+        return pd.DataFrame(columns=columns)
+    result = totals.copy()
+    result.insert(0, "batch_id", batch_id)
+    for column in columns:
+        if column not in result.columns:
+            result[column] = ""
+    return result[columns]
 
 
 def _combine_period_totals(explicit_totals: pd.DataFrame, summary_totals: pd.DataFrame) -> pd.DataFrame:

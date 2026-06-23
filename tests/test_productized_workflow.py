@@ -188,6 +188,80 @@ class ProductizedWorkflowTests(unittest.TestCase):
             self.assertTrue(other_channel.exists())
             self.assertFalse((raw_dir / "抖音商业化新文件.csv").exists())
 
+    def test_zip_upload_reports_existing_channel_conflicts_before_extracting(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw" / "20260401-20260407"
+            raw_dir.mkdir(parents=True)
+            existing = raw_dir / "抖音商业化旧文件.csv"
+            existing.write_text(
+                "视频标题,视频id,素材ID,消耗,展示数,点击数,激活数,付费次数,内容类型\n旧标题,old,old-mat,1,2,1,1,0,资讯\n",
+                encoding="utf-8-sig",
+            )
+            other_channel = raw_dir / "B站.csv"
+            other_channel.write_text(
+                "视频BVID,视频标题,花费,展示量,点击量,应用激活数,应用内付费\nBV1,B站标题,10,100,10,1,0\n",
+                encoding="utf-8-sig",
+            )
+            zip_buffer = BytesIO()
+            with ZipFile(zip_buffer, "w") as archive:
+                archive.writestr(
+                    "20260401-20260407/抖音商业化新文件.csv",
+                    "视频标题,视频id,素材ID,消耗,展示数,点击数,激活数,付费次数,内容类型\n新标题,new,new-mat,9,20,10,3,1,股友说\n",
+                )
+            uploads = [FakeUpload("周期数据.zip", zip_buffer.getvalue())]
+
+            conflicts = detect_upload_channel_conflicts(
+                uploads,
+                raw_dir,
+                strip_common_period_root=True,
+            )
+            with self.assertRaisesRegex(FileExistsError, "本地已存在渠道"):
+                materialize_uploaded_files(
+                    uploads,
+                    raw_dir,
+                    strip_common_period_root=True,
+                )
+
+            self.assertEqual([conflict.channel for conflict in conflicts], ["抖音商业化"])
+            self.assertEqual(conflicts[0].incoming_files, ["抖音商业化新文件.csv"])
+            self.assertTrue(existing.exists())
+            self.assertTrue(other_channel.exists())
+            self.assertFalse((raw_dir / "抖音商业化新文件.csv").exists())
+
+    def test_zip_upload_replace_same_channel_keeps_other_channels(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_dir = tmp_path / "raw" / "20260401-20260407"
+            raw_dir.mkdir(parents=True)
+            existing = raw_dir / "抖音商业化旧文件.csv"
+            existing.write_text(
+                "视频标题,视频id,素材ID,消耗,展示数,点击数,激活数,付费次数,内容类型\n旧标题,old,old-mat,1,2,1,1,0,资讯\n",
+                encoding="utf-8-sig",
+            )
+            other_channel = raw_dir / "B站.csv"
+            other_channel.write_text(
+                "视频BVID,视频标题,花费,展示量,点击量,应用激活数,应用内付费\nBV1,B站标题,10,100,10,1,0\n",
+                encoding="utf-8-sig",
+            )
+            zip_buffer = BytesIO()
+            with ZipFile(zip_buffer, "w") as archive:
+                archive.writestr(
+                    "20260401-20260407/抖音商业化新文件.csv",
+                    "视频标题,视频id,素材ID,消耗,展示数,点击数,激活数,付费次数,内容类型\n新标题,new,new-mat,9,20,10,3,1,股友说\n",
+                )
+
+            materialize_uploaded_files(
+                [FakeUpload("周期数据.zip", zip_buffer.getvalue())],
+                raw_dir,
+                strip_common_period_root=True,
+                replace_same_channel=True,
+            )
+
+            self.assertFalse(existing.exists())
+            self.assertTrue((raw_dir / "抖音商业化新文件.csv").exists())
+            self.assertTrue(other_channel.exists())
+
     def test_social_uploads_replace_same_business_channel_across_wechat_tencent_video_account(self):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -334,6 +408,21 @@ class ProductizedWorkflowTests(unittest.TestCase):
                     [FakeUpload("../evil.xlsx", b"bad")],
                     tmp_path / "raw",
                 )
+
+    def test_materialize_uploaded_zip_rejects_parent_escape_members(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            zip_buffer = BytesIO()
+            with ZipFile(zip_buffer, "w") as archive:
+                archive.writestr("20260401-20260427/../evil.xlsx", b"bad")
+
+            with self.assertRaisesRegex(ValueError, "非法路径"):
+                materialize_uploaded_files(
+                    [FakeUpload("周期数据.zip", zip_buffer.getvalue())],
+                    tmp_path / "raw",
+                    strip_common_period_root=True,
+                )
+            self.assertFalse((tmp_path / "evil.xlsx").exists())
 
     def test_materialize_uploaded_files_rejects_absolute_paths(self):
         with TemporaryDirectory() as tmp:

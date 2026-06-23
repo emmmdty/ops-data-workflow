@@ -116,6 +116,34 @@ class MiniMaxRecapTests(unittest.TestCase):
             self.assertTrue(url.startswith("data:image/jpeg;base64,"))
             self.assertLess(len(url), 200_000)
 
+    def test_uses_remote_douyin_cover_url_as_visual_evidence(self):
+        response = FakeResponse(
+            {
+                "choices": [
+                    {"message": {"content": json.dumps({"一级内容类型": "视频"}, ensure_ascii=False)}}
+                ]
+            }
+        )
+        session = FakeSession(response)
+
+        analyze_top_content_with_minimax(
+            {"platform": "抖音", "title": "巨量素材"},
+            {
+                "remote_media_urls": [
+                    "https://巨量.example/cover.jpg",
+                    "https://巨量.example/video.mp4",
+                ],
+                "metadata": {"evidence_source": "douyin_ad_material"},
+            },
+            env={"MINIMAX_API_KEY": "key"},
+            session=session,
+        )
+
+        content = session.calls[0][1]["json"]["messages"][1]["content"]
+        image_urls = [item["image_url"]["url"] for item in content if item.get("type") == "image_url"]
+        self.assertIn("https://巨量.example/cover.jpg", image_urls)
+        self.assertNotIn("https://巨量.example/video.mp4", image_urls)
+
     def test_normalizes_full_structured_json_fields_and_prompt_includes_metrics(self):
         response = FakeResponse(
             {
