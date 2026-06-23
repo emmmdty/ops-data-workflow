@@ -19,15 +19,24 @@ def main() -> int:
     parser.add_argument("--cache-root", default=".runtime/top-assets", help="project material library root")
     parser.add_argument("--harvester-root", default="", help="sibling harvester-THS root; defaults to ../harvester-THS")
     parser.add_argument("--ops-runtime-root", default=".runtime/harvester", help="ops harvester manifest runtime root")
+    parser.add_argument(
+        "--harvester-runtime-assets-root",
+        default="",
+        help="harvester runtime reusable asset root; defaults to <harvester-root>/.runtime/douyin-channel-type-classifier/assets",
+    )
     parser.add_argument("--dry-run", action="store_true", help="scan only; do not copy files or update database")
     args = parser.parse_args()
 
     harvester_root = Path(args.harvester_root).expanduser().resolve() if args.harvester_root else resolve_harvester_root()
+    harvester_runtime_assets_root = (
+        Path(args.harvester_runtime_assets_root).expanduser().resolve() if args.harvester_runtime_assets_root else None
+    )
     result = consolidate_top_asset_library(
         db_path=Path(args.db),
         cache_root=Path(args.cache_root),
         harvester_root=harvester_root,
         ops_runtime_root=Path(args.ops_runtime_root),
+        harvester_runtime_assets_root=harvester_runtime_assets_root,
         dry_run=bool(args.dry_run),
     )
     print(f"scanned_manifests={result.scanned_manifests}")
@@ -36,8 +45,19 @@ def main() -> int:
     print(f"skipped_no_real_id={result.skipped_no_real_id}")
     print(f"skipped_giant_only={result.skipped_giant_only}")
     print(f"skipped_missing_dir={result.skipped_missing_dir}")
+    for source, count in sorted(result.scanned_by_source.items()):
+        print(f"scanned_by_source.{source}={count}")
     for platform, count in sorted(result.copied_by_platform.items()):
         print(f"copied_by_platform.{platform}={count}")
+    for source, count in sorted(result.copied_by_source.items()):
+        print(f"copied_by_source.{source}={count}")
+    for source, count in sorted(result.updated_by_source.items()):
+        print(f"updated_by_source.{source}={count}")
+    for reason, count in sorted(result.skipped_by_reason.items()):
+        print(f"skipped_by_reason.{reason}={count}")
+    for reason, samples in sorted(result.skip_samples.items()):
+        for index, sample in enumerate(samples, start=1):
+            print(f"skip_sample.{reason}.{index}={sample}")
     return 0
 
 

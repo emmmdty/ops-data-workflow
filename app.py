@@ -1022,7 +1022,7 @@ def _render_recap_tier_panel(
     batch_id: str,
 ) -> None:
     st.subheader("分级复盘任务")
-    st.caption("一级可在上传清洗后自动触发；二级曝光范围和三级阈值范围在这里手动触发。每个范围会生成独立 LLM 报告，不覆盖其他范围。")
+    st.caption("一级可在上传清洗后自动触发；二级曝光范围和三级阈值范围在这里手动触发。每个范围会生成独立多模态复盘报告，不覆盖其他范围。")
     tabs = st.tabs([RECAP_TIER_LABELS[key] for key in [RECAP_TIER_1_SPEND_TOP, RECAP_TIER_2_EXPOSURE_TOP, RECAP_TIER_3_THRESHOLD]])
     for tab, tier_key in zip(tabs, [RECAP_TIER_1_SPEND_TOP, RECAP_TIER_2_EXPOSURE_TOP, RECAP_TIER_3_THRESHOLD]):
         with tab:
@@ -1042,7 +1042,7 @@ def _render_recap_tier_panel(
             if tier_pool.empty:
                 st.warning("当前范围没有可执行素材。请先确认清洗匹配状态，或补充本地内容库后重跑清洗。")
             else:
-                action_label = "生成/更新一级 LLM 复盘" if tier_key == RECAP_TIER_1_SPEND_TOP else f"生成/更新{label} LLM 复盘"
+                action_label = "生成/更新一级多模态复盘" if tier_key == RECAP_TIER_1_SPEND_TOP else f"生成/更新{label}多模态复盘"
                 if st.button(action_label, width="stretch", key=f"run_{tier_key}_{batch_id}"):
                     if _run_recap_tier_pipeline(batch_id, items, tier_key):
                         st.rerun()
@@ -1056,9 +1056,12 @@ def _render_recap_tier_panel(
 def _render_range_recap_report(report: object) -> None:
     if not isinstance(report, dict):
         return
+    model_identity = _text(report.get("model_identity"))
+    if model_identity:
+        st.info(model_identity)
     overview = report.get("overview") if isinstance(report.get("overview"), dict) else {}
     if overview:
-        st.markdown("#### LLM 复盘报告")
+        st.markdown("#### 多模态复盘报告")
         main_text = _text(overview.get("report") or overview.get("summary"))
         if main_text:
             st.markdown(main_text)
@@ -2045,16 +2048,22 @@ def _run_recap_tier_pipeline(
             execution_status = "partial" if partial_capture or partial_analysis else "complete"
             if report_pool.empty:
                 status.update(label=f"{label}复盘未完成", state="error")
-                st.warning(f"{label}没有完成可用于 LLM 报告的素材分析；请稍后重试缺失素材。")
+                st.warning(f"{label}没有完成可用于多模态报告的素材分析；请稍后重试缺失素材。")
                 progress_placeholder.empty()
                 return False
-            status.write("正在生成该范围的 LLM 复盘报告。")
+            status.write("正在生成该范围的多模态复盘报告。")
+            multimodal_results = list_multimodal_recap_items(APP_DB, batch_id=batch_id)
+            if not multimodal_results.empty and "analysis_purpose" in multimodal_results.columns:
+                multimodal_results = multimodal_results[
+                    multimodal_results["analysis_purpose"].map(_text).eq(purpose)
+                ].copy()
             report = generate_range_recap_report(
                 batch_id=batch_id,
                 range_key=tier_key,
                 range_label=label,
                 range_definition=definition,
                 top_pool=report_pool,
+                multimodal_results=multimodal_results,
                 period_totals=list_period_channel_totals(APP_DB, batch_id=batch_id),
                 period_level=_batch_period_level(read_batch_record(APP_DB, batch_id)),
                 env_path=ENV_PATH,
@@ -2067,17 +2076,17 @@ def _run_recap_tier_pipeline(
                 APP_DB,
                 batch_id,
                 tier_key,
-                provider="llm",
-                model="manual-recap-report",
+                provider=_text(report.get("provider")) or "minimax",
+                model="minimax-range-report" if _text(report.get("provider")) == "minimax" else "deepseek-fallback-report",
                 report=report,
             )
             status.update(label=f"{label}复盘已生成", state="complete")
         progress_placeholder.empty()
         if execution_status == "complete":
-            st.success(f"{label}已完成：素材分析和 LLM 报告已更新。")
+            st.success(f"{label}已完成：素材分析和多模态报告已更新。")
             return True
         st.warning(
-            f"{label}部分完成：已基于 {len(report_pool)}/{len(tier_pool)} 条完成分析的素材生成 LLM 报告；"
+            f"{label}部分完成：已基于 {len(report_pool)}/{len(tier_pool)} 条完成分析的素材生成多模态报告；"
             "缺失素材可稍后重试后更新报告。"
         )
         return False
@@ -3059,7 +3068,7 @@ def _recap_tier_status_summary(
         "已缓存素材": succeeded_manifests,
         "已完成多模态": completed_jobs,
         "待分析": max(tier_count - completed_jobs, 0),
-        "LLM报告": "已生成" if bool(report_status.get("has_report")) else "未生成",
+        "多模态报告": "已生成" if bool(report_status.get("has_report")) else "未生成",
     }
 
 

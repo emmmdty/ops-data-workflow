@@ -1275,7 +1275,7 @@ class AppOverviewTests(unittest.TestCase):
         self.assertEqual(summary["已缓存素材"], 1)
         self.assertEqual(summary["已完成多模态"], 1)
         self.assertEqual(summary["待分析"], 1)
-        self.assertEqual(summary["LLM报告"], "已生成")
+        self.assertEqual(summary["多模态报告"], "已生成")
 
     def test_recap_tier_status_summary_matches_manifest_by_job_id_when_identity_missing(self):
         top_pool = pd.DataFrame(
@@ -1300,7 +1300,7 @@ class AppOverviewTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["已缓存素材"], 1)
-        self.assertEqual(summary["LLM报告"], "未生成")
+        self.assertEqual(summary["多模态报告"], "未生成")
 
     def test_recap_tier_pipeline_writes_partial_report_when_capture_partially_fails(self):
         class CaptureResult:
@@ -1341,12 +1341,25 @@ class AppOverviewTests(unittest.TestCase):
         )
 
         persisted = Mock(item_count=1, strategy_count=1)
+        multimodal_results = pd.DataFrame(
+            [
+                {
+                    "content_identity_key": "抖音商业化::抖音::title_account::投放号::高消耗素材",
+                    "analysis_purpose": "strategy_recap:tier1_spend_top",
+                    "summary": "Minimax 已理解素材",
+                    "reuse_points": "复用强痛点口播",
+                    "next_period_strategy": "继续测试同类开头",
+                }
+            ]
+        )
         with patch("app.copy_missing_runtime_env"), patch("app.st.status", return_value=Status()), patch("app.st.warning") as warning, patch(
             "app.run_harvester_asset_capture", return_value=CaptureResult()
         ), patch("app.reset_top_multimodal_jobs"), patch("app.run_top_multimodal_analysis_from_manifests", return_value=1), patch(
             "app.persist_multimodal_recap", return_value=persisted
         ), patch("app._successful_analysis_identities", return_value={"抖音商业化::抖音::title_account::投放号::高消耗素材"}), patch(
-            "app.generate_range_recap_report", return_value={"overview": {"report": "部分报告"}}
+            "app.list_multimodal_recap_items", return_value=multimodal_results
+        ), patch(
+            "app.generate_range_recap_report", return_value={"provider": "minimax", "overview": {"report": "部分报告"}}
         ) as generate_report, patch("app.persist_range_recap_report") as persist_report, patch(
             "app.list_period_channel_totals", return_value=pd.DataFrame()
         ), patch("app.read_batch_record", return_value={}):
@@ -1354,9 +1367,12 @@ class AppOverviewTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertTrue(generate_report.called)
+        self.assertEqual(generate_report.call_args.kwargs["multimodal_results"].iloc[0]["summary"], "Minimax 已理解素材")
         self.assertTrue(persist_report.called)
         report = persist_report.call_args.kwargs["report"]
         self.assertEqual(report["range_execution_status"], "partial")
+        self.assertEqual(persist_report.call_args.kwargs["provider"], "minimax")
+        self.assertEqual(persist_report.call_args.kwargs["model"], "minimax-range-report")
         self.assertIn("部分完成", warning.call_args.args[0])
 
     def test_report_status_copy_only_states_whether_conclusion_uses_current_data(self):

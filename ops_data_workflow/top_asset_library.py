@@ -8,9 +8,10 @@ import json
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 from typing import Iterable, Mapping
 
-from .storage import upsert_top_asset_cache_entry
+from .storage import init_db, upsert_top_asset_cache_entry
 from .top_asset_cache import directory_size, safe_path_segment
 
 
@@ -36,6 +37,11 @@ class TopAssetLibraryConsolidationResult:
     skipped_giant_only: int = 0
     skipped_missing_dir: int = 0
     copied_by_platform: Counter[str] = field(default_factory=Counter)
+    scanned_by_source: Counter[str] = field(default_factory=Counter)
+    copied_by_source: Counter[str] = field(default_factory=Counter)
+    updated_by_source: Counter[str] = field(default_factory=Counter)
+    skipped_by_reason: Counter[str] = field(default_factory=Counter)
+    skip_samples: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,7 @@ def consolidate_top_asset_library(
     cache_root: Path = Path(".runtime/top-assets"),
     harvester_root: Path | None = None,
     ops_runtime_root: Path = Path(".runtime/harvester"),
+    harvester_runtime_assets_root: Path | None = None,
     dry_run: bool = False,
 ) -> TopAssetLibraryConsolidationResult:
     """Copy reusable historical assets into ``cache_root/<platform>/<real-id>``.
@@ -71,34 +78,57 @@ def consolidate_top_asset_library(
     cache_root = Path(cache_root).expanduser().resolve()
     hroot = Path(harvester_root).expanduser().resolve() if harvester_root is not None else None
     ops_runtime_root = Path(ops_runtime_root).expanduser().resolve()
+    runtime_assets_root = (
+        Path(harvester_runtime_assets_root).expanduser().resolve()
+        if harvester_runtime_assets_root is not None
+        else (hroot / ".runtime" / "douyin-channel-type-classifier" / "assets" if hroot is not None else None)
+    )
     result = TopAssetLibraryConsolidationResult()
-    for source in _iter_manifest_sources(cache_root=cache_root, harvester_root=hroot, ops_runtime_root=ops_runtime_root):
+    for source in _iter_manifest_sources(
+        cache_root=cache_root,
+        harvester_root=hroot,
+        ops_runtime_root=ops_runtime_root,
+        harvester_runtime_assets_root=runtime_assets_root,
+    ):
         result.scanned_manifests += 1
+        result.scanned_by_source[source.source] += 1
         identity = _reusable_identity_from_manifest(source)
         if identity is None:
             if _is_douyin_giant_only(source.item, source.path):
                 result.skipped_giant_only += 1
+                _record_skip(result, "giant_only", source.path)
             else:
                 result.skipped_no_real_id += 1
+                _record_skip(result, "no_real_id", source.path)
             continue
         if not source.source_dir.exists() or not source.source_dir.is_dir():
             result.skipped_missing_dir += 1
+            _record_skip(result, "missing_dir", source.path)
+            continue
+        if _is_step15_asset_path(source.path) and not _has_local_media_file(source.item, source.source_dir):
+            result.skipped_no_real_id += 1
+            _record_skip(result, "no_media", source.path)
             continue
         target_dir = cache_root / identity.platform_dir / safe_path_segment(identity.content_id)
-        if target_dir.resolve() == source.source_dir.resolve():
+        if target_dir.exists():
             result.updated_count += 1
+            result.updated_by_source[source.source] += 1
             if not dry_run:
-                _write_normalized_manifest(target_dir / "manifest.json", source, identity, target_dir)
+                if target_dir.resolve() == source.source_dir.resolve():
+                    _write_normalized_manifest(target_dir / "manifest.json", source, identity, target_dir)
                 _record_entry(db_path, identity, target_dir, source.source)
+                _migrate_legacy_cache_keys(db_path, identity)
             continue
         result.copied_count += 1
         result.copied_by_platform[identity.platform_dir] += 1
+        result.copied_by_source[source.source] += 1
         if dry_run:
             continue
         target_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source.source_dir, target_dir, dirs_exist_ok=True)
         _write_normalized_manifest(target_dir / "manifest.json", source, identity, target_dir)
         _record_entry(db_path, identity, target_dir, source.source)
+        _migrate_legacy_cache_keys(db_path, identity)
     return result
 
 
@@ -107,11 +137,14 @@ def _iter_manifest_sources(
     cache_root: Path,
     harvester_root: Path | None,
     ops_runtime_root: Path,
+    harvester_runtime_assets_root: Path | None,
 ) -> Iterable[_SourceManifest]:
     seen: set[Path] = set()
     roots = [cache_root, ops_runtime_root]
     if harvester_root is not None:
         roots.append(harvester_root / "output")
+    if harvester_runtime_assets_root is not None:
+        roots.append(harvester_runtime_assets_root)
     for root in roots:
         if not root.exists():
             continue
@@ -122,7 +155,18 @@ def _iter_manifest_sources(
             seen.add(resolved)
             for item in _manifest_items(path):
                 source_dir = _source_dir_for_item(path, item)
-                yield _SourceManifest(path=path, item=item, source_dir=source_dir, source=_source_name(path, cache_root, harvester_root))
+                yield _SourceManifest(
+                    path=path,
+                    item=item,
+                    source_dir=source_dir,
+                    source=_source_name(
+                        path,
+                        cache_root=cache_root,
+                        harvester_root=harvester_root,
+                        ops_runtime_root=ops_runtime_root,
+                        harvester_runtime_assets_root=harvester_runtime_assets_root,
+                    ),
+                )
 
 
 def _manifest_items(path: Path) -> list[dict[str, object]]:
@@ -171,7 +215,10 @@ def _reusable_identity_from_manifest(source: _SourceManifest) -> _ReusableIdenti
 def _content_id_for_platform(platform_label: str, item: Mapping[str, object], path: Path) -> str:
     values = [
         item.get("content_id"),
+        item.get("work_id"),
         item.get("id"),
+        item.get("awemeId"),
+        item.get("aweme_id"),
         item.get("noteId"),
         item.get("note_id"),
         item.get("bvid"),
@@ -181,8 +228,9 @@ def _content_id_for_platform(platform_label: str, item: Mapping[str, object], pa
         item.get("content_url"),
         item.get("url"),
         item.get("asset_key"),
-        path.parent.name,
     ]
+    if not _is_step15_asset_path(path):
+        values.append(path.parent.name)
     if platform_label == "抖音":
         return _douyin_work_id(values)
     if platform_label == "小红书":
@@ -202,7 +250,7 @@ def _douyin_work_id(values: Iterable[object]) -> str:
         for pattern in [
             r"/(?:video|note)/(\d{10,24})",
             r"(?:aweme_id|item_id|modal_id)=(\d{10,24})",
-            r"::抖音::id::(\d{10,24})",
+            r"(?:^|::)抖音::id::(\d{10,24})",
             r"(?:抖音|douyin)_id_(\d{10,24})",
         ]:
             match = re.search(pattern, text, re.IGNORECASE)
@@ -263,7 +311,18 @@ def _is_douyin_giant_only(item: Mapping[str, object], path: Path) -> bool:
         return False
     if _is_douyin_giant_only_without_real_work_id(item):
         return True
-    if _douyin_work_id([item.get("asset_key"), item.get("content_id"), item.get("id"), item.get("link"), item.get("content_url"), path.parent.name]):
+    if _douyin_work_id(
+        [
+            item.get("asset_key"),
+            item.get("content_id"),
+            item.get("work_id"),
+            item.get("id"),
+            item.get("awemeId"),
+            item.get("aweme_id"),
+            item.get("link"),
+            item.get("content_url"),
+        ]
+    ):
         return False
     text = "\n".join(
         _text(value)
@@ -282,11 +341,16 @@ def _is_douyin_giant_only(item: Mapping[str, object], path: Path) -> bool:
 
 
 def _is_douyin_giant_only_without_real_work_id(item: Mapping[str, object]) -> bool:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+    metadata_source = _text(metadata.get("source")).lower()
     explicit_real_id = _douyin_work_id(
         [
             item.get("asset_key"),
             item.get("content_id"),
+            item.get("work_id"),
             item.get("id"),
+            item.get("awemeId"),
+            item.get("aweme_id"),
             item.get("itemId"),
             item.get("item_id"),
             item.get("link"),
@@ -296,6 +360,8 @@ def _is_douyin_giant_only_without_real_work_id(item: Mapping[str, object]) -> bo
     )
     if explicit_real_id:
         return False
+    if metadata_source == "giant_asset":
+        return True
     text = "\n".join(
         _text(value)
         for value in [
@@ -374,13 +440,57 @@ def _record_entry(db_path: Path, identity: _ReusableIdentity, target_dir: Path, 
     )
 
 
-def _source_name(path: Path, cache_root: Path, harvester_root: Path | None) -> str:
+def _migrate_legacy_cache_keys(db_path: Path, identity: _ReusableIdentity) -> None:
+    legacy_keys = _legacy_cache_keys(identity)
+    if not legacy_keys:
+        return
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        for legacy_key in legacy_keys:
+            conn.execute(
+                "update top_asset_cache_refs set asset_key = ? where asset_key = ?",
+                (identity.asset_key, legacy_key),
+            )
+            conn.execute("delete from top_asset_cache_entries where asset_key = ?", (legacy_key,))
+        conn.commit()
+
+
+def _legacy_cache_keys(identity: _ReusableIdentity) -> list[str]:
+    if identity.platform_label == "抖音":
+        return [f"douyin:work:{identity.content_id}"]
+    return []
+
+
+def _source_name(
+    path: Path,
+    *,
+    cache_root: Path,
+    harvester_root: Path | None,
+    ops_runtime_root: Path,
+    harvester_runtime_assets_root: Path | None,
+) -> str:
     try:
         path.resolve().relative_to(cache_root.resolve())
         return "ops_top_assets_history"
     except ValueError:
         pass
+    try:
+        path.resolve().relative_to(ops_runtime_root.resolve())
+        return "ops_harvester_manifest_history"
+    except ValueError:
+        pass
+    if harvester_runtime_assets_root is not None:
+        try:
+            path.resolve().relative_to(harvester_runtime_assets_root.resolve())
+            return "harvester_runtime_classifier_history"
+        except ValueError:
+            pass
     if harvester_root is not None:
+        try:
+            path.resolve().relative_to((harvester_root / "output" / "step15-assets").resolve())
+            return "harvester_step15_assets_history"
+        except ValueError:
+            pass
         try:
             path.resolve().relative_to((harvester_root / "output").resolve())
             return "harvester_output_history"
@@ -395,6 +505,50 @@ def _platform_hint_from_path(path: Path) -> str:
         if label:
             return label
     return ""
+
+
+def _record_skip(result: TopAssetLibraryConsolidationResult, reason: str, path: Path) -> None:
+    result.skipped_by_reason[reason] += 1
+    samples = result.skip_samples.setdefault(reason, [])
+    if len(samples) < 10:
+        samples.append(str(path))
+
+
+def _is_step15_asset_path(path: Path) -> bool:
+    return "step15-assets" in path.parts
+
+
+def _has_local_media_file(item: Mapping[str, object], source_dir: Path) -> bool:
+    paths = [
+        item.get("video_path"),
+        item.get("videoPath"),
+        item.get("cover_path"),
+        item.get("coverPath"),
+        *_list_paths(item.get("imagePaths") or item.get("image_paths")),
+        *_list_paths(item.get("screenshots") or item.get("screenshots_json")),
+        *_list_paths(item.get("framePaths") or item.get("frame_paths") or item.get("frames") or item.get("frames_json")),
+    ]
+    assets = item.get("assets")
+    if isinstance(assets, list):
+        for asset in assets:
+            if not isinstance(asset, Mapping):
+                continue
+            kind = _text(asset.get("kind") or asset.get("type")).lower()
+            if kind in {"video", "image", "screenshot", "cover", "thumbnail", "frame"}:
+                paths.append(asset.get("path") or asset.get("url"))
+    for value in paths:
+        text = _text(value)
+        if not text or re.match(r"^https?://", text, re.IGNORECASE):
+            continue
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = source_dir / path
+        try:
+            if path.exists() and path.is_file() and path.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _platform_label(value: object) -> str:

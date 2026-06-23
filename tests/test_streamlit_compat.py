@@ -196,7 +196,7 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         self.assertIn("正在生成策略素材分析", strategy_source)
         self.assertIn("清洗入库结果不受影响，可稍后重试策略复盘", strategy_source)
 
-    def test_recap_tier_ui_runs_scoped_llm_reports_without_legacy_imports(self):
+    def test_recap_tier_ui_runs_scoped_multimodal_reports_without_legacy_imports(self):
         recap_source = self._function_source("_render_recap_tier_panel", "def _render_range_recap_report")
         report_source = self._function_source("_render_range_recap_report", "def _render_high_value_quality_tab")
         pipeline_source = self._function_source("_run_recap_tier_pipeline", "def _run_rollup")
@@ -204,17 +204,21 @@ class StreamlitCompatibilityTests(unittest.TestCase):
         for token in [
             "分级复盘任务",
             "一级可在上传清洗后自动触发",
-            "每个范围会生成独立 LLM 报告",
+            "每个范围会生成独立多模态复盘报告",
             "RECAP_TIER_1_SPEND_TOP",
             "RECAP_TIER_2_EXPOSURE_TOP",
             "RECAP_TIER_3_THRESHOLD",
             "generate_range_recap_report",
+            "multimodal_results=multimodal_results",
             "persist_range_recap_report",
         ]:
             self.assertIn(token, self.app_source)
         self.assertIn("load_range_recap_report", recap_source)
+        self.assertIn("model_identity", report_source)
+        self.assertIn("st.info(model_identity)", report_source)
         self.assertNotIn("analysis_jobs", report_source)
         self.assertIn("analysis_purpose=purpose", pipeline_source)
+        self.assertIn("正在生成该范围的多模态复盘报告", pipeline_source)
         self.assertIn("return True", pipeline_source)
         self.assertIn("return False", pipeline_source)
         self.assertIn("if _run_recap_tier_pipeline(batch_id, items, tier_key):", recap_source)
