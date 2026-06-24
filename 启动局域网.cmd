@@ -1,10 +1,12 @@
 @echo off
 chcp 65001 >nul
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "UV_DOWNLOAD_URL=https://mirrors.ustc.edu.cn/github-release/astral-sh/uv/LatestRelease"
+set "UV_INSTALLER_MIRROR_URL=https://mirrors.ustc.edu.cn/github-release/astral-sh/uv/LatestRelease/uv-installer.ps1"
+set "UV_INSTALLER_OFFICIAL_URL=https://astral.sh/uv/install.ps1"
 set "UV_PYTHON_INSTALL_MIRROR=https://mirrors.ustc.edu.cn/github-release/astral-sh/python-build-standalone"
 set "UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple"
 
@@ -22,8 +24,12 @@ if errorlevel 1 (
     echo 未找到 PowerShell，无法自动安装 uv。请先安装 PowerShell 后重试。
     goto fail
   )
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:UV_DOWNLOAD_URL='https://mirrors.ustc.edu.cn/github-release/astral-sh/uv/LatestRelease'; irm 'https://mirrors.ustc.edu.cn/github-release/astral-sh/uv/LatestRelease/uv-installer.ps1' | iex"
-  set "PATH=%USERPROFILE%\.local\bin;%USERPROFILE%\.cargo\bin;%PATH%"
+  call :install_uv_from_url "%UV_INSTALLER_MIRROR_URL%" "%UV_DOWNLOAD_URL%"
+  if errorlevel 1 (
+    echo 中科大镜像安装 uv 失败，正在尝试 uv 官方地址...
+    call :install_uv_from_url "%UV_INSTALLER_OFFICIAL_URL%" ""
+  )
+  set "PATH=%USERPROFILE%\.local\bin;%USERPROFILE%\.cargo\bin;!PATH!"
 )
 
 where uv >nul 2>nul
@@ -59,3 +65,14 @@ if "%EXIT_CODE%"=="0" (
 )
 pause
 exit /b %EXIT_CODE%
+
+:install_uv_from_url
+set "UV_INSTALLER_URL=%~1"
+set "UV_DOWNLOAD_SOURCE=%~2"
+if "%UV_DOWNLOAD_SOURCE%"=="" goto install_uv_without_mirror
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:UV_DOWNLOAD_URL='%UV_DOWNLOAD_SOURCE%'; irm '%UV_INSTALLER_URL%' | iex"
+exit /b %ERRORLEVEL%
+
+:install_uv_without_mirror
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm '%UV_INSTALLER_URL%' | iex"
+exit /b %ERRORLEVEL%

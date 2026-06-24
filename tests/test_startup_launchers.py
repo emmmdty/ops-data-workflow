@@ -104,3 +104,27 @@ def test_windows_launcher_uses_utf8_mirrors_and_helper():
     assert "UV_DOWNLOAD_URL=https://mirrors.ustc.edu.cn/github-release/astral-sh/uv/LatestRelease" in content
     assert "UV_PYTHON_INSTALL_MIRROR=https://mirrors.ustc.edu.cn/github-release/astral-sh/python-build-standalone" in content
     assert "scripts/start_lan.py" in content
+
+
+def test_windows_launcher_uses_crlf_line_endings_for_cmd_exe():
+    content = WINDOWS_LAUNCHER.read_bytes()
+
+    assert b"\r\n" in content
+    assert content.count(b"\n") == content.count(b"\r\n")
+
+
+def test_windows_launcher_defers_path_expansion_inside_parenthesized_blocks():
+    content = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+    assert "EnableDelayedExpansion" in content
+    assert "!PATH!" in content
+    assert "%PATH%" not in content
+
+
+def test_windows_launcher_falls_back_to_official_uv_installer():
+    content = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+    assert "UV_INSTALLER_OFFICIAL_URL=https://astral.sh/uv/install.ps1" in content
+    assert "中科大镜像安装 uv 失败" in content
+    assert "uv 官方地址" in content
+    assert "call :install_uv_from_url" in content
